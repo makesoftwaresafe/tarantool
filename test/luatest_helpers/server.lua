@@ -131,6 +131,12 @@ function Server:wait_election_leader_found()
                      function() return box.info.election.leader ~= 0 end)
 end
 
+function Server:wait_election_state(state)
+    return wait_cond('election state', self, self.exec, self, function(state)
+        return box.info.election.state == state
+    end, {state})
+end
+
 function Server:wait_election_term(term)
     return wait_cond('election term', self, self.exec, self, function(term)
         return box.info.election.term >= term
@@ -191,6 +197,12 @@ end
 
 function Server:synchro_queue_term()
     return self:exec(function() return box.info.synchro.queue.term end)
+end
+
+function Server:wal_write_count()
+    return self:exec(function()
+        return box.error.injection.get('ERRINJ_WAL_WRITE_COUNT')
+    end)
 end
 
 -- TODO: Add the 'wait_for_readiness' parameter for the restart()

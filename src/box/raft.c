@@ -36,6 +36,7 @@
 #include "replication.h"
 #include "txn_limbo.h"
 #include "xrow.h"
+#include "errinj.h"
 
 struct raft box_raft_global = {
 	/*
@@ -521,6 +522,7 @@ box_raft_wait_term_persisted(void)
 	do {
 		fiber_yield();
 	} while (raft->term < data.term && !fiber_is_cancelled());
+	ERROR_INJECT_YIELD(ERRINJ_RAFT_WAIT_TERM_PERSISTED_DELAY);
 
 	trigger_clear(&trig);
 	if (fiber_is_cancelled()) {
