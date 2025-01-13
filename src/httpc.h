@@ -60,7 +60,11 @@ struct httpc_stat {
  * HTTP Client Environment
  */
 struct httpc_env {
-	/** Curl enviroment. */
+	/** Number of a current active http requests. */
+	int req_count;
+	/** Flag that triggers cleanup. */
+	int cleanup;
+	/** Curl environment. */
 	struct curl_env curl_env;
 	/** Memory pool for requests */
 	struct mempool req_pool;
@@ -77,6 +81,13 @@ struct httpc_env {
  */
 int
 httpc_env_create(struct httpc_env *ctx, int max_conns, int max_total_conns);
+
+/**
+ * Finish HTTP client environment
+ * @param env pointer to a structure to finish
+ */
+void
+httpc_env_finish(struct httpc_env *env);
 
 /**
  * Destroy HTTP client environment
@@ -99,7 +110,7 @@ struct httpc_request {
 	struct curl_slist *headers;
 	/** Buffer for data send. */
 	struct ibuf send;
-	/** curl resuest. */
+	/** curl request. */
 	struct curl_request curl_request;
 	/** HTTP status code */
 	int status;
@@ -133,11 +144,11 @@ struct httpc_request {
 	 */
 	bool set_keep_alive_header;
 	/**
-	 * True when Transfer-Encoding: chunked must be
-	 * set before execution automatically if chunked
-	 * io enabled.
+	 * It's the number of bytes of data in the body of the
+	 * request. The value is equal to "Content-Length"
+	 * header or -1 otherwise.
 	 */
-	bool set_chunked_header;
+	long content_length;
 	/** True when chunked io is enabled. */
 	bool io;
 	/**
@@ -427,6 +438,16 @@ httpc_set_follow_location(struct httpc_request *req, long follow);
  */
 void
 httpc_set_accept_encoding(struct httpc_request *req, const char *encoding);
+
+/**
+ * Specify http protocol version for request
+ * @param req request
+ * @param version - http version to use for this request
+ * Version can be 1.1, 2, 2-tls or 2-prior-knowledge
+ * @see https://curl.se/libcurl/c/CURLOPT_HTTP_VERSION.html
+ */
+int
+httpc_set_http_version(struct httpc_request *req, const char *version);
 
 /**
  * Enable a chunked io interface for the request. It allows to

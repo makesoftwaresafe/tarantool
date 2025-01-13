@@ -42,6 +42,7 @@
 #include "mp_extension_types.h"
 #include "fiber.h"
 #include "ssl_error.h"
+#include "trivia/util.h"
 
 /**
  * MP_ERROR format:
@@ -204,22 +205,24 @@ mp_encode_error_one(char *data, const struct error *error)
 }
 
 static struct error *
-error_build_xc(struct mp_error *mp_error)
+error_build(struct mp_error *mp_error)
 {
-	/*
-	 * To create an error the "raw" constructor is used
-	 * because OOM error must be thrown in OOM case.
-	 * Builders returns a pointer to the static OOM error
-	 * in OOM case.
-	 */
 	struct error *err = NULL;
-	if (mp_error->type == NULL || mp_error->message == NULL ||
-	    mp_error->file == NULL) {
+	if (mp_error->type == NULL) {
 		diag_set(ClientError, ER_INVALID_MSGPACK,
-			 "Missing mandatory error fields");
+			 "MP_ERROR_TYPE is missing");
 		return NULL;
 	}
-
+	if (mp_error->message == NULL) {
+		diag_set(ClientError, ER_INVALID_MSGPACK,
+			 "MP_ERROR_MESSAGE is missing");
+		return NULL;
+	}
+	if (mp_error->file == NULL) {
+		diag_set(ClientError, ER_INVALID_MSGPACK,
+			 "MP_ERROR_FILE is missing");
+		return NULL;
+	}
 	if (strcmp(mp_error->type, "ClientError") == 0) {
 		err = new ClientError();
 	} else if (strcmp(mp_error->type, "CustomError") == 0) {
@@ -256,6 +259,10 @@ error_build_xc(struct mp_error *mp_error)
 		err = new SSLError();
 	} else if (strcmp(mp_error->type, "FileFormatError") == 0) {
 		err = new FileFormatError();
+	} else if (strcmp(mp_error->type, "EncodeError") == 0) {
+		err = new EncodeError();
+	} else if (strcmp(mp_error->type, "DecodeError") == 0) {
+		err = new DecodeError();
 	} else {
 		err = new ClientError();
 	}
@@ -268,43 +275,42 @@ error_build_xc(struct mp_error *mp_error)
 }
 
 static inline const char *
-region_strdup(struct region *region, const char *str, uint32_t len)
-{
-	char *res = (char *)region_alloc(region, len + 1);
-	if (res == NULL) {
-		diag_set(OutOfMemory, len + 1, "region_alloc", "res");
-		return NULL;
-	}
-	memcpy(res, str, len);
-	res[len] = 0;
-	return res;
-}
-
-static inline const char *
 mp_decode_and_copy_str(const char **data, struct region *region)
 {
-	if (mp_typeof(**data) != MP_STR) {
-		diag_set(ClientError, ER_INVALID_MSGPACK,
-			 "Invalid MP_ERROR MsgPack format");
-		return NULL;
-	}
 	uint32_t str_len;
 	const char *str = mp_decode_str(data, &str_len);
-	return region_strdup(region, str, str_len);;
+	char *copy = (char *)xregion_alloc(region, str_len + 1);
+	memcpy(copy, str, str_len);
+	copy[str_len] = '\0';
+	return copy;
 }
+
+/**
+ * Helper macro for checking that MsgPack data has a particular type.
+ * Sets diag and returns -1 on error.
+ */
+#define CHECK_MP_TYPE(data, type, what) ({				\
+	int rc = 0;							\
+	if (mp_typeof(**(data)) != (type)) {				\
+		diag_set(ClientError, ER_INVALID_MSGPACK,		\
+			 what " must be " #type);			\
+		rc = -1;						\
+	}								\
+	rc;								\
+})
 
 static int
 mp_decode_error_fields(const char **data, struct mp_error *mp_err,
 		       struct region *region)
 {
-	if (mp_typeof(**data) != MP_MAP)
+	if (CHECK_MP_TYPE(data, MP_MAP, "MP_ERROR_FIELDS value") != 0)
 		return -1;
 	uint32_t map_sz = mp_decode_map(data);
 	for (uint32_t i = 0; i < map_sz; ++i) {
 		uint32_t svp = region_used(region);
-		const char *key = mp_decode_and_copy_str(data, region);
-		if (key == NULL)
+		if (CHECK_MP_TYPE(data, MP_STR, "error payload field name"))
 			return -1;
+		const char *key = mp_decode_and_copy_str(data, region);
 		const char *value = *data;
 		mp_next(data);
 		uint32_t value_len = *data - value;
@@ -324,44 +330,48 @@ mp_decode_error_one(const char **data)
 	struct error *err = NULL;
 	uint32_t map_size;
 
-	if (mp_typeof(**data) != MP_MAP)
-		goto error;
-
+	if (CHECK_MP_TYPE(data, MP_MAP, "MP_ERROR_STACK array entry") != 0)
+		goto finish;
 	map_size = mp_decode_map(data);
 	for (uint32_t i = 0; i < map_size; ++i) {
-		if (mp_typeof(**data) != MP_UINT)
-			goto error;
-
+		if (CHECK_MP_TYPE(data, MP_UINT, "error field key") != 0)
+			goto finish;
 		uint64_t key = mp_decode_uint(data);
 		switch(key) {
 		case MP_ERROR_TYPE:
-			mp_err.type = mp_decode_and_copy_str(data, region);
-			if (mp_err.type == NULL)
+			if (CHECK_MP_TYPE(data, MP_STR,
+					  "MP_ERROR_TYPE value") != 0)
 				goto finish;
+			mp_err.type = mp_decode_and_copy_str(data, region);
 			break;
 		case MP_ERROR_FILE:
-			mp_err.file = mp_decode_and_copy_str(data, region);
-			if (mp_err.file == NULL)
+			if (CHECK_MP_TYPE(data, MP_STR,
+					  "MP_ERROR_FILE value") != 0)
 				goto finish;
+			mp_err.file = mp_decode_and_copy_str(data, region);
 			break;
 		case MP_ERROR_LINE:
-			if (mp_typeof(**data) != MP_UINT)
-				goto error;
+			if (CHECK_MP_TYPE(data, MP_UINT,
+					  "MP_ERROR_LINE value") != 0)
+				goto finish;
 			mp_err.line = mp_decode_uint(data);
 			break;
 		case MP_ERROR_MESSAGE:
-			mp_err.message = mp_decode_and_copy_str(data, region);
-			if (mp_err.message == NULL)
+			if (CHECK_MP_TYPE(data, MP_STR,
+					  "MP_ERROR_MESSAGE value") != 0)
 				goto finish;
+			mp_err.message = mp_decode_and_copy_str(data, region);
 			break;
 		case MP_ERROR_ERRNO:
-			if (mp_typeof(**data) != MP_UINT)
-				goto error;
+			if (CHECK_MP_TYPE(data, MP_UINT,
+					  "MP_ERROR_ERRNO value") != 0)
+				goto finish;
 			mp_err.saved_errno = mp_decode_uint(data);
 			break;
 		case MP_ERROR_CODE:
-			if (mp_typeof(**data) != MP_UINT)
-				goto error;
+			if (CHECK_MP_TYPE(data, MP_UINT,
+					  "MP_ERROR_CODE value") != 0)
+				goto finish;
 			mp_err.code = mp_decode_uint(data);
 			break;
 		case MP_ERROR_FIELDS:
@@ -373,20 +383,11 @@ mp_decode_error_one(const char **data)
 		}
 	}
 
-	try {
-		err = error_build_xc(&mp_err);
-	} catch (OutOfMemory *e) {
-		assert(err == NULL && !diag_is_empty(diag_get()));
-	}
+	err = error_build(&mp_err);
 finish:
 	region_truncate(region, region_svp);
 	mp_error_destroy(&mp_err);
 	return err;
-
-error:
-	diag_set(ClientError, ER_INVALID_MSGPACK,
-		 "Invalid MP_ERROR MsgPack format");
-	goto finish;
 }
 
 /**
@@ -470,40 +471,38 @@ error_to_mpstream(const struct error *error, struct mpstream *stream)
 struct error *
 error_unpack_unsafe(const char **data)
 {
+	const char *begin = *data;
 	struct error *err = NULL;
+	uint32_t map_size;
 
-	if (mp_typeof(**data) != MP_MAP) {
-		diag_set(ClientError, ER_INVALID_MSGPACK,
-			 "Invalid MP_ERROR MsgPack format");
-		return NULL;
-	}
-	uint32_t map_size = mp_decode_map(data);
+	if (CHECK_MP_TYPE(data, MP_MAP, "error data") != 0)
+		goto error;
+	map_size = mp_decode_map(data);
 	for (uint32_t i = 0; i < map_size; ++i) {
-		if (mp_typeof(**data) != MP_UINT) {
-			diag_set(ClientError, ER_INVALID_MSGPACK,
-				 "Invalid MP_ERROR MsgPack format");
-			return NULL;
-		}
+		if (CHECK_MP_TYPE(data, MP_UINT, "error data key") != 0)
+			goto error;
 		uint64_t key = mp_decode_uint(data);
 		switch(key) {
 		case MP_ERROR_STACK: {
-			if (mp_typeof(**data) != MP_ARRAY) {
+			if (err != NULL) {
 				diag_set(ClientError, ER_INVALID_MSGPACK,
-					 "Invalid MP_ERROR MsgPack format");
-				return NULL;
+					 "duplicate MP_ERROR_STACK key");
+				goto error;
 			}
+			if (CHECK_MP_TYPE(data, MP_ARRAY,
+					  "MP_ERROR_STACK value") != 0)
+				goto error;
 			uint32_t stack_sz = mp_decode_array(data);
 			struct error *effect = NULL;
 			for (uint32_t i = 0; i < stack_sz; i++) {
 				struct error *cur = mp_decode_error_one(data);
 				if (cur == NULL)
-					return NULL;
+					goto error;
 				if (err == NULL) {
 					err = cur;
 					effect = cur;
 					continue;
 				}
-
 				error_set_prev(effect, cur);
 				effect = cur;
 			}
@@ -513,7 +512,23 @@ error_unpack_unsafe(const char **data)
 			mp_next(data);
 		}
 	}
+	if (err == NULL) {
+		diag_set(ClientError, ER_INVALID_MSGPACK,
+			 "MP_ERROR_STACK is missing");
+		goto error;
+	}
 	return err;
+
+error:
+	if (err != NULL) {
+		/* A hack to delete the error. */
+		error_ref(err);
+		error_unref(err);
+	}
+	err = diag_last_error(diag_get());
+	assert(err != NULL);
+	error_set_uint(err, "offset", *data - begin);
+	return NULL;
 }
 
 struct error *
@@ -521,7 +536,7 @@ error_unpack(const char **data, uint32_t len)
 {
 	const char *end = *data + len;
 	const char *check = *data;
-	if (mp_check(&check, end) != 0 || check != end)
+	if (mp_check_exact(&check, end) != 0)
 		return NULL;
 	return error_unpack_unsafe(data);
 }

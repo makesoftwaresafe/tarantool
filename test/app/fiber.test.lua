@@ -379,7 +379,7 @@ test_run:grep_log("default", "FiberIsCancelled") == nil
 
 -- must show in the log
 _ = fiber.create(function() box.error(box.error.ILLEGAL_PARAMS, 'oh my') end)
-test_run:grep_log("default", "ER_ILLEGAL_PARAMS:[^\n]*")
+test_run:grep_log("default", "IllegalParams:[^\n]*")
 
 -- #1734 fiber.name irt dead fibers
 fiber.create(function()end):name()
@@ -387,7 +387,7 @@ fiber.create(function()end):name()
 --
 -- gh-1926
 --
-fiber.create(function() fiber.wakeup(fiber.self()) end)
+_ = fiber.create(function() fiber.wakeup(fiber.self()) end)
 
 --
 -- gh-2066 test for fiber wakeup
@@ -712,7 +712,6 @@ function task_f(arg)                                                            
     if arg <= 3 then                                                            \
         fiber._internal.schedule_task(task_f, arg)                              \
     else                                                                        \
-        fiber.self():cancel()                                                   \
         error('Worker is broken')                                               \
     end                                                                         \
 end

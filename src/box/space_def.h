@@ -42,6 +42,31 @@ extern "C" {
 
 struct space_upgrade_def;
 
+/** Space type names. */
+extern const char *space_type_strs[];
+
+/** See space_opts::type. */
+enum space_type {
+	/**
+	 * SPACE_TYPE_DEFAULT is a special value which is used when decoding
+	 * space options from a tuple. After the options have been parsed
+	 * SPACE_TYPE_DEFAULT will be replaced with SPACE_TYPE_NORMAL.
+	 * No live space should ever have this type.
+	 */
+	SPACE_TYPE_DEFAULT = -1,
+	SPACE_TYPE_NORMAL = 0,
+	SPACE_TYPE_DATA_TEMPORARY = 1,
+	SPACE_TYPE_TEMPORARY = 2,
+	space_type_MAX,
+};
+
+static inline const char *
+space_type_name(enum space_type space_type)
+{
+	assert(space_type != SPACE_TYPE_DEFAULT);
+	return space_type_strs[space_type];
+}
+
 /** Space options */
 struct space_opts {
 	/**
@@ -49,15 +74,21 @@ struct space_opts {
 	 * made to a space are replicated.
 	 */
 	uint32_t group_id;
-        /**
-	 * The space is a temporary:
+	/**
+	 * If set to SPACE_TYPE_DATA_TEMPORARY:
 	 * - it is empty at server start
 	 * - changes are not written to WAL
 	 * - changes are not part of a snapshot
-         * - in SQL: space_def memory is allocated on region and
-         *   does not require manual release.
+	 * - in SQL: space_def memory is allocated on region and
+	 *   does not require manual release.
+	 *
+	 * If set to SPACE_TYPE_TEMPORARY:
+	 * - all of the above, but
+	 * - metadata is not persisted (doesn't exist at server start)
+	 * - metadata is not replicated (doesn't exist on replicas)
+	 * - this value cannot be changed from or to even for an empty space
 	 */
-	bool is_temporary;
+	enum space_type type;
 	/**
 	 * This flag is set if space is ephemeral and hence
 	 * its format might be re-used.
@@ -104,6 +135,26 @@ space_opts_create(struct space_opts *opts)
 	*opts = space_opts_default;
 }
 
+/**
+ * Check if the space is data-temporary.
+ */
+static inline bool
+space_opts_is_data_temporary(const struct space_opts *opts)
+{
+	assert(opts->type != SPACE_TYPE_DEFAULT);
+	return opts->type != SPACE_TYPE_NORMAL;
+}
+
+/**
+ * Check if the space is temporary.
+ */
+static inline bool
+space_opts_is_temporary(const struct space_opts *opts)
+{
+	assert(opts->type != SPACE_TYPE_DEFAULT);
+	return opts->type == SPACE_TYPE_TEMPORARY;
+}
+
 /** Space metadata. */
 struct space_def {
 	/** Space id. */
@@ -130,6 +181,13 @@ struct space_def {
 	/** Number of SQL views which refer to this space. */
 	uint32_t view_ref_count;
 	struct space_opts opts;
+	/**
+	 * Encoding of original (i.e., user-provided) format clause to MsgPack,
+	 * allocated via malloc.
+	 */
+	char *format_data;
+	/** Length of MsgPack encoded format clause. */
+	size_t format_data_len;
 	char name[0];
 };
 
@@ -171,7 +229,8 @@ space_def_new(uint32_t id, uint32_t uid, uint32_t exact_field_count,
 	      const char *name, uint32_t name_len,
 	      const char *engine_name, uint32_t engine_len,
 	      const struct space_opts *opts, const struct field_def *fields,
-	      uint32_t field_count);
+	      uint32_t field_count, const char *format_data,
+	      size_t format_data_len);
 
 /**
  * Create a new ephemeral space definition.
@@ -199,6 +258,15 @@ space_tuple_format_new(struct tuple_format_vtab *vtab, void *engine,
 		       struct key_def *const *keys, uint16_t key_count,
 		       const struct space_def *def);
 
+/**
+ * Check if msgpack array pointed to by @a data represents a space definition
+ * tuple which corresponds to a temporary space.
+ * If @a space_id is not NULL the id of the space will be written into it in
+ * case of success.
+ */
+bool
+space_def_tuple_is_temporary(const char *data, uint32_t *space_id);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 
@@ -209,11 +277,13 @@ space_def_new_xc(uint32_t id, uint32_t uid, uint32_t exact_field_count,
 		 const char *name, uint32_t name_len,
 		 const char *engine_name, uint32_t engine_len,
 		 const struct space_opts *opts, const struct field_def *fields,
-		 uint32_t field_count)
+		 uint32_t field_count, const char *format_data,
+		 size_t format_data_len)
 {
 	struct space_def *ret = space_def_new(id, uid, exact_field_count, name,
 					      name_len, engine_name, engine_len,
-					      opts, fields, field_count);
+					      opts, fields, field_count,
+					      format_data, format_data_len);
 	if (ret == NULL)
 		diag_raise();
 	return ret;

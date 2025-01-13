@@ -28,7 +28,12 @@ macro(curl_build)
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCMAKE_C_FLAGS=${LIBCURL_CFLAGS}")
 
     # Switch on the static build.
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_STATICLIB=ON")
+    #
+    # The BUILD_STATIC_CURL option has no effect, because
+    # BUILD_CURL_EXE iS OFF. It is set for consistency:
+    # our approach is to set all options explicitly.
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DBUILD_STATIC_LIBS=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DBUILD_STATIC_CURL=ON")
 
     # Switch off the shared build.
     list(APPEND LIBCURL_CMAKE_FLAGS "-DBUILD_SHARED_LIBS=OFF")
@@ -40,6 +45,12 @@ macro(curl_build)
 
     # Let's disable testing for curl to save build time.
     list(APPEND LIBCURL_CMAKE_FLAGS "-DBUILD_TESTING=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_TEST_BUNDLES=OFF")
+
+    # Let's disable building documentation for curl to save build time.
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DENABLE_CURL_MANUAL=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DBUILD_MISC_DOCS=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DBUILD_LIBCURL_DOCS=OFF")
 
     # Setup use of openssl, use the same OpenSSL library
     # for libcurl as is used for tarantool itself.
@@ -89,7 +100,12 @@ macro(curl_build)
     # Additionaly disable some more protocols.
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_SMB=ON")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_GOPHER=ON")
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_CRYPTO_AUTH=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_BASIC_AUTH=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_BEARER_AUTH=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_DIGEST_AUTH=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_KERBEROS_AUTH=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_NEGOTIATE_AUTH=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_AWS=ON")
 
     # Don't attempt to find system CA bundle/certificates at
     # libcurl configuration step (build time). Fallback to
@@ -128,19 +144,26 @@ macro(curl_build)
     list(APPEND LIBCURL_CMAKE_FLAGS "-DBUILD_CURL_EXE=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_BROTLI=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_GNUTLS=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_GNUTLS=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_MBEDTLS=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_WOLFSSL=OFF")
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_NSS=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_LIBRTMP=OFF")
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DHAVE_LIBIDN2=OFF")
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_LIBIDN2=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_RUSTLS=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_WOLFSSH=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_GSASL=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_LIBIDN2=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_NGTCP2=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_NGHTTP3=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_QUICHE=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_OPENSSL_QUIC=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_HTTP=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_PROXY=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_SHA512_256=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DENABLE_IPV6=ON")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_COOKIES=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DBUILD_EXAMPLES=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_ECH=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_HTTPSRR=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DENABLE_UNIX_SOCKETS=ON")
     # Should be already set by "-DHTTP_ONLY=ON" above.
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_FTP=ON")
@@ -154,14 +177,17 @@ macro(curl_build)
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_POP3=ON")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_IMAP=ON")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_MQTT=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_IPFS=ON")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_SMTP=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_ALTSVC=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_SRP=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_DOH=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_GETOPTIONS=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_HSTS=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_HTTP_AUTH=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_LIBCURL_OPTION=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_MIME=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_FORM_API=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_NETRC=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_NTLM=ON")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_OPENSSL_AUTO_LOAD_CONFIG=OFF")
@@ -178,16 +204,20 @@ macro(curl_build)
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_GSSAPI=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_LIBSSH=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_LIBPSL=OFF")
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_OPENLDAP=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_USE_LIBUV=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_WERROR=OFF")
     # CURL_ZSTD adds zstd encoding/decoding support. Tuning libcurl's build to
     # catch the symbols may require extra work.
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_ZSTD=OFF")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DLIBCURL_OUTPUT_NAME=libcurl")
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DENABLE_CURLDEBUG=OFF")
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DENABLE_DEBUG=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DENABLE_CURLDEBUG=${TARANTOOL_DEBUG}")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DENABLE_DEBUG=${TARANTOOL_DEBUG}")
     list(APPEND LIBCURL_CMAKE_FLAGS "-DUSE_MSH3=OFF")
-    list(APPEND LIBCURL_CMAKE_FLAGS "-DENABLE_WEBSOCKETS=OFF")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_WEBSOCKETS=ON")
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCMAKE_UNITY_BUILD=OFF")
+    # Note that CMake build does not allow build curl and libcurl debug
+    # enabled, see https://github.com/curl/curl/blob/master/docs/INSTALL.cmake
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
 
     # We need PIC at least to enable build for Fedora on
     # ARM64 CPU. Without it configuration with Fedora
@@ -197,6 +227,15 @@ macro(curl_build)
     # For debug builds: name the library as libcurl.a, not
     # libcurl-d.a. We use this name below.
     list(APPEND LIBCURL_CMAKE_FLAGS "-DCMAKE_DEBUG_POSTFIX=")
+
+    # Disables 'install' targets.
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_INSTALL=OFF")
+
+    # Disables local binding support.
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_BINDLOCAL=OFF")
+
+    # Disables headers-api support.
+    list(APPEND LIBCURL_CMAKE_FLAGS "-DCURL_DISABLE_HEADERS_API=OFF")
 
     include(ExternalProject)
     ExternalProject_Add(
@@ -218,6 +257,14 @@ macro(curl_build)
     add_library(bundled-libcurl STATIC IMPORTED GLOBAL)
     set_target_properties(bundled-libcurl PROPERTIES IMPORTED_LOCATION
         ${LIBCURL_INSTALL_DIR}/lib/libcurl.a)
+    if (ENABLE_BUNDLED_ZLIB)
+        # Need to build zlib first
+        add_dependencies(bundled-libcurl-project bundled-zlib)
+    endif()
+    if (ENABLE_BUNDLED_OPENSSL)
+        # Need to build openssl first
+        add_dependencies(bundled-libcurl-project bundled-openssl)
+    endif()
     if (BUNDLED_LIBCURL_USE_ARES)
         # Need to build ares first
         add_dependencies(bundled-libcurl-project bundled-ares)

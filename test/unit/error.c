@@ -13,6 +13,7 @@
 #include "random.h"
 #include "ssl_error.h"
 #include "vclock/vclock.h"
+#include "box/tuple.h"
 
 #define UNIT_TAP_COMPATIBLE 1
 #include "unit.h"
@@ -454,7 +455,7 @@ static void
 test_error_code(void)
 {
 	header();
-	plan(9);
+	plan(10);
 
 	diag_set(ClientError, ER_READONLY);
 	is(box_error_code(box_error_last()), ER_READONLY, "ClientError");
@@ -477,6 +478,98 @@ test_error_code(void)
 	is(box_error_code(box_error_last()), ER_XLOG_GAP, "XlogGapError");
 	diag_set(FiberIsCancelled);
 	is(box_error_code(box_error_last()), ER_PROC_LUA, "FiberIsCancelled");
+	diag_set(IllegalParams, "foo");
+	is(box_error_code(box_error_last()), ER_ILLEGAL_PARAMS,
+	   "IllegalParams");
+
+	check_plan();
+	footer();
+}
+
+static void
+error_destroy(struct error *e)
+{
+	/* Intentionally left blank. */
+}
+
+static void
+test_error_format_msg(void)
+{
+	header();
+	plan(6);
+
+	char msg[DIAG_ERRMSG_MAX + 1];
+	struct error e;
+	error_create(&e, error_destroy, NULL, NULL, NULL, NULL, 0);
+	error_ref(&e);
+
+	/* Test largest message that fits into statically allocated buffer. */
+	for (size_t i = 0; i < DIAG_ERRMSG_MAX - 1; i++)
+		msg[i] = pseudo_random_in_range('a', 'z');
+	msg[DIAG_ERRMSG_MAX - 1] = '\0';
+	error_format_msg(&e, msg);
+	is(strcmp(box_error_message(&e), msg), 0, "errmsg is correct");
+	is(box_error_message(&e), e.errmsg_buf,
+	   "errmsg is statically allocated (%d characters)", strlen(msg));
+
+	/* This message doesn't fit into the static buffer. */
+	msg[DIAG_ERRMSG_MAX - 1] = '.';
+	msg[DIAG_ERRMSG_MAX] = '\0';
+	error_format_msg(&e, msg);
+	is(strcmp(box_error_message(&e), msg), 0, "errmsg is correct");
+	isnt(box_error_message(&e), e.errmsg_buf,
+	     "errmsg is dynamically allocated (%d characters)", strlen(msg));
+
+	/* This message fits into the static buffer again. */
+	msg[17] = '\0';
+	error_format_msg(&e, msg);
+	is(strcmp(box_error_message(&e), msg), 0, "errmsg is correct");
+	is(box_error_message(&e), e.errmsg_buf,
+	   "errmsg is statically allocated (%d characters)", strlen(msg));
+
+	error_unref(&e);
+
+	check_plan();
+	footer();
+}
+
+static void
+test_error_append_msg(void)
+{
+	header();
+	plan(5);
+
+	char msg[DIAG_ERRMSG_MAX];
+	struct error e;
+	error_create(&e, error_destroy, NULL, NULL, NULL, NULL, 0);
+	error_ref(&e);
+
+	error_format_msg(&e, "Message");
+	is(box_error_message(&e), e.errmsg_buf,
+	   "errmsg is statically allocated (%d characters)",
+	   strlen(box_error_message(&e)));
+
+	error_append_msg(&e, "/%s/%s/%d/", "foo", "bar", 123);
+	is(strcmp(box_error_message(&e), "Message/foo/bar/123/"), 0,
+	   "errmsg is correct");
+	is(box_error_message(&e), e.errmsg_buf,
+	   "errmsg is statically allocated (%d characters)",
+	   strlen(box_error_message(&e)));
+
+	for (size_t i = 0; i < DIAG_ERRMSG_MAX - 1; i++)
+		msg[i] = pseudo_random_in_range('a', 'z');
+	msg[DIAG_ERRMSG_MAX - 1] = '\0';
+	error_append_msg(&e, msg);
+	isnt(box_error_message(&e), e.errmsg_buf,
+	     "errmsg is dynamically allocated (%d characters)",
+	     strlen(box_error_message(&e)));
+
+	error_append_msg(&e, "%d/%d/%d", 1, 2, 3);
+	isnt(box_error_message(&e), e.errmsg_buf,
+	     "errmsg is dynamically allocated (%d characters)",
+	     strlen(box_error_message(&e)));
+
+	error_unref(&e);
 
 	check_plan();
 	footer();
@@ -517,15 +610,293 @@ test_pthread(void)
 	footer();
 }
 
+static void
+test_undefined_error_code(void)
+{
+	header();
+#ifdef TEST_BUILD
+	plan(10);
+#else
+	plan(5);
+#endif
+
+	const struct errcode_record *record;
+	ok(strcmp(tnt_errcode_str(box_error_code_MAX), "ER_UNKNOWN") == 0);
+	ok(strcmp(tnt_errcode_desc(box_error_code_MAX), "Unknown error") == 0);
+	record = tnt_errcode_record(box_error_code_MAX);
+	ok(strcmp(record->errstr, "ER_UNKNOWN") == 0);
+	ok(strcmp(record->errdesc, "Unknown error") == 0);
+	ok(record->errfields == NULL && record->errfields_count == 0);
+#ifdef TEST_BUILD
+	ok(strcmp(tnt_errcode_str(ER_TEST_FIRST - 1), "ER_UNKNOWN") == 0);
+	ok(strcmp(tnt_errcode_desc(ER_TEST_FIRST - 1), "Unknown error") == 0);
+	record = tnt_errcode_record(ER_TEST_FIRST - 1);
+	ok(strcmp(record->errstr, "ER_UNKNOWN") == 0);
+	ok(strcmp(record->errdesc, "Unknown error") == 0);
+	ok(record->errfields == NULL && record->errfields_count == 0);
+#endif
+
+	check_plan();
+	footer();
+}
+
+static void
+test_client_error_name(void)
+{
+	header();
+	plan(1);
+
+	diag_set(ClientError, ER_UNSUPPORTED, "foo", "bar");
+	struct error *e = diag_last_error(diag_get());
+	const char *s = error_get_str(e, "name");
+	ok(s != NULL && strcmp(s, "UNSUPPORTED") == 0);
+
+	check_plan();
+	footer();
+}
+
+#ifdef TEST_BUILD
+
+/* Test ClientError arguments become payload fields (gh-9109). */
+static void
+test_client_error_creation(void)
+{
+	header();
+	plan(67);
+
+	/* Test CHAR argument type */
+	const char *s;
+	struct error *e;
+	diag_set(ClientError, ER_TEST_TYPE_CHAR, 'c');
+	e = diag_last_error(diag_get());
+	s = error_get_str(e, "field");
+	ok(s != NULL && strcmp(s, "c") == 0);
+
+	/* Test INT argument type */
+	int64_t i;
+	diag_set(ClientError, ER_TEST_TYPE_INT, 1);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "field", &i) && i == 1);
+	diag_set(ClientError, ER_TEST_TYPE_INT, INT_MAX);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "field", &i) && i == INT_MAX);
+	diag_set(ClientError, ER_TEST_TYPE_INT, INT_MIN);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "field", &i) && i == INT_MIN);
+
+	/* Test UINT argument type */
+	uint64_t u;
+	diag_set(ClientError, ER_TEST_TYPE_UINT, 1);
+	e = diag_last_error(diag_get());
+	ok(error_get_uint(e, "field", &u) && u == 1);
+	diag_set(ClientError, ER_TEST_TYPE_UINT, UINT_MAX);
+	e = diag_last_error(diag_get());
+	ok(error_get_uint(e, "field", &u) && u == UINT_MAX);
+
+	/* Test LONG argument type */
+	diag_set(ClientError, ER_TEST_TYPE_LONG, 1L);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "field", &i) && i == 1);
+	diag_set(ClientError, ER_TEST_TYPE_LONG, LONG_MAX);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "field", &i) && i == LONG_MAX);
+	diag_set(ClientError, ER_TEST_TYPE_LONG, LONG_MIN);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "field", &i) && i == LONG_MIN);
+
+	/* Test ULONG argument type */
+	diag_set(ClientError, ER_TEST_TYPE_ULONG, 1UL);
+	e = diag_last_error(diag_get());
+	ok(error_get_uint(e, "field", &u) && u == 1);
+	diag_set(ClientError, ER_TEST_TYPE_ULONG, ULONG_MAX);
+	e = diag_last_error(diag_get());
+	ok(error_get_uint(e, "field", &u) && u == ULONG_MAX);
+
+	/* Test LLONG argument type */
+	diag_set(ClientError, ER_TEST_TYPE_LLONG, 1LL);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "field", &i) && i == 1);
+	diag_set(ClientError, ER_TEST_TYPE_LLONG, LLONG_MAX);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "field", &i) && i == LLONG_MAX);
+	diag_set(ClientError, ER_TEST_TYPE_LLONG, LLONG_MIN);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "field", &i) && i == LLONG_MIN);
+
+	/* Test ULLONG argument type */
+	diag_set(ClientError, ER_TEST_TYPE_ULLONG, 1ULL);
+	e = diag_last_error(diag_get());
+	ok(error_get_uint(e, "field", &u) && u == 1);
+	diag_set(ClientError, ER_TEST_TYPE_ULLONG, ULLONG_MAX);
+	e = diag_last_error(diag_get());
+	ok(error_get_uint(e, "field", &u) && u == ULLONG_MAX);
+
+	/* Test STRING argument type */
+	diag_set(ClientError, ER_TEST_TYPE_STRING, "hello");
+	e = diag_last_error(diag_get());
+	s = error_get_str(e, "field");
+	ok(s != NULL && strcmp(s, "hello") == 0);
+
+	/* Test MSGPACK argument type */
+	char mp_buf[128];
+	size_t size = mp_format(mp_buf, lengthof(mp_buf), "[%d, %s]", 42, "hi");
+	uint32_t mp_size;
+	const char *mp;
+	diag_set(ClientError, ER_TEST_TYPE_MSGPACK, mp_buf);
+	e = diag_last_error(diag_get());
+	mp = error_get_mp(e, "field", &mp_size);
+	ok(mp_size == size);
+	ok(s != NULL && memcmp(mp, mp_buf, mp_size) == 0);
+
+	/* Test TUPLE argument type */
+	struct tuple *tuple = tuple_new(tuple_format_runtime, mp_buf,
+					mp_buf + size);
+	diag_set(ClientError, ER_TEST_TYPE_TUPLE, tuple);
+	tuple_delete(tuple);
+	e = diag_last_error(diag_get());
+	mp = error_get_mp(e, "field", &mp_size);
+	ok(mp_size == size);
+	ok(s != NULL && memcmp(mp, mp_buf, mp_size) == 0);
+
+	/* Test different number of error arguments. */
+	diag_set(ClientError, ER_TEST_2_ARGS, 1, 2);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "f1", &i) && i == 1);
+	ok(error_get_int(e, "f2", &i) && i == 2);
+
+	diag_set(ClientError, ER_TEST_3_ARGS, 1, 2, 3);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "f1", &i) && i == 1);
+	ok(error_get_int(e, "f2", &i) && i == 2);
+	ok(error_get_int(e, "f3", &i) && i == 3);
+
+	diag_set(ClientError, ER_TEST_4_ARGS, 1, 2, 3, 4);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "f1", &i) && i == 1);
+	ok(error_get_int(e, "f2", &i) && i == 2);
+	ok(error_get_int(e, "f3", &i) && i == 3);
+	ok(error_get_int(e, "f4", &i) && i == 4);
+
+	diag_set(ClientError, ER_TEST_5_ARGS, 1, 2, 3, 4, 5);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "f1", &i) && i == 1);
+	ok(error_get_int(e, "f2", &i) && i == 2);
+	ok(error_get_int(e, "f3", &i) && i == 3);
+	ok(error_get_int(e, "f4", &i) && i == 4);
+	ok(error_get_int(e, "f5", &i) && i == 5);
+
+	diag_set(ClientError, ER_TEST_6_ARGS, 1, 2, 3, 4, 5, 6);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "f1", &i) && i == 1);
+	ok(error_get_int(e, "f2", &i) && i == 2);
+	ok(error_get_int(e, "f3", &i) && i == 3);
+	ok(error_get_int(e, "f4", &i) && i == 4);
+	ok(error_get_int(e, "f5", &i) && i == 5);
+	ok(error_get_int(e, "f6", &i) && i == 6);
+
+	/* Test format string is supported in message. */
+	diag_set(ClientError, ER_TEST_FORMAT_MSG, 1, "two");
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "f1", &i) && i == 1);
+	s = error_get_str(e, "f2");
+	ok(s != NULL && strcmp(s, "two") == 0);
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error 1 two") == 0);
+
+	/*
+	 * Test number of arguments of format string may be less
+	 * then number of payload arguments.
+	 */
+	diag_set(ClientError, ER_TEST_FORMAT_MSG_FEWER, 1, "seven", 3);
+	e = diag_last_error(diag_get());
+	ok(error_get_int(e, "f1", &i) && i == 1);
+	s = error_get_str(e, "f2");
+	ok(s != NULL && strcmp(s, "seven") == 0);
+	ok(error_get_int(e, "f3", &i) && i == 3);
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error 1 seven") == 0);
+
+	/*
+	 * Test if field name is "" then respective positional argument
+	 * is printed in formatted string message but not become payload.
+	 */
+	diag_set(ClientError, ER_TEST_FIRST);
+	e = diag_last_error(diag_get());
+	int ref_payload_count = e->payload.count;
+	diag_set(ClientError, ER_TEST_OMIT_TYPE_CHAR, 'x');
+	e = diag_last_error(diag_get());
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error x") == 0);
+	ok(e->payload.count == ref_payload_count);
+	diag_set(ClientError, ER_TEST_OMIT_TYPE_INT, 1);
+	e = diag_last_error(diag_get());
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error 1") == 0);
+	ok(e->payload.count == ref_payload_count);
+	diag_set(ClientError, ER_TEST_OMIT_TYPE_UINT, 2);
+	e = diag_last_error(diag_get());
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error 2") == 0);
+	ok(e->payload.count == ref_payload_count);
+	diag_set(ClientError, ER_TEST_OMIT_TYPE_LONG, 3L);
+	e = diag_last_error(diag_get());
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error 3") == 0);
+	ok(e->payload.count == ref_payload_count);
+	diag_set(ClientError, ER_TEST_OMIT_TYPE_ULONG, 4UL);
+	e = diag_last_error(diag_get());
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error 4") == 0);
+	ok(e->payload.count == ref_payload_count);
+	diag_set(ClientError, ER_TEST_OMIT_TYPE_LLONG, 5LL);
+	e = diag_last_error(diag_get());
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error 5") == 0);
+	ok(e->payload.count == ref_payload_count);
+	diag_set(ClientError, ER_TEST_OMIT_TYPE_ULLONG, 6ULL);
+	e = diag_last_error(diag_get());
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error 6") == 0);
+	ok(e->payload.count == ref_payload_count);
+	diag_set(ClientError, ER_TEST_OMIT_TYPE_STRING, "str");
+	e = diag_last_error(diag_get());
+	ok(e->errmsg != NULL && strcmp(e->errmsg, "Test error str") == 0);
+	ok(e->payload.count == ref_payload_count);
+
+	/*
+	 * Test if argument for payload-only field is NULL then it is
+	 * not added.
+	 */
+	diag_set(ClientError, ER_TEST_TYPE_STRING, NULL);
+	e = diag_last_error(diag_get());
+	s = error_get_str(e, "field");
+	ok(s == NULL);
+	diag_set(ClientError, ER_TEST_TYPE_MSGPACK, NULL);
+	e = diag_last_error(diag_get());
+	mp = error_get_mp(e, "field", &mp_size);
+	ok(mp == NULL);
+	diag_set(ClientError, ER_TEST_TYPE_TUPLE, NULL);
+	e = diag_last_error(diag_get());
+	mp = error_get_mp(e, "field", &mp_size);
+	ok(mp == NULL);
+
+	check_plan();
+	footer();
+}
+
+#endif
+
+static uint32_t
+field_name_hash_impl(const char *str, uint32_t len)
+{
+	return str[0] + len;
+}
+
 int
 main(void)
 {
 	header();
-	plan(11);
+#ifdef TEST_BUILD
+	plan(16);
+#else
+	plan(15);
+#endif
 
 	random_init();
 	memory_init();
 	fiber_init(fiber_c_invoke);
+	tuple_init(field_name_hash_impl);
 
 	test_payload_field_str();
 	test_payload_field_uint();
@@ -537,8 +908,16 @@ main(void)
 	test_payload_clear();
 	test_payload_move();
 	test_error_code();
+	test_error_format_msg();
+	test_error_append_msg();
 	test_pthread();
+	test_undefined_error_code();
+	test_client_error_name();
+#ifdef TEST_BUILD
+	test_client_error_creation();
+#endif
 
+	tuple_free();
 	fiber_free();
 	memory_free();
 	random_free();

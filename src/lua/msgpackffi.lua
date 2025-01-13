@@ -1,9 +1,11 @@
 -- msgpackffi.lua (internal file)
 
+local tweaks = require('internal.tweaks')
 local ffi = require('ffi')
 local buffer = require('buffer')
 local builtin = ffi.C
 local msgpack = require('msgpack') -- .NULL, .array_mt, .map_mt, .cfg
+local varbinary = require('varbinary')
 local int8_ptr_t = ffi.typeof('int8_t *')
 local uint8_ptr_t = ffi.typeof('uint8_t *')
 local uint16_ptr_t = ffi.typeof('uint16_t *')
@@ -216,6 +218,20 @@ local function encode_str(buf, str)
     ffi.copy(p, str, len)
 end
 
+local function encode_bin(buf, bin)
+    local len = #bin
+    buf:reserve(5 + len)
+    if len <= 0xff then
+        encode_u8(buf, 0xc4, len)
+    elseif len <= 0xffff then
+        encode_u16(buf, 0xc5, len)
+    else
+        encode_u32(buf, 0xc6, len)
+    end
+    local p = buf:alloc(len)
+    ffi.copy(p, bin, len)
+end
+
 local function encode_array(buf, size)
     if size <= 0xf then
         encode_fix(buf, 0x90, size)
@@ -258,7 +274,7 @@ local function encode_error(buf, err)
     end
 end
 
-local function encode_r(buf, obj, level)
+local function encode_r(buf, obj, level, trace_level)
 ::restart::
     if type(obj) == "number" then
         -- Lua-way to check that number is an integer
@@ -272,8 +288,10 @@ local function encode_r(buf, obj, level)
     elseif type(obj) == "table" then
         if level >= msgpack.cfg.encode_max_depth then
             if not msgpack.cfg.encode_deep_as_nil then
-                error(string.format('Too high nest level - %d',
-                                    msgpack.cfg.encode_max_depth + 1))
+                box.error(box.error.PROC_LUA,
+                          string.format('Too high nest level - %d',
+                                        msgpack.cfg.encode_max_depth + 1),
+                          trace_level and trace_level + 1)
             end
             encode_nil(buf)
             return
@@ -298,20 +316,22 @@ local function encode_r(buf, obj, level)
             serialize == 'seq' or serialize == 'sequence' then
             encode_array(buf, array_count)
             for i=1,array_count,1 do
-                encode_r(buf, obj[i], level + 1)
+                encode_r(buf, obj[i], level + 1,
+                         trace_level and trace_level + 1)
             end
         elseif (serialize == nil and map_count > 0) or
             serialize == 'map' or serialize == 'mapping' then
             encode_map(buf, array_count + map_count)
             for key, val in pairs(obj) do
-                encode_r(buf, key, level + 1)
-                encode_r(buf, val, level + 1)
+                encode_r(buf, key, level + 1, trace_level and trace_level + 1)
+                encode_r(buf, val, level + 1, trace_level and trace_level + 1)
             end
         elseif type(serialize) == 'function' then
             obj = serialize(obj)
             goto restart
         else
-            error("Invalid __serialize value")
+            box.error(box.error.PROC_LUA, "Invalid __serialize value",
+                      trace_level and trace_level + 1)
         end
     elseif obj == nil then
         encode_nil(buf)
@@ -327,10 +347,14 @@ local function encode_r(buf, obj, level)
         if fun ~= nil then
             fun(buf, obj)
         else
-            error("can not encode FFI type: '"..ffi.typeof(obj).."'")
+            box.error(box.error.PROC_LUA,
+                      "can not encode FFI type: '"..ffi.typeof(obj).."'",
+                      trace_level and trace_level + 1)
         end
     else
-        error("can not encode Lua type: '"..type(obj).."'")
+        box.error(box.error.PROC_LUA,
+                  "can not encode Lua type: '"..type(obj).."'",
+                  trace_level and trace_level + 1)
     end
 end
 
@@ -357,6 +381,7 @@ on_encode(ffi.typeof('const unsigned char'), encode_int)
 on_encode(ffi.typeof('bool'), encode_bool_cdata)
 on_encode(ffi.typeof('float'), encode_float)
 on_encode(ffi.typeof('double'), encode_double)
+on_encode(ffi.typeof('struct varbinary'), encode_bin)
 on_encode(ffi.typeof('decimal_t'), encode_decimal)
 on_encode(ffi.typeof('struct tt_uuid'), encode_uuid)
 on_encode(ffi.typeof('const struct error &'), encode_error)
@@ -518,6 +543,15 @@ local function decode_str(data, size)
     return ret
 end
 
+local function decode_bin(data, size)
+    if tweaks.msgpack_decode_binary_as_string then
+        return decode_str(data, size)
+    end
+    local ret = varbinary.new(data[0], size)
+    data[0] = data[0] + size
+    return ret
+end
+
 local function decode_array(data, size)
     assert (type(size) == "number")
     local arr = {}
@@ -599,9 +633,9 @@ end
 
 local decoder_hint = {
     --[[{{{ MP_BIN]]
-    [0xc4] = function(data) return decode_str(data, decode_u8(data)) end;
-    [0xc5] = function(data) return decode_str(data, decode_u16(data)) end;
-    [0xc6] = function(data) return decode_str(data, decode_u32(data)) end;
+    [0xc4] = function(data) return decode_bin(data, decode_u8(data)) end;
+    [0xc5] = function(data) return decode_bin(data, decode_u16(data)) end;
+    [0xc6] = function(data) return decode_bin(data, decode_u32(data)) end;
 
     --[[MP_FLOAT, MP_DOUBLE]]
     [0xca] = decode_float;

@@ -5,9 +5,11 @@ local fio = require('fio')
 local xlog = require('xlog')
 local ffi = require('ffi')
 local fun = require('fun')
+local utils = require('internal.utils')
+local tarantool = require('tarantool')
+local mkversion = require('version')
 
 ffi.cdef([[
-    uint32_t box_dd_version_id(void);
     void box_init_latest_dd_version_id(uint32_t version_id);
     bool box_schema_needs_upgrade(void);
     int box_schema_upgrade_begin(void);
@@ -37,40 +39,6 @@ local SUPER = 31
 -- not possible to infer type from table content.
 local function setmap(tab)
     return setmetatable(tab, { __serialize = 'map' })
-end
-
-local mkversion = {}
-mkversion.__index = mkversion
-setmetatable(mkversion, {__call = function(c, ...) return c.new(...) end})
-
-function mkversion.new(major, minor, patch)
-    local self = setmetatable({}, mkversion)
-    self.major = major
-    self.minor = minor
-    self.patch = patch
-    self.id = bit.bor(bit.lshift(bit.bor(bit.lshift(major, 8), minor), 8), patch)
-    return self
-end
-
--- Parse string with version in format 'A.B.C' to version object.
-function mkversion.parse(version)
-    local major, minor, patch = version:match('^(%d+)%.(%d+)%.(%d+)$')
-    if major == nil then
-        error('version should be in format A.B.C')
-    end
-    return mkversion.new(tonumber(major), tonumber(minor), tonumber(patch))
-end
-
-function mkversion.__tostring(self)
-    return string.format('%s.%s.%s', self.major, self.minor, self.patch)
-end
-
-function mkversion.__eq(lhs, rhs)
-    return lhs.id == rhs.id
-end
-
-function mkversion.__lt(lhs, rhs)
-    return lhs.id < rhs.id
 end
 
 -- space:truncate() doesn't work with disabled triggers on __index
@@ -137,16 +105,6 @@ local function reset_system_formats()
     end)
 end
 
-local function version_from_tuple(tuple)
-    local major, minor, patch = tuple:unpack(2, 4)
-    patch = patch or 0
-    if major and minor and type(major) == 'number' and
-       type(minor) == 'number' and type(patch) == 'number' then
-        return mkversion(major, minor, patch)
-    end
-    return nil
-end
-
 -- Get schema version, stored in _schema system space, by reading the latest
 -- snapshot file from the snap_dir. Useful to define schema_version before
 -- recovering the snapshot, because some schema versions are too old and cannot
@@ -166,7 +124,7 @@ local function get_snapshot_version(snap_dir)
         if sid == box.schema.SCHEMA_ID then
             local tuple = row.BODY.tuple
             if tuple and tuple[1] == 'version' then
-                version = version_from_tuple(tuple)
+                version = box.internal.version_from_tuple(tuple)
                 if not version then
                     log.error("Corrupted version tuple in space '_schema' "..
                               "in snapshot '%s': %s ", snap, tuple)
@@ -295,7 +253,7 @@ local function upgrade_to_1_7_5()
 end
 
 local function user_trig_1_7_5(_, tuple)
-    if tuple and not tuple[5] then
+    if tuple and (type(tuple[5]) ~= 'table' or next(tuple[5]) == nil) then
         tuple = tuple:update{{'=', 5, setmap({})}}
         log.info("Set empty password to %s '%s'", tuple[4], tuple[3])
     end
@@ -581,6 +539,58 @@ local sequence_format = {{name = 'id', type = 'unsigned'},
 --------------------------------------------------------------------------------
 -- Tarantool 1.7.6
 --------------------------------------------------------------------------------
+
+--
+-- Update format of user spaces. Format of system spaces have been updated
+-- during upgrade to 1.7.5. However commit 519bc82e ("Parse and validate
+-- space formats") introduced strict checking of format field. Now tarantool
+-- requires, that format is written as map with explicit 'name' and 'type'
+-- keys: {name = 'a', type = 'number'}. Previously, it wasn't a case,
+-- anything could be written in the space format.
+--
+local function space_trig_1_7_6(_, tuple)
+    -- Do nothing for system spaces.
+    if tuple == nil or tuple[1] <= box.schema.SYSTEM_ID_MAX then
+        return tuple
+    end
+
+    -- If it's a complete garbage or tuple[7] is missing, use empty format.
+    -- Also, overwrite the table, if it's empty to be sure, that it's
+    -- encoded as array and not as map.
+    local new_format = {}
+    if type(tuple[7]) == 'table' and next(tuple[7]) ~= nil then
+        -- Non empty format. Check format and change if it's possible.
+        for i, f in ipairs(tuple[7]) do
+            -- Create the fields from ground up. Better not to use existing
+            -- ones, anything can be there, we must be sure, that every field
+            -- is encoded as map and has 'name' and 'type' keys.
+            local field = setmap({
+                name = f['name'],
+                type = f['type'],
+            })
+
+            if field['name'] == nil then
+                if type(f[1]) ~= 'string' then
+                    local err = "Cannot find name for field %d in space %s"
+                    error(err:format(i, tuple[3]))
+                end
+                field['name'] = f[1]
+            end
+            if field['type'] == nil then
+                field['type'] = type(f[2]) == 'string' and f[2] or 'any'
+            end
+            table.insert(new_format, field)
+        end
+    end
+    if not table.equals(tuple[7], new_format) then
+        -- Better to be as verbose as it's possible. So that user can
+        -- restore the previous format if smth goes wrong.
+        log.info("Update space '%s' format: old format %s, new format %s",
+                 tuple[3], json.encode(tuple[7]), json.encode(new_format))
+        tuple = tuple:update{{'=', 7, new_format}}
+    end
+    return tuple
+end
 
 local function create_sequence_space()
     local _space = box.space[box.schema.SPACE_ID]
@@ -1442,39 +1452,85 @@ local function upgrade_to_3_0_0()
 end
 
 --------------------------------------------------------------------------------
+-- Tarantool 3.1.0
+--------------------------------------------------------------------------------
+
+local function add_trigger_to_func()
+    log.info('add trigger to _func')
+    local _space = box.space[box.schema.SPACE_ID]
+    local _func = box.space[box.schema.FUNC_ID]
+    local _vfunc = box.space[box.schema.VFUNC_ID]
+    for _, v in _func:pairs() do
+        _func:update(v[1], {{'=', 20, {}}})
+    end
+    local ops = {{'=', '[7][20]', {name = 'trigger', type = 'array'}}}
+    _space:update({_func.id}, ops)
+    _space:update({_vfunc.id}, ops)
+end
+
+local function upgrade_to_3_1_0()
+    add_trigger_to_func()
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 3.3.0
+--------------------------------------------------------------------------------
+
+local function create_gc_consumers()
+    local _space = box.space[box.schema.SPACE_ID]
+    local _index = box.space[box.schema.INDEX_ID]
+    local _priv = box.space[box.schema.PRIV_ID]
+    local space_id = box.schema.GC_CONSUMERS_ID
+    local opts = {group_id = 1}
+
+    log.info("create space _gc_consumers")
+    local format = {{name = 'uuid', type = 'string'},
+                    {name = 'vclock', type = 'map'},
+                    {name = 'opts', type = 'map'}}
+    _space:insert{space_id, ADMIN, '_gc_consumers', 'memtx', 0, opts,
+                  format}
+
+    -- replication can create and update persistent gc consumers
+    log.info("grant write on space _gc_consumers to replication")
+    _priv:replace{ADMIN, REPLICATION, 'space', box.schema.GC_CONSUMERS_ID,
+                  box.priv.W}
+
+    log.info("create primary index for space _gc_consumers")
+    _index:insert{space_id, 0, 'primary', 'tree', { unique = true },
+                  {{0, 'string'}}}
+end
+local function upgrade_to_3_3_0()
+    create_gc_consumers()
+end
+
+--------------------------------------------------------------------------------
 
 local handlers = {
-    {version = mkversion(1, 7, 5), func = upgrade_to_1_7_5},
-    {version = mkversion(1, 7, 6), func = upgrade_to_1_7_6},
-    {version = mkversion(1, 7, 7), func = upgrade_to_1_7_7},
-    {version = mkversion(1, 10, 0), func = upgrade_to_1_10_0},
-    {version = mkversion(1, 10, 2), func = upgrade_to_1_10_2},
-    {version = mkversion(2, 1, 0), func = upgrade_to_2_1_0},
-    {version = mkversion(2, 1, 1), func = upgrade_to_2_1_1},
-    {version = mkversion(2, 1, 2), func = upgrade_to_2_1_2},
-    {version = mkversion(2, 1, 3), func = upgrade_to_2_1_3},
-    {version = mkversion(2, 2, 1), func = upgrade_to_2_2_1},
-    {version = mkversion(2, 3, 0), func = upgrade_to_2_3_0},
-    {version = mkversion(2, 3, 1), func = upgrade_to_2_3_1},
-    {version = mkversion(2, 7, 1), func = upgrade_to_2_7_1},
-    {version = mkversion(2, 9, 1), func = upgrade_to_2_9_1},
-    {version = mkversion(2, 10, 1), func = upgrade_to_2_10_1},
-    {version = mkversion(2, 10, 4), func = upgrade_to_2_10_4},
-    {version = mkversion(2, 10, 5), func = upgrade_to_2_10_5},
-    {version = mkversion(2, 11, 0), func = upgrade_to_2_11_0},
-    {version = mkversion(2, 11, 1), func = upgrade_to_2_11_1},
-    {version = mkversion(3, 0, 0), func = upgrade_to_3_0_0},
+    {version = mkversion.new(1, 7, 5), func = upgrade_to_1_7_5},
+    {version = mkversion.new(1, 7, 6), func = upgrade_to_1_7_6},
+    {version = mkversion.new(1, 7, 7), func = upgrade_to_1_7_7},
+    {version = mkversion.new(1, 10, 0), func = upgrade_to_1_10_0},
+    {version = mkversion.new(1, 10, 2), func = upgrade_to_1_10_2},
+    {version = mkversion.new(2, 1, 0), func = upgrade_to_2_1_0},
+    {version = mkversion.new(2, 1, 1), func = upgrade_to_2_1_1},
+    {version = mkversion.new(2, 1, 2), func = upgrade_to_2_1_2},
+    {version = mkversion.new(2, 1, 3), func = upgrade_to_2_1_3},
+    {version = mkversion.new(2, 2, 1), func = upgrade_to_2_2_1},
+    {version = mkversion.new(2, 3, 0), func = upgrade_to_2_3_0},
+    {version = mkversion.new(2, 3, 1), func = upgrade_to_2_3_1},
+    {version = mkversion.new(2, 7, 1), func = upgrade_to_2_7_1},
+    {version = mkversion.new(2, 9, 1), func = upgrade_to_2_9_1},
+    {version = mkversion.new(2, 10, 1), func = upgrade_to_2_10_1},
+    {version = mkversion.new(2, 10, 4), func = upgrade_to_2_10_4},
+    {version = mkversion.new(2, 10, 5), func = upgrade_to_2_10_5},
+    {version = mkversion.new(2, 11, 0), func = upgrade_to_2_11_0},
+    {version = mkversion.new(2, 11, 1), func = upgrade_to_2_11_1},
+    {version = mkversion.new(3, 0, 0), func = upgrade_to_3_0_0},
+    {version = mkversion.new(3, 1, 0), func = upgrade_to_3_1_0},
+    {version = mkversion.new(3, 3, 0), func = upgrade_to_3_3_0},
 }
-builtin.box_init_latest_dd_version_id(handlers[#handlers].version.id)
-
--- Schema version of the snapshot.
-local function get_version()
-    local version = builtin.box_dd_version_id()
-    local major = bit.band(bit.rshift(version, 16), 0xff)
-    local minor = bit.band(bit.rshift(version, 8), 0xff)
-    local patch = bit.band(version, 0xff)
-    return mkversion(major, minor, patch)
-end
+builtin.box_init_latest_dd_version_id(
+    box.internal.version_to_id(handlers[#handlers].version))
 
 local trig_oldest_version = nil
 
@@ -1496,17 +1552,20 @@ local trig_oldest_version = nil
 -- * then usual upgrade_to_X_X_X() handlers may be fired to turn schema into the
 --   latest one.
 local recovery_triggers = {
-    {version = mkversion(1, 7, 1), tbl = {
+    {version = mkversion.new(1, 7, 1), tbl = {
         _user   = user_trig_1_7_1,
     }},
-    {version = mkversion(1, 7, 2), tbl = {
+    {version = mkversion.new(1, 7, 2), tbl = {
         _index = index_trig_1_7_2,
     }},
-    {version = mkversion(1, 7, 5), tbl = {
+    {version = mkversion.new(1, 7, 5), tbl = {
         _space = space_trig_1_7_5,
         _user  = user_trig_1_7_5,
     }},
-    {version = mkversion(1, 7, 7), tbl = {
+    {version = mkversion.new(1, 7, 6), tbl = {
+        _space = space_trig_1_7_6,
+    }},
+    {version = mkversion.new(1, 7, 7), tbl = {
         _priv   = priv_trig_1_7_7,
     }},
 }
@@ -1515,7 +1574,7 @@ local recovery_triggers = {
 -- snapshot), the triggers helping recover the old schema should be removed.
 local function schema_trig_last(_, tuple)
     if tuple and tuple[1] == 'version' then
-        local version = version_from_tuple(tuple)
+        local version = box.internal.version_from_tuple(tuple)
         if version then
             log.info("Recovery trigger: recovered schema version %s. "..
                      "Removing outdated recovery triggers.", version)
@@ -1560,7 +1619,7 @@ local function clear_recovery_triggers(version)
 end
 
 local function upgrade_from(version)
-    if version < mkversion(1, 6, 8) then
+    if version < mkversion.new(1, 6, 8) then
         log.warn('can upgrade from 1.6.8 only')
         return
     end
@@ -1582,6 +1641,7 @@ end
 -- Runs the given function with the permission to execute DDL operations
 -- with an old schema. Used by upgrade/downgrade scripts.
 local function run_upgrade(func, ...)
+    utils.box_check_configured()
     if builtin.box_schema_upgrade_begin() ~= 0 then
         box.error()
     end
@@ -1593,7 +1653,7 @@ local function run_upgrade(func, ...)
 end
 
 local function upgrade()
-    local version = get_version()
+    local version = box.internal.dd_version()
     run_upgrade(upgrade_from, version)
 end
 
@@ -1626,20 +1686,15 @@ local function restore_sql_builtin_functions(issue_handler)
     }
     local datetime = os.date("%Y-%m-%d %H:%M:%S")
     local _func = box.space._func
-    -- Otherwise we can't insert SQL_BUILTIN function. It is prohibited
-    -- to add since 2.9.0.
-    with_disabled_system_triggers(function()
-        for _, func in ipairs(sql_builtin_list) do
-            if _func.index.name:get(func) == nil then
-                local t = _func:auto_increment{
-                    ADMIN, func, 1, 'SQL_BUILTIN', '', 'function', {}, 'any',
-                    'none', 'none', false, false, true, {}, setmap({}), '',
-                    datetime, datetime}
-                box.space._priv:replace{ADMIN, PUBLIC, 'function', t.id,
-                                        box.priv.X}
-            end
+    for _, func in ipairs(sql_builtin_list) do
+        if _func.index.name:get(func) == nil then
+            local t = _func:auto_increment{
+                ADMIN, func, 1, 'SQL_BUILTIN', '', 'function', {}, 'any',
+                'none', 'none', false, false, true, {}, setmap({}), '',
+                datetime, datetime}
+            box.space._priv:replace{ADMIN, PUBLIC, 'function', t.id, box.priv.X}
         end
-    end)
+    end
 end
 
 local function downgrade_from_2_9_1(issue_handler)
@@ -1809,16 +1864,13 @@ local function drop_vspace_sequence_space(issue_handler)
     end
     log.info("revoke grants for 'public' role for _vspace_sequence")
     box.space._priv:delete{PUBLIC, 'space', box.schema.VSPACE_SEQUENCE_ID}
-    local indexes = box.space._index:select(box.schema.VSPACE_SEQUENCE_ID)
-    -- Otherwise we can't drop neither the primary index nor the space.
-    with_disabled_system_triggers(function()
-        for _, index in pairs(indexes) do
-            log.info("drop index %s on _vspace_sequence", index[3])
-            box.space._index:delete{index[1], index[2]}
-        end
-        log.info("drop view _vspace_sequence")
-        box.space._space:delete{box.schema.VSPACE_SEQUENCE_ID}
-    end)
+    for _, index in box.space._index:pairs(box.schema.VSPACE_SEQUENCE_ID,
+                                           {iterator = 'REQ'}) do
+        log.info("drop index %s on _vspace_sequence", index[3])
+        box.space._index:delete{index[1], index[2]}
+    end
+    log.info("drop view _vspace_sequence")
+    box.space._space:delete{box.schema.VSPACE_SEQUENCE_ID}
 end
 
 local function downgrade_from_2_10_5(issue_handler)
@@ -1971,23 +2023,6 @@ local function store_replicaset_uuid_in_old_way(issue_handler)
     change_replicaset_uuid_key('replicaset_uuid', 'cluster')
 end
 
--- Global names are stored in spaces. Can't silently delete them. It might break
--- the cluster. The user has to do it manually and carefully.
-local function check_names_are_not_set(issue_handler)
-    local _schema = box.space._schema
-    local msg_suffix = 'name is set. It is supported from version 3.0.0'
-    if _schema:get{'cluster_name'} ~= nil then
-        issue_handler('Cluster %s', msg_suffix)
-    end
-    if _schema:get{'replicaset_name'} ~= nil then
-        issue_handler('Replicaset %s', msg_suffix)
-    end
-    local row = box.space._cluster:get{box.info.id}
-    if row ~= nil and row.name ~= nil then
-        issue_handler('Instance %s', msg_suffix)
-    end
-end
-
 local function drop_instance_names(issue_handler)
     if issue_handler.dry_run then
         return
@@ -2002,8 +2037,73 @@ end
 
 local function downgrade_from_3_0_0(issue_handler)
     store_replicaset_uuid_in_old_way(issue_handler)
-    check_names_are_not_set(issue_handler)
+    -- It's allowed to downgrade with names set in order to simlify the
+    -- downgrade process. Names will properly work on schema 2.11, since
+    -- the DDL is allowed, even though they they're not in the format.
     drop_instance_names(issue_handler)
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 3.1.0
+--------------------------------------------------------------------------------
+
+local function drop_trigger_from_func(issue_handler)
+    local _space = box.space[box.schema.SPACE_ID]
+    local _func = box.space[box.schema.FUNC_ID]
+    local _vfunc = box.space[box.schema.VFUNC_ID]
+    local fmt = 'Function %s is registered as event trigger. ' ..
+                'It is supported starting from version 3.1.0'
+    if #_func:format() == 19 then
+        return
+    end
+    if not issue_handler.dry_run then
+        log.info('drop trigger from _func')
+        local ops = {{'#', '[7][20]', 1}}
+        _space:update({_func.id}, ops)
+        _space:update({_vfunc.id}, ops)
+    end
+    for _, v in _func:pairs() do
+        if #v > 19 and not table.equals(v[20], {}) then
+            issue_handler(fmt, v.name)
+        end
+        if not issue_handler.dry_run then
+            _func:update(v[1], {{'#', 20, 1}})
+        end
+    end
+end
+
+local function downgrade_from_3_1_0(issue_handler)
+    drop_trigger_from_func(issue_handler)
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 3.3.0
+--------------------------------------------------------------------------------
+
+local function drop_gc_consumers(issue_handler)
+    -- GC consumers are created by Tarantool, not users, so the space
+    -- can be dropped even if some persistent consumers are left
+    if issue_handler.dry_run then
+        return
+    end
+
+    local _space = box.space[box.schema.SPACE_ID]
+    local _index = box.space[box.schema.INDEX_ID]
+    local _priv = box.space[box.schema.PRIV_ID]
+    local space_id = box.schema.GC_CONSUMERS_ID
+
+    log.info("drop primary index of _gc_consumers")
+    _index:delete{space_id, 0}
+
+    log.info("drop replication privilege for _gc_consumers")
+    _priv:delete{REPLICATION, 'space', space_id}
+
+    log.info("drop space _gc_consumers")
+    _space:delete{space_id}
+end
+
+local function downgrade_from_3_3_0(issue_handler)
+    drop_gc_consumers(issue_handler)
 end
 
 -- Versions should be ordered from newer to older.
@@ -2023,12 +2123,14 @@ end
 -- if schema version is 2.10.0.
 --
 local downgrade_handlers = {
-    {version = mkversion(3, 0, 0), func = downgrade_from_3_0_0},
-    {version = mkversion(2, 11, 1), func = downgrade_from_2_11_1},
-    {version = mkversion(2, 11, 0), func = downgrade_from_2_11_0},
-    {version = mkversion(2, 10, 5), func = downgrade_from_2_10_5},
-    {version = mkversion(2, 10, 0), func = downgrade_from_2_10_0},
-    {version = mkversion(2, 9, 1), func = downgrade_from_2_9_1},
+    {version = mkversion.new(3, 3, 0), func = downgrade_from_3_3_0},
+    {version = mkversion.new(3, 1, 0), func = downgrade_from_3_1_0},
+    {version = mkversion.new(3, 0, 0), func = downgrade_from_3_0_0},
+    {version = mkversion.new(2, 11, 1), func = downgrade_from_2_11_1},
+    {version = mkversion.new(2, 11, 0), func = downgrade_from_2_11_0},
+    {version = mkversion.new(2, 10, 5), func = downgrade_from_2_10_5},
+    {version = mkversion.new(2, 10, 0), func = downgrade_from_2_10_0},
+    {version = mkversion.new(2, 9, 1), func = downgrade_from_2_9_1},
 }
 
 -- This downgrade issue handler is used to raise an error when issue is
@@ -2066,8 +2168,8 @@ end
 -- Find schema version which does not require upgrade for given application
 -- version. For example:
 --
--- app2schema_version(mkversion('2.10.3')) == mkversion('2.10.1')
--- app2schema_version(mkversion('2.10.0')) == mkversion('2.9.1')
+-- app2schema_version(mkversion.new('2.10.3')) == mkversion.new('2.10.1')
+-- app2schema_version(mkversion.new('2.10.0')) == mkversion.new('2.9.1')
 local function app2schema_version(app_version)
     local schema_version
     for _, handler in ipairs(handlers) do
@@ -2094,6 +2196,7 @@ end
 
 -- List of all Tarantool releases we can downgrade to.
 local downgrade_versions = {
+    -- DOWNGRADE VERSIONS BEGIN
     "2.8.2",
     "2.8.3",
     "2.8.4",
@@ -2103,9 +2206,26 @@ local downgrade_versions = {
     "2.10.3",
     "2.10.4",
     "2.10.5",
+    "2.10.6",
+    "2.10.7",
+    "2.10.8",
     "2.11.0",
     "2.11.1",
+    "2.11.2",
+    "2.11.3",
+    "2.11.4",
+    "2.11.5",
     "3.0.0",
+    "3.0.1",
+    "3.0.2",
+    "3.1.0",
+    "3.1.1",
+    "3.1.2",
+    "3.2.0",
+    "3.2.1",
+    "3.3.0",
+    "3.3.1",
+    -- DOWNGRADE VERSIONS END
 }
 
 -- Downgrade or list downgrade issues depending of dry_run argument value.
@@ -2116,14 +2236,21 @@ local downgrade_versions = {
 -- In case of downgrade check for issues is done before making any changes.
 -- If any issue is found then downgrade is failed and no any changes are done.
 local function downgrade_impl(version_str, dry_run)
-    box.internal.check_param(version_str, 'version_str', 'string')
-    local version = mkversion.parse(version_str)
+    utils.box_check_configured()
+    utils.check_param(version_str, 'version_str', 'string')
+    local version = mkversion.fromstr(version_str)
     if fun.index(version_str, downgrade_versions) == nil then
         error("Downgrade is only possible to version listed in" ..
               " box.schema.downgrade_versions().")
     end
 
-    local schema_version_cur = get_version()
+    local schema_version_cur = box.internal.dd_version()
+    local app_version = tarantool.version:match('^%d+%.%d+%.%d+')
+    if schema_version_cur > mkversion.fromstr(app_version) then
+        local err = "Cannot downgrade as current schema version %s is newer" ..
+                    " than Tarantool version %s"
+        error(err:format(schema_version_cur, app_version))
+    end
     local schema_version_dst = app2schema_version(version)
     if schema_version_cur < schema_version_dst then
         local err = "Cannot downgrade as current schema version %s is older" ..
@@ -2169,7 +2296,7 @@ local function bootstrap()
         -- insert initial schema
         initial_1_7_5()
         -- upgrade schema to the latest version
-        upgrade_from(mkversion(1, 7, 5))
+        upgrade_from(mkversion.new(1, 7, 5))
     end)
 
     reset_system_formats()
@@ -2188,7 +2315,9 @@ end
 box.schema.downgrade_issues = function(version)
     return downgrade_impl(version, true)
 end
-box.internal.bootstrap = bootstrap;
+box.internal.bootstrap = function()
+    run_upgrade(bootstrap)
+end
 box.internal.schema_needs_upgrade = builtin.box_schema_needs_upgrade
 box.internal.get_snapshot_version = get_snapshot_version;
 box.internal.set_recovery_triggers = set_recovery_triggers;

@@ -234,6 +234,11 @@ step_group_concat(struct sql_context *ctx, int argc, const struct Mem *argv)
 }
 
 /** Implementations of the ABS() function. */
+#if ENABLE_UB_SANITIZER
+static void
+func_abs_int(struct sql_context *ctx, int argc, const struct Mem *argv)
+  __attribute__((no_sanitize("signed-integer-overflow")));
+#endif
 static void
 func_abs_int(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
@@ -517,12 +522,9 @@ func_trim_str(struct sql_context *ctx, int argc, const struct Mem *argv)
 
 	struct region *region = &fiber()->gc;
 	size_t svp = region_used(region);
-	uint8_t *chars_len = region_alloc(region, chars_size);
-	if (chars_len == NULL) {
-		ctx->is_aborted = true;
-		diag_set(OutOfMemory, chars_size, "region_alloc", "chars_len");
-		return;
-	}
+	uint8_t *chars_len = NULL;
+	if (chars_size > 0)
+		chars_len = xregion_alloc(region, chars_size);
 	size_t chars_count = 0;
 
 	int32_t offset = 0;
@@ -794,13 +796,7 @@ func_char(struct sql_context *ctx, int argc, const struct Mem *argv)
 		return mem_set_str_static(ctx->pOut, "", 0);
 	struct region *region = &fiber()->gc;
 	size_t svp = region_used(region);
-	uint32_t size;
-	UChar32 *buf = region_alloc_array(region, typeof(*buf), argc, &size);
-	if (buf == NULL) {
-		ctx->is_aborted = true;
-		diag_set(OutOfMemory, size, "region_alloc_array", "buf");
-		return;
-	}
+	UChar32 *buf = xregion_alloc_array(region, typeof(*buf), argc);
 	size_t len = 0;
 	for (int i = 0; i < argc; ++i) {
 		if (mem_is_null(&argv[i]))
@@ -2083,13 +2079,20 @@ static struct sql_func_definition definitions[] = {
 	 func_zeroblob, NULL},
 };
 
+/** Find built-in function by name. */
 static struct sql_func_dictionary *
-built_in_func_get(const char *name)
+built_in_func_get(const char *name, const char *old_name)
 {
 	uint32_t len = strlen(name);
 	mh_int_t k = mh_strnptr_find_str(built_in_functions, name, len);
-	if (k == mh_end(built_in_functions))
-		return NULL;
+	if (k == mh_end(built_in_functions)) {
+		if (old_name == NULL)
+			return NULL;
+		uint32_t old_len = strlen(old_name);
+		k = mh_strnptr_find_str(built_in_functions, old_name, old_len);
+		if (k == mh_end(built_in_functions))
+			return NULL;
+	}
 	return mh_strnptr_node(built_in_functions, k)->val;
 }
 
@@ -2098,7 +2101,7 @@ built_in_func_put(struct sql_func_dictionary *dict)
 {
 	const char *name = dict->name;
 	uint32_t len = strlen(name);
-	assert(built_in_func_get(name) == NULL);
+	assert(built_in_func_get(name, NULL) == NULL);
 
 	uint32_t hash = mh_strn_hash(name, len);
 	const struct mh_strnptr_node_t strnode = {name, len, hash, dict};
@@ -2222,7 +2225,8 @@ find_built_in_func(struct Expr *expr, struct sql_func_dictionary *dict)
 			str = tt_sprintf("at least %d", argc_min);
 		else
 			str = tt_sprintf("from %d to %d", argc_min, argc_max);
-		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, name, str, n);
+		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, name, str, n,
+			 argc_min, argc_max);
 		return NULL;
 	}
 	struct func *func = find_compatible(expr, dict, CHECK_TYPE_EXACT);
@@ -2243,10 +2247,19 @@ struct func *
 sql_func_find(struct Expr *expr)
 {
 	const char *name = expr->u.zToken;
-	struct sql_func_dictionary *dict = built_in_func_get(name);
-	if (dict != NULL)
+	size_t len = strlen(name);
+	char *old_name = NULL;
+	if ((expr->flags & EP_Lookup2) != 0)
+		old_name = sql_legacy_name_new(name, len);
+	struct sql_func_dictionary *dict = built_in_func_get(name, old_name);
+	if (dict != NULL) {
+		sql_xfree(old_name);
 		return find_built_in_func(expr, dict);
-	struct func *func = func_by_name(name, strlen(name));
+	}
+	struct func *func = func_by_name(name, len);
+	if (func == NULL && old_name != NULL)
+		func = func_by_name(old_name, strlen(old_name));
+	sql_xfree(old_name);
 	if (func == NULL) {
 		diag_set(ClientError, ER_NO_SUCH_FUNCTION, name);
 		return NULL;
@@ -2263,7 +2276,7 @@ sql_func_find(struct Expr *expr)
 	assert(argc >= 0);
 	if (argc != n) {
 		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, name,
-			 tt_sprintf("%d", argc), n);
+			 tt_sprintf("%d", argc), n, argc, argc);
 		return NULL;
 	}
 	return func;
@@ -2283,12 +2296,22 @@ sql_func_finalize(const char *name)
 }
 
 uint32_t
-sql_func_flags(const char *name)
+sql_func_flags(const struct Expr *expr)
 {
-	struct sql_func_dictionary *dict = built_in_func_get(name);
-	if (dict != NULL)
+	const char *name = expr->u.zToken;
+	size_t len = strlen(name);
+	char *old_name = NULL;
+	if ((expr->flags & EP_Lookup2) != 0)
+		old_name = sql_legacy_name_new(name, len);
+	struct sql_func_dictionary *dict = built_in_func_get(name, old_name);
+	if (dict != NULL) {
+		sql_xfree(old_name);
 		return dict->flags;
-	struct func *func = func_by_name(name, strlen(name));
+	}
+	struct func *func = func_by_name(name, len);
+	if (func == NULL && old_name != NULL)
+		func = func_by_name(old_name, strlen(old_name));
+	sql_xfree(old_name);
 	if (func == NULL || func->def->aggregate != FUNC_AGGREGATE_GROUP)
 		return 0;
 	return SQL_FUNC_AGG;
@@ -2307,13 +2330,14 @@ sql_built_in_functions_cache_init(void)
 	for (uint32_t i = 0; i < nelem(definitions); ++i) {
 		struct sql_func_definition *desc = &definitions[i];
 		const char *name = desc->name;
-		struct sql_func_dictionary *dict = built_in_func_get(name);
+		struct sql_func_dictionary *dict = built_in_func_get(name,
+								     NULL);
 		assert(dict != NULL);
 
 		uint32_t len = strlen(name);
 		struct func_def *def = func_def_new(i, ADMIN, name, len,
 						    FUNC_LANGUAGE_SQL_BUILTIN,
-						    NULL, 0, NULL, 0);
+						    NULL, 0, NULL, 0, NULL);
 		def->setuid = true;
 		def->is_deterministic = dict->is_deterministic;
 		assert(desc->argc != -1 || dict->argc_min != dict->argc_max);
@@ -2345,9 +2369,10 @@ sql_built_in_functions_cache_init(void)
 	 * another name for CHAR_LENGTH().
 	 */
 	const char *name = "CHARACTER_LENGTH";
-	struct sql_func_dictionary *dict = built_in_func_get(name);
+	struct sql_func_dictionary *dict = built_in_func_get(name, NULL);
 	name = "CHAR_LENGTH";
-	struct sql_func_dictionary *dict_original = built_in_func_get(name);
+	struct sql_func_dictionary *dict_original = built_in_func_get(name,
+								      NULL);
 	dict->count = dict_original->count;
 	dict->functions = dict_original->functions;
 }
@@ -2403,7 +2428,6 @@ func_sql_expr_new(const struct func_def *def)
 	struct Expr *expr = sql_expr_compile(body, body_len);
 	if (expr == NULL)
 		return NULL;
-
 	struct Parse parser;
 	sql_parser_create(&parser, SQL_DEFAULT_FLAGS);
 	struct Vdbe *v = sqlGetVdbe(&parser);
@@ -2438,15 +2462,29 @@ func_sql_expr_call(struct func *func, struct port *args, struct port *ret)
 {
 	struct func_sql_expr *func_sql = (struct func_sql_expr *)func;
 	struct Vdbe *stmt = func_sql->stmt;
-	if (args->vtab != &port_c_vtab || ((struct port_c *)args)->size != 2) {
+	if (args->vtab != &port_c_vtab) {
 		diag_set(ClientError, ER_UNSUPPORTED, "Tarantool",
 			 "SQL functions");
 		return -1;
 	}
-	struct port_c_entry *pe = ((struct port_c *)args)->first;
-	const char *data = pe->mp;
-	uint32_t mp_size = pe->mp_size;
-	struct tuple_format *format = pe->mp_format;
+	struct port_c *port = (struct port_c *)args;
+	char buf[32];
+	const char *data;
+	uint32_t mp_size;
+	struct tuple_format *format;
+	struct port_c_entry *pe = port->first;
+	if (pe->type != PORT_C_ENTRY_NULL) {
+		assert(pe->type == PORT_C_ENTRY_MP);
+		data = pe->mp.data;
+		mp_size = pe->mp.size;
+		format = pe->mp.format;
+	} else {
+		char *end = mp_encode_nil(buf);
+		data = buf;
+		mp_size = end - data;
+		format = NULL;
+	}
+
 	struct region *region = &fiber()->gc;
 	size_t svp = region_used(region);
 	port_sql_create(ret, stmt, DQL_EXECUTE, false);
@@ -2458,7 +2496,7 @@ func_sql_expr_call(struct func *func, struct port *args, struct port *ret)
 	uint32_t count = format != NULL ? format->total_field_count : 1;
 	struct vdbe_field_ref *ref;
 	size_t size = sizeof(ref->slots[0]) * count + sizeof(*ref);
-	ref = region_aligned_alloc(region, size, alignof(*ref));
+	ref = xregion_aligned_alloc(region, size, alignof(*ref));
 	vdbe_field_ref_create(ref, count);
 	if (format != NULL)
 		vdbe_field_ref_prepare_data(ref, data, mp_size);
@@ -2475,9 +2513,7 @@ func_sql_expr_call(struct func *func, struct port *args, struct port *ret)
 	char *pos = sql_stmt_func_result_to_msgpack(stmt, &res_size, region);
 	if (pos == NULL)
 		goto error;
-	int rc = port_c_add_mp(ret, pos, pos + res_size);
-	if (rc != 0)
-		goto error;
+	port_c_add_mp(ret, pos, pos + res_size);
 
 	if (sql_step(stmt) != SQL_DONE)
 		goto error;

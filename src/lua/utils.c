@@ -42,6 +42,7 @@
 #include "core/say.h"
 #include "core/tt_uuid.h"
 #include "lj_trace.h"
+#include "lua/alloc.h"
 #include "lua/serializer.h"
 #include "trivia/util.h"
 #include "vclock/vclock.h"
@@ -54,9 +55,22 @@ static uint32_t CTID_STRUCT_IBUF;
 static uint32_t CTID_STRUCT_IBUF_PTR;
 uint32_t CTID_CHAR_PTR;
 uint32_t CTID_CONST_CHAR_PTR;
+uint32_t CTID_VARBINARY;
 uint32_t CTID_UUID;
 uint32_t CTID_DATETIME = 0;
 uint32_t CTID_INTERVAL = 0;
+
+struct lua_State *
+luaT_newstate(void)
+{
+	struct lua_State *L = luaL_newstate();
+	if (L == NULL)
+		panic("failed to initialize Lua");
+
+	luaT_initalloc(L);
+
+	return L;
+}
 
 /** A copy of index2adr() from luajit/src/lj_api.c. */
 static TValue *
@@ -66,7 +80,7 @@ index2adr(lua_State *L, int idx)
 		TValue *o = L->base + (idx - 1);
 		return o < L->top ? o : niltv(L);
 	} else if (idx > LUA_REGISTRYINDEX) {
-		api_check(L, idx != 0 && -idx <= L->top - L->base);
+		assert(idx != 0 && -idx <= L->top - L->base);
 		return L->top + idx;
 	} else if (idx == LUA_GLOBALSINDEX) {
 		TValue *o = &G(L)->tmptv;
@@ -76,7 +90,7 @@ index2adr(lua_State *L, int idx)
 		return registry(L);
 	} else {
 		GCfunc *fn = curr_func(L);
-		api_check(L, fn->c.gct == ~LJ_TFUNC && !isluafunc(fn));
+		assert(fn->c.gct == ~LJ_TFUNC && !isluafunc(fn));
 		if (idx == LUA_ENVIRONINDEX) {
 			TValue *o = &G(L)->tmptv;
 			settabV(L, o, tabref(fn->c.env));
@@ -128,7 +142,7 @@ luaL_pushcdata(struct lua_State *L, uint32_t ctypeid)
 		/* Handle ctype __gc metamethod. Use the fast lookup here. */
 		cTValue *tv = lj_tab_getinth(cts->miscmap, -(int32_t)ctypeid);
 		if (tv && tvistab(tv) && (tv = lj_meta_fast(L, tabV(tv), MM_gc))) {
-			GCtab *t = cts->finalizer;
+			GCtab *t = tabref(G(L)->gcroot[GCROOT_FFI_FIN]);
 			if (gcref(t->metatable)) {
 				/* Add to finalizer table, if still enabled. */
 				copyTV(L, lj_tab_set(L, t, o), tv);
@@ -154,6 +168,48 @@ luaT_pushvclock(struct lua_State *L, const struct vclock *vclock)
 		lua_settable(L, -3);
 	}
 	luaL_setmaphint(L, -1); /* compact flow */
+}
+
+/*
+ * Note: varbinary is a VLS object so we can't use luaL_pushcdata and
+ * luaL_checkcdata helpers.
+ */
+void
+luaT_pushvarbinary(struct lua_State *L, const char *data, uint32_t len)
+{
+	assert(CTID_VARBINARY != 0);
+	/* Calculate the cdata size. */
+	CTState *cts = ctype_cts(L);
+	CType *ct = ctype_raw(cts, CTID_VARBINARY);
+	CTSize size;
+	CTInfo info = lj_ctype_info(cts, CTID_VARBINARY, &size);
+	size = lj_ctype_vlsize(cts, ct, (CTSize)len);
+	assert(size != CTSIZE_INVALID);
+	/* Allocate a new cdata. */
+	GCcdata *cd = lj_cdata_newx(cts, CTID_VARBINARY, size, info);
+	/* Anchor the uninitialized cdata with the stack. */
+	TValue *o = L->top;
+	setcdataV(L, o, cd);
+	incr_top(L);
+	/* Initialize the cdata. */
+	memcpy(cdataptr(cd), data, len);
+	lj_gc_check(L);
+}
+
+const char *
+luaT_tovarbinary(struct lua_State *L, int index, uint32_t *len)
+{
+	assert(CTID_VARBINARY != 0);
+	TValue *o = index2adr(L, index);
+	if (!tviscdata(o))
+		return NULL;
+	GCcdata *cd = cdataV(o);
+	if (cd->ctypeid != CTID_VARBINARY)
+		return NULL;
+	CTSize size = cdatavlen(cd);
+	assert(size != CTSIZE_INVALID);
+	*len = size;
+	return cdataptr(cd);
 }
 
 struct tt_uuid *
@@ -235,8 +291,10 @@ void *
 luaL_checkcdata(struct lua_State *L, int idx, uint32_t *ctypeid)
 {
 	void *cdata = luaL_tocpointer(L, idx, ctypeid);
-	if (cdata == NULL)
-		luaL_error(L, "expected cdata as %d argument", idx);
+	if (cdata == NULL) {
+		diag_set(IllegalParams, "expected cdata as %d argument", idx);
+		luaT_error(L);
+	}
 	return cdata;
 }
 
@@ -337,6 +395,12 @@ luaL_setcdatagc(struct lua_State *L, int idx)
 	lua_pop(L, 1);
 }
 
+size_t
+luaL_getgctotal(struct lua_State *L)
+{
+	return (lua_getgccount(L) * 1024ULL) + lua_gc(L, LUA_GCCOUNTB, 0);
+}
+
 /**
  * A helper to register a single type metatable.
  */
@@ -363,7 +427,7 @@ luaT_newmodule(struct lua_State *L, const char *modname,
 	       const struct luaL_Reg *funcs)
 {
 	say_debug("%s(%s)", __func__, modname);
-	assert(modname != NULL && funcs != NULL);
+	assert(modname != NULL);
 
 	/* Get loaders.builtin. */
 	lua_getfield(L, LUA_REGISTRYINDEX, "_TARANTOOL_BUILTIN");
@@ -379,7 +443,8 @@ luaT_newmodule(struct lua_State *L, const char *modname,
 	lua_newtable(L);
 
 	/* Fill the module table with functions. */
-	luaL_setfuncs(L, funcs, 0);
+	if (funcs != NULL)
+		luaL_setfuncs(L, funcs, 0);
 
 	/* Copy the module table. */
 	lua_pushvalue(L, -1);
@@ -450,6 +515,31 @@ luaT_setmodule(struct lua_State *L, const char *modname)
 
 	say_debug("%s(%s): success", __func__, modname);
 	return 0;
+}
+
+const char *
+luaL_tolstring_strict(struct lua_State *L, int idx, size_t *len_ptr)
+{
+	if (lua_type(L, idx) != LUA_TSTRING)
+		return NULL;
+
+	const char *res = lua_tolstring(L, idx, len_ptr);
+	assert(res != NULL);
+	return res;
+}
+
+bool
+luaL_tointeger_strict(struct lua_State *L, int idx, int *value)
+{
+	if (lua_type(L, idx) != LUA_TNUMBER)
+		return false;
+	double num = lua_tonumber(L, idx);
+	if (num < INT_MIN || num > INT_MAX)
+		return false;
+	*value = num;
+	if (*value != num)
+		return false;
+	return true;
 }
 
 /*
@@ -728,6 +818,23 @@ luaT_toibuf(struct lua_State *L, int idx)
 	return NULL;
 }
 
+void
+luaL_pushnull(struct lua_State *L)
+{
+	lua_rawgeti(L, LUA_REGISTRYINDEX, luaL_nil_ref);
+}
+
+bool
+luaL_isnull(struct lua_State *L, int idx)
+{
+	if (lua_type(L, idx) == LUA_TCDATA) {
+		uint32_t ctypeid;
+		void *cdata = luaL_tocpointer(L, idx, &ctypeid);
+		return ctypeid == CTID_P_VOID && *(void **)cdata == NULL;
+	}
+	return false;
+}
+
 int
 luaL_checkconstchar(struct lua_State *L, int idx, const char **res,
 		    uint32_t *cdata_type_p)
@@ -741,6 +848,24 @@ luaL_checkconstchar(struct lua_State *L, int idx, const char **res,
 	*res = cdata != NULL ? *(const char **) cdata : NULL;
 	*cdata_type_p = cdata_type;
 	return 0;
+}
+
+bool
+luaT_hasfield(struct lua_State *L, int obj_index, int table_index)
+{
+	/*
+	 * lua_pushvalue() changes the size of the Lua stack, so
+	 * calling lua_gettable() with a relative index would pick
+	 * up a wrong object.
+	 */
+	if (table_index < 0)
+		table_index += lua_gettop(L) + 1;
+
+	lua_pushvalue(L, obj_index);
+	lua_gettable(L, table_index);
+	bool res = !lua_isnil(L, -1);
+	lua_pop(L, 1);
+	return res;
 }
 
 lua_State *
@@ -909,6 +1034,10 @@ tarantool_lua_utils_init(struct lua_State *L)
 	assert(CTID_CHAR_PTR != 0);
 	CTID_CONST_CHAR_PTR = luaL_ctypeid(L, "const char *");
 	assert(CTID_CONST_CHAR_PTR != 0);
+	rc = luaL_cdef(L, "struct varbinary { char data[?]; };");
+	assert(rc == 0);
+	CTID_VARBINARY = luaL_ctypeid(L, "struct varbinary");
+	assert(CTID_VARBINARY != 0);
 	rc = luaL_cdef(L, "struct tt_uuid {"
 				  "uint32_t time_low;"
 				  "uint16_t time_mid;"
@@ -1043,4 +1172,96 @@ void cord_on_yield(void)
 			g->panic(L);
 		exit(EXIT_FAILURE);
 	}
+}
+
+const char *
+luaT_checkstring(struct lua_State *L, int index)
+{
+	const char *name = lua_tostring(L, index);
+	if (name == NULL) {
+		diag_set(IllegalParams, "expected string as %d argument",
+			 index);
+		luaT_error(L);
+	}
+	return name;
+}
+
+const char *
+luaT_checklstring(struct lua_State *L, int index, size_t *len)
+{
+	const char *name = lua_tolstring(L, index, len);
+	if (name == NULL) {
+		diag_set(IllegalParams, "expected string as %d argument",
+			 index);
+		luaT_error(L);
+	}
+	return name;
+}
+
+int
+luaT_checkint(struct lua_State *L, int index)
+{
+	int ok;
+	int i = lua_tointegerx(L, index, &ok);
+	if (!ok) {
+		diag_set(IllegalParams, "expected integer as %d argument",
+			 index);
+		luaT_error(L);
+	}
+	return i;
+}
+
+double
+luaT_checknumber(struct lua_State *L, int index)
+{
+	int ok;
+	double d = lua_tonumberx(L, index, &ok);
+	if (!ok) {
+		diag_set(IllegalParams, "expected number as %d argument",
+			 index);
+		luaT_error(L);
+	}
+	return d;
+}
+
+void *
+luaT_checkudata(struct lua_State *L, int index, const char *name)
+{
+	void *udata = luaL_testudata(L, index, name);
+	if (udata == NULL) {
+		diag_set(IllegalParams, "expected %s as %d argument",
+			 name, index);
+		luaT_error(L);
+	}
+	return udata;
+}
+
+void
+luaT_checktype(struct lua_State *L, int index, int expected)
+{
+	int actual = lua_type(L, index);
+	if (actual != expected) {
+		diag_set(IllegalParams, "expected %s as %d argument",
+			 lua_typename(L, expected), index);
+		luaT_error(L);
+	}
+}
+
+int64_t
+luaT_checkint64(struct lua_State *L, int idx)
+{
+	int64_t result;
+	if (luaL_convertint64(L, idx, false, &result) != 0) {
+		diag_set(IllegalParams, "expected int64_t as %d argument", idx);
+		luaT_error(L);
+	}
+	return result;
+}
+
+int
+luaT_optint(struct lua_State *L, int index, int deflt)
+{
+	if (lua_isnoneornil(L, index))
+		return deflt;
+	return luaT_checkint(L, index);
 }

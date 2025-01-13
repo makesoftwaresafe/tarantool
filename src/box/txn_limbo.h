@@ -33,6 +33,7 @@
 #include "vclock/vclock.h"
 #include "latch.h"
 #include "errinj.h"
+#include "replication.h"
 
 #include <stdint.h>
 
@@ -52,16 +53,15 @@ struct txn_limbo_entry {
 	/** Transaction, waiting for a quorum. */
 	struct txn *txn;
 	/**
+	 * Approximate size of this request when encoded.
+	 */
+	size_t approx_len;
+	/**
 	 * LSN of the transaction by the originator's vclock
 	 * component. May be -1 in case the transaction is not
 	 * written to WAL yet.
 	 */
 	int64_t lsn;
-	/**
-	 * Number of ACKs. Or in other words - how many replicas
-	 * confirmed receipt of the transaction.
-	 */
-	int ack_count;
 	/**
 	 * Result flags. Only one of them can be true. But both
 	 * can be false if the transaction is still waiting for
@@ -69,6 +69,8 @@ struct txn_limbo_entry {
 	 */
 	bool is_commit;
 	bool is_rollback;
+	/** When this entry was added to the queue. */
+	double insertion_time;
 };
 
 static inline bool
@@ -139,6 +141,11 @@ struct txn_limbo {
 	 */
 	struct vclock promote_term_map;
 	/**
+	 * A vclock containing biggest known confirmed lsns for each previous
+	 * limbo owner.
+	 */
+	struct vclock confirmed_vclock;
+	/**
 	 * The biggest PROMOTE term seen by the instance and persisted in WAL.
 	 * It is related to raft term, but not the same. Synchronous replication
 	 * represented by the limbo is interested only in the won elections
@@ -154,13 +161,33 @@ struct txn_limbo {
 	 */
 	struct latch promote_latch;
 	/**
-	 * Maximal LSN gathered quorum and either already confirmed in WAL, or
-	 * whose confirmation is in progress right now. Any attempt to confirm
-	 * something smaller than this value can be safely ignored. Moreover,
-	 * any attempt to rollback something starting from <= this LSN is
-	 * illegal.
+	 * Maximal LSN that gathered quorum and has already been persisted in
+	 * the WAL. Any attempt to confirm something smaller than this value can
+	 * be safely ignored. Moreover, any attempt to rollback something
+	 * starting from <= this LSN is illegal.
 	 */
 	int64_t confirmed_lsn;
+	/**
+	 * Maximal LSN that gathered quorum and has not yet been persisted in
+	 * the WAL. No filtering can be performed based on this value. The
+	 * `worker` must always been woken up if this value is bumped separately
+	 * from the `confirmed_lsn` in order to asynchronously write a CONFIRM
+	 * request.
+	 */
+	int64_t volatile_confirmed_lsn;
+	/**
+	 * The first unconfirmed synchronous transaction in the current term.
+	 * Is NULL if there is no such transaction, or if the current instance
+	 * does not own limbo.
+	 */
+	struct txn_limbo_entry *entry_to_confirm;
+	/**
+	 * Number of ACKs of the first unconfirmed synchronous transaction
+	 * (entry_to_confirm->txn). Contains the actual value only for a
+	 * non-NULL entry_to_confirm with a local lsn assigned. Otherwise
+	 * it may contain any trash.
+	 */
+	int ack_count;
 	/**
 	 * Total number of performed rollbacks. It used as a guard
 	 * to do some actions assuming all limbo transactions will
@@ -225,6 +252,23 @@ struct txn_limbo {
 	 * can't be any inconsistencies.
 	 */
 	bool do_validate;
+	/**
+	 * The time that the latest successfully confirmed entry waited for
+	 * quorum.
+	 */
+	double confirm_lag;
+	/** Maximal size of entries enqueued in txn_limbo.queue (in bytes). */
+	int64_t max_size;
+	/** Current approximate size of txn_limbo.queue. */
+	int64_t size;
+	/**
+	 * Asynchronously tries to close the gap between the `confirmed_lsn` and
+	 * the `volatile_confirmed_lsn` by writing a CONFIRM request to the WAL
+	 * and retrying it on failure. Must always be woken up when the
+	 * `volatile_confirmed_lsn` is updated separately from the
+	 * `confirmed_lsn`.
+	 */
+	struct fiber *worker;
 };
 
 /**
@@ -238,6 +282,12 @@ static inline bool
 txn_limbo_is_empty(struct txn_limbo *limbo)
 {
 	return rlist_empty(&limbo->queue);
+}
+
+static inline bool
+txn_limbo_is_full(struct txn_limbo *limbo)
+{
+	return limbo->size >= limbo->max_size;
 }
 
 bool
@@ -268,6 +318,16 @@ txn_limbo_replica_term(const struct txn_limbo *limbo, uint32_t replica_id)
 }
 
 /**
+ * Return the latest confirmed lsn for the replica with id @replica_id.
+ */
+static inline int64_t
+txn_limbo_replica_confirmed_lsn(const struct txn_limbo *limbo,
+				uint32_t replica_id)
+{
+	return vclock_get(&limbo->confirmed_vclock, replica_id);
+}
+
+/**
  * Return the last synchronous transaction in the limbo or NULL when it is
  * empty.
  */
@@ -279,7 +339,8 @@ txn_limbo_last_synchro_entry(struct txn_limbo *limbo);
  * The limbo entry is allocated on the transaction's region.
  */
 struct txn_limbo_entry *
-txn_limbo_append(struct txn_limbo *limbo, uint32_t id, struct txn *txn);
+txn_limbo_append(struct txn_limbo *limbo, uint32_t id, struct txn *txn,
+		 size_t approx_len);
 
 /** Remove the entry from the limbo, mark as rolled back. */
 void
@@ -307,7 +368,7 @@ txn_limbo_assign_local_lsn(struct txn_limbo *limbo,
  * remote transactions. The function exists to be used in a
  * context, where a transaction is not known whether it is local
  * or not. For example, when a transaction is committed not bound
- * to any fiber (txn_commit_try_async()), it can be created by applier
+ * to any fiber (txn_commit_submit()), it can be created by applier
  * (then it is remote) or by recovery (then it is local). Besides,
  * recovery can commit remote transactions as well, when works on
  * a replica - it will recover data received from master.
@@ -328,6 +389,7 @@ txn_limbo_ack(struct txn_limbo *limbo, uint32_t replica_id, int64_t lsn);
  * entry is either committed or rolled back.
  * If timeout is reached before acks are collected, the tx is
  * rolled back as well as all the txs in the limbo following it.
+ * If fiber is cancelled before acks are collected, the tx is left in limbo.
  * Returns -1 when rollback was performed and tx has to be freed.
  *          0 when tx processing can go on.
  */
@@ -408,8 +470,8 @@ txn_limbo_wait_empty(struct txn_limbo *limbo, double timeout);
  * Persist limbo state to a given synchro request.
  */
 void
-txn_limbo_checkpoint(const struct txn_limbo *limbo,
-		     struct synchro_request *req);
+txn_limbo_checkpoint(const struct txn_limbo *limbo, struct synchro_request *req,
+		     struct vclock *vclock);
 
 /**
  * Write a PROMOTE request, which has the same effect as CONFIRM(@a lsn) and
@@ -435,6 +497,10 @@ txn_limbo_on_parameters_change(struct txn_limbo *limbo);
 void
 txn_limbo_filter_enable(struct txn_limbo *limbo);
 
+/** Stop filtering incoming synchro requests. */
+void
+txn_limbo_filter_disable(struct txn_limbo *limbo);
+
 /**
  * Freeze limbo. Prevent CONFIRMs and ROLLBACKs until limbo is unfrozen.
  */
@@ -447,11 +513,42 @@ txn_limbo_fence(struct txn_limbo *limbo);
 void
 txn_limbo_unfence(struct txn_limbo *limbo);
 
+/** Return whether limbo has an owner. */
+static inline bool
+txn_limbo_has_owner(struct txn_limbo *limbo)
+{
+	return limbo->owner_id != REPLICA_ID_NIL;
+}
+
+/** Return whether limbo is owned by current instance. */
+static inline bool
+txn_limbo_is_owned_by_current_instance(const struct txn_limbo *limbo)
+{
+	return limbo->owner_id == instance_id;
+}
+
 /**
  * Initialize qsync engine.
  */
 void
 txn_limbo_init();
+
+/**
+ * Denitialize qsync engine.
+ */
+void
+txn_limbo_free();
+
+void
+txn_limbo_shutdown(void);
+
+/** Set maximal limbo size in bytes. */
+void
+txn_limbo_set_max_size(struct txn_limbo *limbo, int64_t size);
+
+/** Wait for space in the limbo to add a new entry. */
+int
+txn_limbo_wait_for_space(struct txn_limbo *limbo);
 
 #if defined(__cplusplus)
 }

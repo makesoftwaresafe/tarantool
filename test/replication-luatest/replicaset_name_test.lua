@@ -2,17 +2,24 @@ local fio = require('fio')
 local replica_set = require('luatest.replica_set')
 local server = require('luatest.server')
 local t = require('luatest')
-local g = t.group()
+
+local g = t.group('with-names', t.helpers.matrix({
+    on_2_11_1 = {true, false},
+}))
 
 local function wait_for_death(instance)
-    t.helpers.retrying({}, function()
+    -- NB: The address sanitizer may take some time to generate
+    -- its report and all this time the process is alive. It takes
+    -- more than the default retrying() timeout (5 seconds) in
+    -- some circumstances.
+    t.helpers.retrying({timeout = 60}, function()
         assert(not instance.process:is_alive())
     end)
     -- Nullify already dead process or server:drop() fails.
     instance.process = nil
 end
 
-g.before_all = function(lg)
+g.before_all(function(lg)
     lg.replica_set = replica_set:new({})
     local box_cfg = {
         replication = {
@@ -20,23 +27,57 @@ g.before_all = function(lg)
             server.build_listen_uri('replica', lg.replica_set.id),
         },
         replication_timeout = 0.1,
+        replication_sync_timeout = 300,
         replicaset_name = 'test-name',
     }
+    if lg.params.on_2_11_1 then
+        -- It's prohibited to start instance with name, when
+        -- there's no name in the snap.
+        box_cfg.replicaset_name = nil
+    end
     lg.master = lg.replica_set:build_and_add_server({
         alias = 'master',
         box_cfg = box_cfg,
+        datadir = lg.params.on_2_11_1 and
+            'test/replication-luatest/upgrade/2.11.1/master' or nil,
     })
     box_cfg.read_only = true
     lg.replica = lg.replica_set:build_and_add_server({
         alias = 'replica',
         box_cfg = box_cfg,
+        datadir = lg.params.on_2_11_1 and
+            'test/replication-luatest/upgrade/2.11.1/replica' or nil,
     })
     lg.replica_set:start()
-end
+    if lg.params.on_2_11_1 then
+        lg.master:exec(function()
+            -- Pretend to be the 2.11.5 version, since it's the first
+            -- 2.11 release, which will properly work with names.
+            box.space._schema:replace{'version', 2, 11, 5}
+            box.cfg{replicaset_name = 'test-name'}
+            t.assert_equals(box.info.replicaset.name, 'test-name')
+        end)
+        lg.replica:wait_for_vclock_of(lg.master)
+        lg.replica:exec(function()
+            box.cfg{replicaset_name = 'test-name'}
+            t.assert_equals(box.info.replicaset.name, 'test-name')
+        end)
+    end
+end)
 
-g.after_all = function(lg)
+g.after_all(function(lg)
+    if lg.params.on_2_11_1 then
+        lg.master:exec(function()
+            box.schema.upgrade()
+            t.assert_not(box.internal.schema_needs_upgrade())
+        end)
+        lg.replica:wait_for_vclock_of(lg.master)
+        lg.replica:exec(function()
+            t.assert_not(box.internal.schema_needs_upgrade())
+        end)
+    end
     lg.replica_set:drop()
-end
+end)
 
 g.test_local_errors = function(lg)
     lg.master:exec(function()
@@ -122,7 +163,7 @@ g.test_replicaset_rename = function(lg)
     lg.master:exec(function()
         box.cfg{
             force_recovery = false,
-            replicaset_name = 'test'
+            replicaset_name = 'test',
         }
         t.assert_equals(_G.last_event.replicaset_name, 'test')
         t.assert_equals(box.info.replicaset.name, box.cfg.replicaset_name)
@@ -149,7 +190,7 @@ g.test_replicaset_rename = function(lg)
         -- The name is converted to a proper form automatically.
         box.cfg{
             force_recovery = true,
-            replicaset_name = 'TEST2'
+            replicaset_name = 'TEST2',
         }
         t.assert_equals(box.cfg.replicaset_name, 'test2')
         t.assert_equals(_G.last_event.replicaset_name, 'test2')
@@ -218,7 +259,7 @@ g.test_replicaset_name_bootstrap_mismatch = function(lg)
     lg.master:exec(function()
         box.cfg{
             force_recovery = true,
-            replicaset_name = box.NULL
+            replicaset_name = box.NULL,
         }
         t.assert_equals(box.info.replicaset.name, 'test-name')
         box.space._schema:delete{'replicaset_name'}
@@ -235,7 +276,8 @@ g.test_replicaset_name_bootstrap_mismatch = function(lg)
                                  new_replica.alias .. '.log')
     wait_for_death(new_replica)
     t.assert(new_replica:grep_log(
-        'Replicaset name mismatch: expected test%-name, got <no%-name>', 1024,
+        'Replicaset name mismatch: name \'test%-name\' provided in config ' ..
+        'confilcts with the instance one \'<no%-name>\'', 1023,
         {filename = logfile}))
     new_replica:drop()
     --
@@ -259,7 +301,8 @@ g.test_replicaset_name_bootstrap_mismatch = function(lg)
     logfile = fio.pathjoin(new_replica.workdir, new_replica.alias .. '.log')
     wait_for_death(new_replica)
     t.assert(new_replica:grep_log(
-        'Replicaset name mismatch: expected new%-name, got test%-name', 1024,
+        'Replicaset name mismatch: name \'new%-name\' provided in config ' ..
+        'confilcts with the instance one \'test%-name\'', 1024,
         {filename = logfile}))
     new_replica:drop()
     lg.master:exec(function(replica_id)
@@ -288,7 +331,8 @@ g.test_replicaset_name_recovery_mismatch = function(lg)
     local logfile = fio.pathjoin(lg.replica.workdir, lg.replica.alias .. '.log')
     wait_for_death(lg.replica)
     t.assert(lg.replica:grep_log(
-        'Replicaset name mismatch: expected new%-name, got test%-name', 1024,
+        'Replicaset name mismatch: name \'new%-name\' provided in config ' ..
+        'confilcts with the instance one \'test%-name\'', 1024,
         {filename = logfile}))
     --
     -- Has name in WAL, no name in cfg. Then the replica uses the saved name, no
@@ -326,7 +370,8 @@ g.test_replicaset_name_recovery_mismatch = function(lg)
     }, {wait_until_ready = false})
     wait_for_death(lg.replica)
     t.assert(lg.replica:grep_log(
-        'Replicaset name mismatch: expected new%-name, got <no%-name>', 1024,
+        'Replicaset name mismatch: name \'new%-name\' provided in config ' ..
+        'confilcts with the instance one \'<no%-name>\'', 1024,
         {filename = logfile}))
     box_cfg.replicaset_name = nil
     box_cfg.force_recovery = nil
@@ -357,7 +402,8 @@ g.test_replicaset_name_recovery_mismatch = function(lg)
     logfile = fio.pathjoin(lg.master.workdir, lg.master.alias .. '.log')
     wait_for_death(lg.master)
     t.assert(lg.master:grep_log(
-        'Replicaset name mismatch: expected new%-name, got test%-name', 1024,
+        'Replicaset name mismatch: name \'new%-name\' provided in config ' ..
+        'confilcts with the instance one \'test%-name\'', 1024,
         {filename = logfile}))
     --
     -- No name in WAL, has name in cfg.
@@ -383,7 +429,8 @@ g.test_replicaset_name_recovery_mismatch = function(lg)
     }, {wait_until_ready = false})
     wait_for_death(lg.master)
     t.assert(lg.master:grep_log(
-        'Replicaset name mismatch: expected new%-name, got <no%-name>', 1024,
+        'Replicaset name mismatch: name \'new%-name\' provided in config ' ..
+        'confilcts with the instance one \'<no%-name>\'', 1024,
         {filename = logfile}))
     box_cfg.replicaset_name = nil
     -- Has to be forced or it won't be able to sync with the replica because of

@@ -4,6 +4,7 @@
 #include <lualib.h>           /* luaL_openlibs() */
 #include "memory.h"           /* memory_init() */
 #include "fiber.h"            /* fiber_init() */
+#include "event.h"            /* event_init() */
 #include "small/ibuf.h"       /* struct ibuf */
 #include "box/box.h"          /* box_init() */
 #include "box/tuple.h"        /* box_tuple_format_default() */
@@ -124,7 +125,7 @@ test_basic(struct lua_State *L)
 	part.exclude_null = false;
 	part.sort_order = SORT_ORDER_ASC;
 	part.path = NULL;
-	struct key_def *key_def = key_def_new(&part, 1, false);
+	struct key_def *key_def = key_def_new(&part, 1, 0);
 	box_tuple_format_t *another_format = box_tuple_format_new(&key_def, 1);
 	key_def_delete(key_def);
 
@@ -134,7 +135,6 @@ test_basic(struct lua_State *L)
 	check_tuple(tuple, another_format, lua_gettop(L) - top, "objects");
 
 	/* Clean up. */
-	tuple_format_delete(another_format);
 	lua_pop(L, 1);
 	assert(lua_gettop(L) == 0);
 
@@ -187,11 +187,17 @@ main()
 
 	struct lua_State *L = luaT_newteststate();
 
+	event_init();
 	box_init();
 	tarantool_lua_error_init(L);
 	luaopen_msgpack(L);
 	box_lua_tuple_init(L);
 	lua_pop(L, 1);
 
-	return test_basic(L);
+	int rc = test_basic(L);
+	lua_close(L);
+	box_free();
+	event_free();
+
+	return rc;
 }

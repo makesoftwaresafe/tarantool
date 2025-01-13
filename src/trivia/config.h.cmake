@@ -23,6 +23,11 @@
  * release, e.g. 1.6.6-113-g8399d0e.
  */
 #define PACKAGE_VERSION "@TARANTOOL_VERSION@"
+/**
+ * A string with tag identifier of the tzdata release,
+ * e.g. 2024a.
+ */
+#define TZDATA_VERSION "@TZDATA_VERSION@"
 
 /** \endcond public */
 
@@ -151,10 +156,6 @@
  */
 #cmakedefine HAVE_BYTE_ORDER_BIG_ENDIAN 1
 /*
- * Defined if this platform supports openmp and it is enabled
- */
-#cmakedefine HAVE_OPENMP 1
-/*
 *  Defined if compatible with GNU readline installed.
 */
 #cmakedefine HAVE_GNU_READLINE 1
@@ -277,6 +278,7 @@
 #define DEFAULT_CFG SYSCONF_DIR "/" DEFAULT_CFG_FILENAME
 
 #cmakedefine ENABLE_ASAN 1
+#cmakedefine ENABLE_UB_SANITIZER 1
 
 /* Cacheline size to calculate alignments */
 #define CACHELINE_SIZE 64
@@ -288,17 +290,23 @@
 #cmakedefine ENABLE_AUDIT_LOG 1
 #cmakedefine ENABLE_FEEDBACK_DAEMON 1
 #cmakedefine ENABLE_WAL_EXT 1
+#cmakedefine ENABLE_RETENTION_PERIOD 1
 #cmakedefine ENABLE_READ_VIEW 1
 #cmakedefine ENABLE_SECURITY 1
+#cmakedefine ENABLE_MEMCS_ENGINE 1
 #cmakedefine ENABLE_COMPRESS_MODULE 1
 #cmakedefine ENABLE_ETCD_CLIENT 1
+#cmakedefine ENABLE_CONFIG_EXTRAS 1
+#cmakedefine ENABLE_FAILOVER 1
+#cmakedefine ENABLE_INTEGRITY 1
+#cmakedefine ENABLE_FETCH_SNAPSHOT_CURSOR 1
 
 #cmakedefine EXPORT_LIBCURL_SYMBOLS 1
 
 #cmakedefine BUILD_STATIC 1
 #cmakedefine EMBED_LUAZLIB 1
 #cmakedefine EMBED_LUAZIP 1
-#cmakedefine EMBED_LUAROCKS 1
+#cmakedefine TEST_BUILD 1
 
 /*
  * vim: syntax=c

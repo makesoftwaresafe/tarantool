@@ -18,6 +18,8 @@ include(CheckFunctionExists)
 include(FindOptionalPackage)
 include(FindPackageMessage)
 include(ExternalProject)
+include(CheckPatch)
+include(MakeLuaPath)
 
 find_program(ECHO echo)
 find_program(CAT cat)
@@ -26,6 +28,10 @@ find_program(GIT git)
 find_program(LD ld)
 find_program(CTAGS ctags)
 find_program(LUACHECK luacheck ENV PATH)
+find_program(PYTHON python)
+
+include (CTest)
+enable_testing()
 
 # Define PACKAGE macro in tarantool/config.h
 set(PACKAGE "Tarantool" CACHE STRING "Package name.")
@@ -39,6 +45,77 @@ if(NOT CMAKE_BUILD_TYPE)
         "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel."
         FORCE)
 endif()
+
+include(cmake/SetBuildParallelLevel.cmake)
+SetBuildParallelLevel(CMAKE_BUILD_PARALLEL_LEVEL)
+
+set(CTEST_OUTPUT_ON_FAILURE TRUE)
+math(EXPR CTEST_PARALLEL_LEVEL
+     "${CMAKE_BUILD_PARALLEL_LEVEL} * 2" OUTPUT_FORMAT DECIMAL)
+math(EXPR CTEST_CPU_THRESHOLD
+     "${CMAKE_BUILD_PARALLEL_LEVEL} * 3 / 2" OUTPUT_FORMAT DECIMAL)
+# TARANTOOL_CTEST_FLAGS is used by CMake targets.
+# XXX: CMake 3.17 introduces CMAKE_CTEST_ARGUMENTS that contains
+# CTest options and is used by `test` target.
+list(APPEND TARANTOOL_CTEST_FLAGS
+    --no-tests=error
+    --output-on-failure
+    --parallel ${CTEST_PARALLEL_LEVEL}
+    --repeat until-pass:3
+    --schedule-random
+    # CPU load threshold for starting new parallel tests.
+    # The option `--test-load` accepts a maximum number of
+    # tests that waiting CPU, upon reaching which the test will
+    # stop running new tests. This option may slowdown test
+    # running and increase a total test time, but it makes testing
+    # more stable than without option. It is recommended to set
+    # a value to $(nproc), see [1].
+    #
+    # 1. https://discourse.cmake.org/t/what-does-test-load-do/8610/3
+    --test-load ${CTEST_CPU_THRESHOLD}
+)
+if(CMAKE_VERBOSE_MAKEFILE)
+    list(APPEND TARANTOOL_CTEST_FLAGS --verbose)
+endif()
+
+# It is not possible to add dependencies to `add_test()`
+# in CMake, see [1]. CMake 3.7 introduces FIXTURES_REQUIRED [2]
+# and FIXTURES_SETUP [3], but these test properties cannot be
+# used - this feature is unsupported in the current CMake version.
+# To workaround this, the function `add_test_suite_target` is
+# introduced. It adds a CMake target that builds testsuite's
+# prerequisites and CMake test that executes that target.
+#
+# 1. https://gitlab.kitware.com/cmake/cmake/-/issues/8774
+# 2. https://cmake.org/cmake/help/latest/prop_test/FIXTURES_REQUIRED.html
+# 3. https://cmake.org/cmake/help/latest/prop_test/FIXTURES_SETUP.html
+function(_add_test_suite_target target)
+  set(prefix ARG)
+  set(noValues)
+  set(singleValues LABELS)
+  set(multiValues DEPENDS)
+
+  # FIXME: if we update to CMake >= 3.5, can remove this line.
+  include(CMakeParseArguments)
+  cmake_parse_arguments(${prefix}
+                        "${noValues}"
+                        "${singleValues}"
+                        "${multiValues}"
+                        ${ARGN})
+
+  set(_DEPS_TARGET ${target}-deps)
+
+  add_custom_target(${_DEPS_TARGET} DEPENDS ${ARG_DEPENDS})
+
+  add_test(NAME ${_DEPS_TARGET}
+    COMMAND ${CMAKE_COMMAND}
+            --build ${CMAKE_BINARY_DIR}
+            --target ${_DEPS_TARGET}
+  )
+  set_tests_properties(${_DEPS_TARGET} PROPERTIES
+    LABELS ${ARG_LABELS}
+  )
+endfunction()
 
 #
 # Check submodules
@@ -56,6 +133,14 @@ endif()
 # Define GNU standard installation directories
 include(GNUInstallDirs)
 
+if(BUILD_STATIC_WITH_BUNDLED_LIBS)
+    set(BUILD_STATIC ON)
+endif()
+
+if(NOT BUNDLED_LIBS_INSTALL_DIR)
+    set(BUNDLED_LIBS_INSTALL_DIR ${PROJECT_BINARY_DIR}/build)
+endif()
+
 include(cmake/utils.cmake)
 include(cmake/pod2man.cmake)
 # the order is significant: we need to know os and compiler to configure libs
@@ -72,6 +157,7 @@ include(cmake/module.cmake)
 include(cmake/thread.cmake)
 include(cmake/hardening.cmake)
 include(cmake/prefix.cmake)
+include(cmake/SetFiberStackSize.cmake)
 
 add_compile_flags("C;CXX" ${HARDENING_FLAGS})
 set(DEPENDENCY_CFLAGS "${DEPENDENCY_CFLAGS} ${HARDENING_FLAGS}")
@@ -299,6 +385,7 @@ include_directories(${PROJECT_SOURCE_DIR}/src)
 include_directories(${PROJECT_BINARY_DIR}/src)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib/small/include)
+include_directories(${PROJECT_BINARY_DIR}/src/lib/small/small/include)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib/small/third_party)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib/core)
 include_directories(${PROJECT_SOURCE_DIR}/third_party)
@@ -343,19 +430,15 @@ endforeach()
 set(_libdirs)
 list(APPEND _libdirs "/usr/local/${MULTILIB}") # LuaRocks
 list(APPEND _libdirs "${CMAKE_INSTALL_FULL_LIBDIR}") # Install prefix
-if(NOT CMAKE_CROSSCOMPILING AND EXISTS "/etc/debian_version")
-    # gh-1085: LuaRocks on Debian uses lib instead of lib/x86_64-linux-gnu/
-    list(APPEND _libdirs "/usr/local/lib") # LuaRocks on Debian
-endif()
-if(NOT CMAKE_CROSSCOMPILING AND EXISTS "/etc/gentoo-release")
-    # LuaRocks on Gentoo
-    list(APPEND _libdirs "/usr/${MULTILIB}/lua/luarocks/lib")
-endif()
-if(NOT CMAKE_CROSSCOMPILING AND EXISTS "/etc/alpine-release")
-    # LuaRocks on Alpine
-    list(APPEND _libdirs "/usr/local/lib")
-endif()
-list(APPEND _libdirs "/usr/${MULTILIB}") # System packages
+# gh-1085: LuaRocks on Debian and Alpine uses lib instead
+# of lib/${ARCH}-linux-gnu/
+list(APPEND _libdirs "/usr/local/lib")
+# LuaRocks on Gentoo
+list(APPEND _libdirs "/usr/${MULTILIB}/lua/luarocks/lib")
+# System packages
+list(APPEND _libdirs "/usr/${MULTILIB}")
+# Add CPATH on Debian based systems depending on architecture
+list(APPEND _libdirs "/usr/lib/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux-gnu")
 list(REMOVE_DUPLICATES _libdirs)
 set(MODULE_LIBPATH)
 foreach(dir
@@ -371,13 +454,19 @@ find_package_message(MODULE_LUAPATH "Lua package.path: ${MODULE_LUAPATH}"
 find_package_message(MODULE_LIBPATH "Lua package.cpath: ${MODULE_LIBPATH}"
     "${MODULE_LIBPATH}")
 
+set(TARANTOOL_DEBUG OFF)
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(TARANTOOL_DEBUG ON)
+endif(CMAKE_BUILD_TYPE STREQUAL "Debug")
 
 ##
 ## Third-Party libraries
 ##
 
+# URL of the backup storage to download bundled dependencies from.
+set(BACKUP_STORAGE "https://distrib.hb.vkcloud-storage.ru" CACHE STRING "Source to download third party dependencies")
+
 set(EMBED_LUAZLIB ${BUILD_STATIC})
-set(EMBED_LUAROCKS ${BUILD_STATIC})
 
 #
 # Since we *optionally* build bundled libs, a direct build
@@ -411,14 +500,12 @@ endif()
 # ZLIB
 #
 
-#
-# If tarantool is built as a part of enterpirse version,
-# zlib package will be found there and the second attempt
-# to find it will cause an error. Search for it only if it
-# has not been found before.
-#
-
-if (NOT ZLIB_FOUND)
+option(ENABLE_BUNDLED_ZLIB "Enable building of the bundled zlib"
+    ${BUILD_STATIC_WITH_BUNDLED_LIBS})
+if(ENABLE_BUNDLED_ZLIB)
+    include(BuildZLIB)
+    add_dependencies(build_bundled_libs bundled-zlib)
+else()
     set(ZLIB_FIND_REQUIRED ON)
     find_package(ZLIB)
 endif()
@@ -426,15 +513,38 @@ endif()
 #
 # ZZIP
 #
+
+option(ENABLE_BUNDLED_ZZIP "Enable building of the bundled zzip"
+    ${BUILD_STATIC_WITH_BUNDLED_LIBS})
 if(EMBED_LUAZIP)
-    set(ZZIP_FIND_REQUIRED ON)
-    find_package(ZZIP)
+    if(ENABLE_BUNDLED_ZZIP)
+        include(BuildZZIP)
+        add_dependencies(build_bundled_libs bundled-zzip)
+    else()
+        set(ZZIP_FIND_REQUIRED ON)
+        find_package(ZZIP)
+    endif()
 endif()
 
 #
 # OpenSSL
 #
-find_package(OpenSSL)
+
+option(OPENSSL_USE_STATIC_LIBS "Link OpenSSL statically"
+    ${BUILD_STATIC})
+set(ENABLE_BUNDLED_OPENSSL_DEFAULT OFF)
+if(BUILD_STATIC_WITH_BUNDLED_LIBS AND OPENSSL_USE_STATIC_LIBS)
+    set(ENABLE_BUNDLED_OPENSSL_DEFAULT ON)
+endif()
+option(ENABLE_BUNDLED_OPENSSL "Enable building of the bundled openssl"
+    ${ENABLE_BUNDLED_OPENSSL_DEFAULT})
+if(ENABLE_BUNDLED_OPENSSL)
+    set(OPENSSL_USE_STATIC_LIBS ON)
+    include(BuildOpenSSL)
+    add_dependencies(build_bundled_libs bundled-openssl)
+else()
+    find_package(OpenSSL)
+endif()
 if (OPENSSL_FOUND)
     message(STATUS "OpenSSL ${OPENSSL_VERSION} found")
     include_directories(${OPENSSL_INCLUDE_DIR})
@@ -448,6 +558,9 @@ endif()
 #
 if(OPENSSL_USE_STATIC_LIBS)
     set(OPENSSL_LIBRARIES ${OPENSSL_LIBRARIES} ${ZLIB_LIBRARIES})
+    if(ENABLED_BUNDLED_OPENSSL AND ENABLE_BUNDLED_ZLIB)
+        add_dependencies(bundled-openssl bundled-zlib)
+    endif()
 endif()
 
 #
@@ -503,21 +616,48 @@ message(STATUS "EXPORT_LIBCURL_SYMBOLS: ${EXPORT_LIBCURL_SYMBOLS}")
 # ReadLine
 #
 
-set(Readline_FIND_REQUIRED ON)
-find_package(Readline)
+option(ENABLE_BUNDLED_READLINE "Enable building of the bundled readline"
+    ${BUILD_STATIC_WITH_BUNDLED_LIBS})
+if(ENABLE_BUNDLED_READLINE)
+    include(BuildReadline)
+    add_dependencies(build_bundled_libs bundled-readline)
+else()
+    set(Readline_FIND_REQUIRED ON)
+    find_package(Readline)
+endif()
 
 #
 # ICONV
 #
-set(ICONV_FIND_REQUIRED ON)
-find_package(ICONV)
+
+# In Linux iconv is embedded into glibc.
+set(ENABLE_BUNDLED_ICONV_DEFAULT OFF)
+if(APPLE AND BUILD_STATIC_WITH_BUNDLED_LIBS)
+    set(ENABLE_BUNDLED_ICONV_DEFAULT ON)
+endif()
+option(ENABLE_BUNDLED_ICONV "Enable building of the bundled iconv"
+    ${ENABLE_BUNDLED_ICONV_DEFAULT})
+if(ENABLE_BUNDLED_ICONV)
+    include(BuildICONV)
+    add_dependencies(build_bundled_libs bundled-iconv)
+else()
+    set(ICONV_FIND_REQUIRED ON)
+    find_package(ICONV)
+endif()
 
 #
 # ICU
 #
 
-set(ICU_FIND_REQUIRED ON)
-find_package(ICU)
+option(ENABLE_BUNDLED_ICU "Enable building of the bundled icu"
+    ${BUILD_STATIC_WITH_BUNDLED_LIBS})
+if(ENABLE_BUNDLED_ICU)
+    include(BuildICU)
+    add_dependencies(build_bundled_libs bundled-icu)
+else()
+    set(ICU_FIND_REQUIRED ON)
+    find_package(ICU)
+endif()
 
 #
 # libunwind
@@ -662,7 +802,7 @@ option(ENABLE_BUNDLED_LIBYAML "Enable building of the bundled libyaml" ON)
 if (ENABLE_BUNDLED_LIBYAML)
     include(BuildLibYAML)
     libyaml_build()
-    add_dependencies(build_bundled_libs yaml)
+    add_dependencies(build_bundled_libs bundled-libyaml)
 else()
     set(LIBYAML_FIND_REQUIRED ON)
     find_package(LibYAML)
@@ -677,12 +817,23 @@ libccdt_build()
 add_dependencies(build_bundled_libs cdt)
 
 #
+# Nanoarrow
+#
+include(BuildNanoarrow)
+nanoarrow_build()
+add_dependencies(build_bundled_libs bundled-nanoarrow)
+
+#
 # Third-Party misc
 #
 
 include(BuildMisc)
 libmisc_build()
 add_dependencies(build_bundled_libs misc)
+
+if(DEFINED EXTRA_DEPENDENCIES_CMAKE)
+    include(${EXTRA_DEPENDENCIES_CMAKE})
+endif()
 
 # cpack config. called package.cmake to avoid
 # conflicts with the global CPack.cmake (On MacOS X
@@ -697,10 +848,19 @@ include (cmake/package.cmake)
 #
 include (cmake/rpm.cmake)
 
-add_subdirectory(src)
+set(TARANTOOL_BIN $<TARGET_FILE:tarantool>)
+
 add_subdirectory(extra)
 add_subdirectory(test)
-add_subdirectory(perf)
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(AUTHOR_WARNING "Benchmarks are available only in release build")
+else ()
+    add_subdirectory(perf)
+endif ()
+# XXX: src should be processed after perf, since small perf tests
+# require bundled libbenchmark library defined in the perf
+# subdirectory.
+add_subdirectory(src)
 add_subdirectory(doc)
 
 option(WITH_NOTIFY_SOCKET "Enable notifications on NOTIFY_SOCKET" ON)
@@ -746,7 +906,24 @@ elseif(IS_DIRECTORY .git AND GIT)
     )
 endif()
 
-option(TEST_BUILD "Abort if memory leak is found." OFF)
+set(TZDATA_VERSION "")
+set(TZCODE_SOURCE_DIR ${PROJECT_SOURCE_DIR}/third_party/tz)
+if (EXISTS "${TZCODE_SOURCE_DIR}/.git" AND GIT)
+    execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --dirty
+                    WORKING_DIRECTORY ${TZCODE_SOURCE_DIR}
+                    OUTPUT_VARIABLE TZDATA_VERSION
+                    RESULT_VARIABLE TZDATA_ERROR_CODE
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
+
+if(TZDATA_VERSION STREQUAL "")
+    # The current version of tzdata, must be update on bump.
+    set(TZDATA_VERSION 2022a)
+    message(WARNING "Failed to determine tzdata version from Git tags. \
+                     Using default version \"${TZDATA_VERSION}\".")
+endif()
+
+option(TEST_BUILD "Use defaults suited for tests" OFF)
 set(ABORT_ON_LEAK_DEFAULT ${TEST_BUILD})
 option(ABORT_ON_LEAK "Abort if memory leak is found." ${ABORT_ON_LEAK_DEFAULT})
 
@@ -784,8 +961,14 @@ set(options PACKAGE VERSION BUILD C_COMPILER CXX_COMPILER C_FLAGS CXX_FLAGS
     ENABLE_HARDENING
     ENABLE_DOC
     ENABLE_DIST
+    ENABLE_BUNDLED_ZLIB
+    OPENSSL_USE_STATIC_LIBS
+    ENABLE_BUNDLED_OPENSSL
     ENABLE_BUNDLED_LIBCURL
     BUNDLED_LIBCURL_USE_ARES
+    ENABLE_BUNDLED_READLINE
+    ENABLE_BUNDLED_ICONV
+    ENABLE_BUNDLED_ICU
     ENABLE_BUNDLED_LIBYAML
     ENABLE_BUNDLED_MSGPUCK
     ENABLE_BUNDLED_LIBUNWIND

@@ -1,44 +1,236 @@
 tarantool --help
-Tarantool - a Lua application server
+Tarantool 3.<minor>.<patch>-<suffix>
 
-Usage: tarantool script.lua [OPTIONS] [SCRIPT [ARGS]]
+----------------------------------------------------------
 
-All command line options are passed to the interpreted script.
-When no script name is provided, the server responds to:
-  -h, --help			display this help and exit
-  -v, --version			print program version and exit
-  -e EXPR			execute string 'EXPR'
-  -l NAME			require library 'NAME'
-  -j cmd			perform LuaJIT control command
-  -b ...			save or list bytecode
-  -d				activate debugging session for 'SCRIPT'
-  -i				enter interactive mode after executing 'SCRIPT'
-  --				stop handling options
-  -				execute stdin and stop handling options
+The recommended way to work with Tarantool is to use tt
+tool.
 
-Please visit project home page at https://tarantool.org
-to see online documentation, submit bugs or contribute a patch.
+Run a Tarantool instance:
+
+$ tt start <app name>:<instance name>
+
+Connect to an instance:
+
+$ tt connect <uri>
+
+Execute a Lua script:
+
+$ tt run [OPTIONS] script.lua [ARGS]
+
+Run an interactive Lua interpreter:
+
+$ tt run -i
+
+Please visit https://tarantool.io/tt to see online
+documentation.
+
+----------------------------------------------------------
+
+At the lower level there are the following action options.
+
+-h
+--help
+
+    Print this help message.
+
+-v, -V
+--version
+
+    Print version and build information.
+
+--help-env-list
+
+    Print environment variables list.
+
+-n <...> [-c <...>]
+--name <...> [--config <...>]
+
+    Start an instance.
+
+    The path to the configuration file can be omitted if a
+    configuration is stored in etcd and TT_CONFIG_ETCD_*
+    environment variables are set.
+
+<first positional argument> [<..more args..>]
+
+    Run a Lua script file. All the arguments after the
+    script name are stored in the `arg` global value.
+
+    The file may be pointed as `-` to read the script from
+    stdin.
+
+-e <..code..>
+
+    Run a Lua code.
+
+    It can be used on its own (as an action option) or
+    together with another action option (as a modifier).
+
+-i
+
+    Run the interactive REPL.
+
+--failover
+
+    Run a failover coordinator service.
+
+    It is available in Tarantool Enterprise Edition.
+
+The following modifier options are applicable to actions.
+
+--force-recovery
+
+    Enable force-recovery mode at database loading.
+
+--integrity-check <path/to/hashes.json>
+
+    Enable integrity check and load hash sums.
+
+-l <module>
+
+    `require` Lua module <module> and set it the same named
+    global variable.
+
+-j <cmd>
+
+    Perform LuaJIT control command <cmd>.
+
+-b <...>
+
+    Save or list bytecode.
+
+-d
+
+    Activate debugging session for a given script.
+
+--
+
+    End-of-options marker. All the arguments after the
+    marker are interpreted as non-option ones.
+
+Please visit project home page at https://tarantool.io
+to see online documentation.
+
+Visit https://github.com/tarantool/tarantool to submit bugs
+or contribute a patch.
 
 tarantool -h
-Tarantool - a Lua application server
+Tarantool 3.<minor>.<patch>-<suffix>
 
-Usage: tarantool script.lua [OPTIONS] [SCRIPT [ARGS]]
+----------------------------------------------------------
 
-All command line options are passed to the interpreted script.
-When no script name is provided, the server responds to:
-  -h, --help			display this help and exit
-  -v, --version			print program version and exit
-  -e EXPR			execute string 'EXPR'
-  -l NAME			require library 'NAME'
-  -j cmd			perform LuaJIT control command
-  -b ...			save or list bytecode
-  -d				activate debugging session for 'SCRIPT'
-  -i				enter interactive mode after executing 'SCRIPT'
-  --				stop handling options
-  -				execute stdin and stop handling options
+The recommended way to work with Tarantool is to use tt
+tool.
 
-Please visit project home page at https://tarantool.org
-to see online documentation, submit bugs or contribute a patch.
+Run a Tarantool instance:
+
+$ tt start <app name>:<instance name>
+
+Connect to an instance:
+
+$ tt connect <uri>
+
+Execute a Lua script:
+
+$ tt run [OPTIONS] script.lua [ARGS]
+
+Run an interactive Lua interpreter:
+
+$ tt run -i
+
+Please visit https://tarantool.io/tt to see online
+documentation.
+
+----------------------------------------------------------
+
+At the lower level there are the following action options.
+
+-h
+--help
+
+    Print this help message.
+
+-v, -V
+--version
+
+    Print version and build information.
+
+--help-env-list
+
+    Print environment variables list.
+
+-n <...> [-c <...>]
+--name <...> [--config <...>]
+
+    Start an instance.
+
+    The path to the configuration file can be omitted if a
+    configuration is stored in etcd and TT_CONFIG_ETCD_*
+    environment variables are set.
+
+<first positional argument> [<..more args..>]
+
+    Run a Lua script file. All the arguments after the
+    script name are stored in the `arg` global value.
+
+    The file may be pointed as `-` to read the script from
+    stdin.
+
+-e <..code..>
+
+    Run a Lua code.
+
+    It can be used on its own (as an action option) or
+    together with another action option (as a modifier).
+
+-i
+
+    Run the interactive REPL.
+
+--failover
+
+    Run a failover coordinator service.
+
+    It is available in Tarantool Enterprise Edition.
+
+The following modifier options are applicable to actions.
+
+--force-recovery
+
+    Enable force-recovery mode at database loading.
+
+--integrity-check <path/to/hashes.json>
+
+    Enable integrity check and load hash sums.
+
+-l <module>
+
+    `require` Lua module <module> and set it the same named
+    global variable.
+
+-j <cmd>
+
+    Perform LuaJIT control command <cmd>.
+
+-b <...>
+
+    Save or list bytecode.
+
+-d
+
+    Activate debugging session for a given script.
+
+--
+
+    End-of-options marker. All the arguments after the
+    marker are interpreted as non-option ones.
+
+Please visit project home page at https://tarantool.io
+to see online documentation.
+
+Visit https://github.com/tarantool/tarantool to submit bugs
+or contribute a patch.
 
 tarantool -Z
 tarantool: invalid option
@@ -158,28 +350,3 @@ arg[2] => 2
 arg[3] => 3
 arg[4] => --help
 
--b
-Save LuaJIT bytecode: luajit -b[options] input output
-  -l        Only list bytecode.
-  -s        Strip debug info (default).
-  -g        Keep debug info.
-  -n name   Set module name (default: auto-detect from input name).
-  -t type   Set output file type (default: auto-detect from output name).
-  -a arch   Override architecture for object files (default: native).
-  -o os     Override OS for object files (default: native).
-  -e chunk  Use chunk string as input.
-  --        Stop handling options.
-  -         Use stdin as input and/or stdout as output.
-
-File types: c h obj o raw (default)
--bl -e ''
--- BYTECODE -- "":0-1
-0001    RET0     0   1
-
--b -l -e ''
--- BYTECODE -- "":0-1
-0001    RET0     0   1
-
--b -e '' output
--jon -e ''
--j on -e ''

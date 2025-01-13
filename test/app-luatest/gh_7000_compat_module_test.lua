@@ -45,6 +45,7 @@ g.before_all(function()
         compat.add_option(option_def)
     end
     option_1_called = false
+    option_2_called = false
 end)
 g.after_all( function() reset(compat) end)
 
@@ -214,6 +215,33 @@ end
 
 g.test_help = function()
     t.assert(compat.help())
+end
+
+g.test_is_new_is_old = function()
+    for _, option_def in pairs(definitions) do
+        local name = option_def.name
+        t.assert(compat[name])
+
+        compat[name] = 'new'
+        t.assert(compat[name]:is_new())
+        t.assert_not(compat[name]:is_old())
+
+        compat[name] = 'old'
+        t.assert_not(compat[name]:is_new())
+        t.assert(compat[name]:is_old())
+
+        compat[name] = 'default'
+        local is_new = option_def.default == 'new'
+        t.assert_equals(compat[name]:is_new(), is_new)
+        t.assert_equals(compat[name]:is_old(), not is_new)
+
+        t.assert_error_msg_content_equals(
+            'usage: compat.<option_name>:is_new()',
+            compat[name].is_new)
+        t.assert_error_msg_content_equals(
+            'usage: compat.<option_name>:is_old()',
+            compat[name].is_old)
+    end
 end
 
 g.test_hot_reload = function()

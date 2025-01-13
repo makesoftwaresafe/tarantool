@@ -37,6 +37,7 @@
 #include "tarantoolInt.h"
 #include "box/schema.h"
 #include "box/tuple.h"
+#include "box/lua/misc.h"
 #include "mpstream/mpstream.h"
 #include "box/port.h"
 #include "lua/utils.h"
@@ -811,8 +812,7 @@ static inline int
 bin_to_uuid(struct Mem *mem)
 {
 	assert(mem->type == MEM_TYPE_BIN);
-	if (mem->n != UUID_LEN ||
-	    tt_uuid_validate((struct tt_uuid *)mem->z) != 0)
+	if (mem->n != UUID_LEN)
 		return -1;
 	mem_set_uuid(mem, (struct tt_uuid *)mem->z);
 	return 0;
@@ -874,7 +874,7 @@ str_to_datetime(struct Mem *mem)
 {
 	assert(mem->type == MEM_TYPE_STR);
 	struct datetime dt;
-	if (datetime_parse_full(&dt, mem->z, mem->n, NULL, 0) <= 0)
+	if (datetime_parse_full(&dt, mem->z, mem->n) <= 0)
 		return -1;
 	mem_set_datetime(mem, &dt);
 	return 0;
@@ -2728,21 +2728,15 @@ mem_cmp_msgpack(const struct Mem *a, const char **b, int *result,
 		if (type == MP_UUID) {
 			assert(len == UUID_LEN);
 			mem.type = MEM_TYPE_UUID;
-			if (uuid_unpack(b, len, &mem.u.uuid) == NULL)
-				return -1;
+			VERIFY(uuid_unpack(b, len, &mem.u.uuid) != NULL);
 			break;
 		} else if (type == MP_DECIMAL) {
 			mem.type = MEM_TYPE_DEC;
-			if (decimal_unpack(b, len, &mem.u.d) == 0)
-				return -1;
+			VERIFY(decimal_unpack(b, len, &mem.u.d) != NULL);
 			break;
 		} else if (type == MP_DATETIME) {
 			mem.type = MEM_TYPE_DATETIME;
-			if (datetime_unpack(b, len, &mem.u.dt) == 0) {
-				diag_set(ClientError, ER_INVALID_MSGPACK,
-					 "Invalid MP_DATETIME MsgPack format");
-				return -1;
-			}
+			VERIFY(datetime_unpack(b, len, &mem.u.dt) != NULL);
 			break;
 		} else if (type == MP_INTERVAL) {
 			diag_set(ClientError, ER_SQL_TYPE_MISMATCH, mp_str(*b),
@@ -3043,37 +3037,23 @@ mem_from_mp_ephemeral(struct Mem *mem, const char *buf, uint32_t *len)
 		uint32_t size = mp_decode_extl(&buf, &type);
 		if (type == MP_UUID) {
 			assert(size == UUID_LEN);
-			buf = svp;
-			if (mp_decode_uuid(&buf, &mem->u.uuid) == NULL) {
-				diag_set(ClientError, ER_INVALID_MSGPACK,
-					 "Invalid MP_UUID MsgPack format");
-				return -1;
-			}
+			VERIFY(uuid_unpack(&buf, size, &mem->u.uuid) != NULL);
 			mem->type = MEM_TYPE_UUID;
 			mem->flags = 0;
 			break;
 		} else if (type == MP_DECIMAL) {
-			buf = svp;
-			if (mp_decode_decimal(&buf, &mem->u.d) == NULL)
-				return -1;
+			VERIFY(decimal_unpack(&buf, size, &mem->u.d) != NULL);
 			mem->type = MEM_TYPE_DEC;
 			mem->flags = 0;
 			break;
 		} else if (type == MP_DATETIME) {
-			if (datetime_unpack(&buf, size, &mem->u.dt) == NULL) {
-				diag_set(ClientError, ER_INVALID_MSGPACK,
-					 "Invalid MP_DATETIME MsgPack format");
-				return -1;
-			}
+			VERIFY(datetime_unpack(&buf, size, &mem->u.dt) != NULL);
 			mem->type = MEM_TYPE_DATETIME;
 			mem->flags = 0;
 			break;
 		} else if (type == MP_INTERVAL) {
-			if (interval_unpack(&buf, size, &mem->u.itv) == NULL) {
-				diag_set(ClientError, ER_INVALID_MSGPACK,
-					 "Invalid MP_INTERVAL MsgPack format");
-				return -1;
-			}
+			VERIFY(interval_unpack(&buf, size,
+					       &mem->u.itv) != NULL);
 			mem->type = MEM_TYPE_INTERVAL;
 			mem->flags = 0;
 			break;
@@ -3234,13 +3214,7 @@ mem_to_mp(const struct Mem *mem, uint32_t *size, struct region *region)
 		return NULL;
 	}
 	*size = region_used(region) - used;
-	char *data = region_join(region, *size);
-	if (data == NULL) {
-		region_truncate(region, used);
-		diag_set(OutOfMemory, *size, "region_join", "data");
-		return NULL;
-	}
-	return data;
+	return xregion_join(region, *size);
 }
 
 char *
@@ -3263,12 +3237,7 @@ mem_encode_array(const struct Mem *mems, uint32_t count, uint32_t *size,
 		return NULL;
 	}
 	*size = region_used(region) - used;
-	char *array = region_join(region, *size);
-	if (array == NULL) {
-		region_truncate(region, used);
-		diag_set(OutOfMemory, *size, "region_join", "array");
-		return NULL;
-	}
+	char *array = xregion_join(region, *size);
 	mp_tuple_assert(array, array + *size);
 	return array;
 }
@@ -3303,10 +3272,7 @@ mem_encode_map(const struct Mem *mems, uint32_t count, uint32_t *size,
 		goto error;
 	}
 	*size = region_used(region) - used;
-	char *map = region_join(region, *size);
-	if (map != NULL)
-		return map;
-	diag_set(OutOfMemory, *size, "region_join", "map");
+	return xregion_join(region, *size);
 error:
 	region_truncate(region, used);
 	return NULL;
@@ -3379,13 +3345,7 @@ static struct Mem *
 vdbemem_alloc_on_region(uint32_t count)
 {
 	struct region *region = &fiber()->gc;
-	size_t size;
-	struct Mem *ret = region_alloc_array(region, typeof(*ret), count,
-					     &size);
-	if (ret == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "ret");
-		return NULL;
-	}
+	struct Mem *ret = xregion_alloc_array(region, struct Mem, count);
 	memset(ret, 0, count * sizeof(*ret));
 	for (uint32_t i = 0; i < count; i++) {
 		mem_create(&ret[i]);
@@ -3394,12 +3354,30 @@ vdbemem_alloc_on_region(uint32_t count)
 	return ret;
 }
 
+/**
+ * Get port contents as raw MsgPack. Encodes the port's VDBE memory registers on
+ * the current fiber's region using a MsgPack stream.
+ */
+static const char *
+port_vdbemem_get_msgpack(struct port *base, uint32_t *size);
+
+/**
+ * Dump port contents to Lua. Iterates over the port's VDBE memory registers
+ * and pushes Lua values to the provided Lua stack depending on the type of the
+ * memory register.
+ */
 static void
-port_vdbemem_dump_lua(struct port *base, struct lua_State *L, bool is_flat)
+port_vdbemem_dump_lua(struct port *base, struct lua_State *L,
+		      enum port_dump_lua_mode mode)
 {
-	(void) is_flat;
 	struct port_vdbemem *port = (struct port_vdbemem *) base;
-	assert(is_flat == true);
+	assert(mode == PORT_DUMP_LUA_MODE_FLAT ||
+	       mode == PORT_DUMP_LUA_MODE_MP_OBJECT);
+	if (mode == PORT_DUMP_LUA_MODE_MP_OBJECT) {
+		port_dump_lua_mp_object_mode_slow(base, L, &fiber()->gc,
+						  port_vdbemem_get_msgpack);
+		return;
+	}
 	for (uint32_t i = 0; i < port->mem_count; i++) {
 		struct Mem *mem = (struct Mem *)port->mem + i;
 		switch (mem->type) {
@@ -3460,15 +3438,11 @@ port_vdbemem_get_msgpack(struct port *base, uint32_t *size)
 		mem_to_mpstream((struct Mem *)port->mem + i, &stream);
 	mpstream_flush(&stream);
 	*size = region_used(region) - region_svp;
-	if (is_error)
-		goto error;
-	const char *ret = (char *)region_join(region, *size);
-	if (ret == NULL)
-		goto error;
-	return ret;
-error:
-	diag_set(OutOfMemory, *size, "region", "ret");
-	return NULL;
+	if (is_error) {
+		diag_set(OutOfMemory, *size, "region", "ret");
+		return NULL;
+	}
+	return xregion_join(region, *size);
 }
 
 static const struct port_vtab port_vdbemem_vtab;
@@ -3518,8 +3492,6 @@ port_lua_get_vdbemem(struct port *base, uint32_t *size)
 	struct region *region = &fiber()->gc;
 	size_t region_svp = region_used(region);
 	struct Mem *val = vdbemem_alloc_on_region(argc);
-	if (val == NULL)
-		return NULL;
 	for (int i = 0; i < argc; i++) {
 		struct luaL_field field;
 		int index = -1 - i;
@@ -3587,12 +3559,7 @@ port_lua_get_vdbemem(struct port *base, uint32_t *size)
 				goto error;
 			}
 			uint32_t size = region_used(region) - used;
-			char *raw = region_join(region, size);
-			if (raw == NULL) {
-				diag_set(OutOfMemory, size, "region_join",
-					 "raw");
-				goto error;
-			}
+			char *raw = xregion_join(region, size);
 			rc = is_map ? mem_copy_map(&val[i], raw, size) :
 			     mem_copy_array(&val[i], raw, size);
 			if (rc != 0)
@@ -3646,21 +3613,27 @@ port_c_get_vdbemem(struct port *base, uint32_t *size)
 	struct region *region = &fiber()->gc;
 	size_t region_svp = region_used(region);
 	struct Mem *val = vdbemem_alloc_on_region(port->size);
-	if (val == NULL)
-		return NULL;
 	int i = 0;
 	const char *data;
 	struct port_c_entry *pe;
 	for (pe = port->first; pe != NULL; pe = pe->next) {
-		if (pe->mp_size == 0) {
+		switch (pe->type) {
+		case PORT_C_ENTRY_TUPLE:
 			data = tuple_data(pe->tuple);
 			if (mp_decode_array(&data) != 1) {
 				diag_set(ClientError, ER_SQL_EXECUTE,
 					 "Unsupported type passed from C");
 				goto error;
 			}
-		} else {
-			data = pe->mp;
+			break;
+		case PORT_C_ENTRY_MP_OBJECT:
+		case PORT_C_ENTRY_MP:
+			data = pe->mp.data;
+			break;
+		default:
+			diag_set(ClientError, ER_SQL_EXECUTE,
+				 "Unsupported type passed from C");
+			goto error;
 		}
 		uint32_t len;
 		mem_clear(&val[i]);
@@ -3719,44 +3692,23 @@ port_c_get_vdbemem(struct port *base, uint32_t *size)
 			if (type == MP_UUID) {
 				assert(len == UUID_LEN);
 				struct tt_uuid *uuid = &val[i].u.uuid;
-				data = str;
-				if (mp_decode_uuid(&data, uuid) == NULL) {
-					diag_set(ClientError,
-						 ER_INVALID_MSGPACK, "Invalid "
-						 "MP_UUID MsgPack format");
-					goto error;
-				}
+				VERIFY(uuid_unpack(&data, len, uuid) != NULL);
 				val[i].type = MEM_TYPE_UUID;
 				break;
 			} else if (type == MP_DECIMAL) {
 				decimal_t *d = &val[i].u.d;
-				data = str;
-				if (mp_decode_decimal(&data, d) == NULL) {
-					diag_set(ClientError,
-						 ER_INVALID_MSGPACK, "Invalid "
-						 "MP_DECIMAL MsgPack format");
-					goto error;
-				}
+				VERIFY(decimal_unpack(&data, len, d) != NULL);
 				val[i].type = MEM_TYPE_DEC;
 				break;
 			} else if (type == MP_DATETIME) {
 				struct datetime *dt = &val[i].u.dt;
-				if (datetime_unpack(&data, len, dt) == 0) {
-					diag_set(ClientError,
-						 ER_INVALID_MSGPACK, "Invalid "
-						 "MP_DATETIME MsgPack format");
-					goto error;
-				}
+				VERIFY(datetime_unpack(&data, len, dt) != NULL);
 				val[i].type = MEM_TYPE_DATETIME;
 				break;
 			} else if (type == MP_INTERVAL) {
 				struct interval *itv = &val[i].u.itv;
-				if (interval_unpack(&data, len, itv) == NULL) {
-					diag_set(ClientError,
-						 ER_INVALID_MSGPACK, "Invalid "
-						 "MP_INTERVAL MsgPack format");
-					goto error;
-				}
+				VERIFY(interval_unpack(&data, len,
+						       itv) != NULL);
 				val[i].type = MEM_TYPE_INTERVAL;
 				break;
 			}

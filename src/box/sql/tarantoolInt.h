@@ -179,13 +179,22 @@ sql_encode_table_opts(struct region *region, struct space_def *def,
 char *
 fk_constraint_encode_links(const struct fk_constraint_def *fk, uint32_t *size);
 
-/**
- * Drop the check constraint or foreign key. This function drops tuple and field
- * constraints. If there is more than one constraint with the given name, one of
- * them will be dropped.
- */
+/** Drop tuple FOREIGN KEY constraint with given name. */
 int
-sql_constraint_drop(uint32_t space_id, const char *name);
+sql_tuple_foreign_key_drop(uint32_t space_id, const char *name);
+
+/** Drop tuple CHECK constraint with given name. */
+int
+sql_tuple_check_drop(uint32_t space_id, const char *name);
+
+/** Drop field FOREIGN KEY constraint of given field with given name. */
+int
+sql_field_foreign_key_drop(uint32_t space_id, uint32_t fieldno,
+			   const char *name);
+
+/** Drop field CHECK constraint of given field with given name. */
+int
+sql_field_check_drop(uint32_t space_id, uint32_t fieldno, const char *name);
 
 /**
  * Create new foreign key.
@@ -219,6 +228,10 @@ sql_foreign_key_create(const char *name, uint32_t child_id, uint32_t parent_id,
 int
 sql_check_create(const char *name, uint32_t space_id, uint32_t func_id,
 		 uint32_t fieldno, bool is_field_ck);
+
+/** Add SQL_EXPR function as the field default value to space format. */
+int
+sql_add_default(uint32_t space_id, uint32_t fieldno, uint32_t func_id);
 
 /**
  * Encode index parts of given foreign key constraint into

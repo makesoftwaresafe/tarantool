@@ -36,6 +36,7 @@
 #include "trivia/util.h"
 #include "iterator_type.h"
 #include "index_def.h"
+#include "index_weak_ref.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -255,14 +256,16 @@ box_tuple_extract_key(box_tuple_t *tuple, uint32_t space_id,
 /** \endcond public */
 
 /**
- * Allocate and initialize iterator for space_id, index_id. If packed_pos is
- * not NULL, iterator will start right after tuple with position, described by
- * this argument. A returned iterator must be destroyed by box_iterator_free().
+ * Allocate and initialize iterator for space_id, index_id and then skip @a
+ * offset tuples. If packed_pos is not NULL, iterator will start right after
+ * tuple with position, described by this argument. A returned iterator must
+ * be destroyed by box_iterator_free().
  */
 box_iterator_t *
-box_index_iterator_after(uint32_t space_id, uint32_t index_id, int type,
-			 const char *key, const char *key_end,
-			 const char *packed_pos, const char *packed_pos_end);
+box_index_iterator_with_offset(uint32_t space_id, uint32_t index_id, int type,
+			       const char *key, const char *key_end,
+			       const char *packed_pos,
+			       const char *packed_pos_end, uint32_t offset);
 
 /**
  * A helper for position extractors. Get packed position of tuple in
@@ -309,6 +312,8 @@ int
 box_index_compact(uint32_t space_id, uint32_t index_id);
 
 struct iterator {
+	/** Weak reference to the index this iterator is for. */
+	struct index_weak_ref index_ref;
 	/**
 	 * Same as next(), but returns a tuple as it is stored in the index,
 	 * without any transformations. Used internally by engines. For
@@ -331,12 +336,6 @@ struct iterator {
 	int (*position)(struct iterator *it, const char **pos, uint32_t *size);
 	/** Destroy the iterator. */
 	void (*free)(struct iterator *);
-	/** Space cache version at the time of the last index lookup. */
-	uint32_t space_cache_version;
-	/** ID of the space the iterator is for. */
-	uint32_t space_id;
-	/** ID of the index the iterator is for. */
-	uint32_t index_id;
 	/**
 	 * Allocator that was used for allocation of fields pos_buf requires
 	 * its size on deallocation.
@@ -345,20 +344,9 @@ struct iterator {
 	/**
 	 * Pointer to a buffer which was allocated for start position with
 	 * runtime_alloc. Will be freed on iterator_delete.
-	 * Needed for box_index_iterator_after.
+	 * Needed for box_index_iterator_with_offset.
 	 */
 	char *pos_buf;
-	/**
-	 * Pointer to the index the iterator is for.
-	 * Guaranteed to be valid only if the schema
-	 * state has not changed since the last lookup.
-	 */
-	struct index *index;
-	/**
-	 * Pointer to the space this iterator is for.
-	 * Don't access directly, use iterator_space().
-	 */
-	struct space *space;
 };
 
 /**
@@ -370,24 +358,6 @@ struct iterator {
  */
 void
 iterator_create(struct iterator *it, struct index *index);
-
-/** iterator_space() slow path. */
-struct space *
-iterator_space_slow(struct iterator *it);
-
-/**
- * Returns the space this iterator is for or NULL if the iterator is invalid
- * (e.g. the index was dropped).
- */
-static inline struct space *
-iterator_space(struct iterator *it)
-{
-	extern uint32_t space_cache_version;
-	if (likely(it->space != NULL &&
-		   it->space_cache_version == space_cache_version))
-		return it->space;
-	return iterator_space_slow(it);
-}
 
 /**
  * Iterate to the next tuple.
@@ -482,23 +452,15 @@ key_validate(const struct index_def *index_def, enum iterator_type type,
 
 /**
  * Check that the supplied key is valid for a search in a unique
- * index (i.e. the key must be fully specified).
+ * index (i.e. the key must be fully specified). Also check that
+ * index is unique.
+ *
  * @retval 0  The key is valid.
  * @retval -1 The key is invalid.
  */
 int
-exact_key_validate(struct key_def *key_def, const char *key,
+exact_key_validate(struct index_def *index_def, const char *key,
 		   uint32_t part_count);
-
-/**
- * Check that the supplied key is valid for representing iterator
- * position (i.e. the key must be fully specified, but nulls are allowed).
- * @retval 0  The key is valid.
- * @retval -1 The key is invalid.
- */
-int
-exact_key_validate_nullable(struct key_def *key_def, const char *key,
-			    uint32_t part_count);
 
 /**
  * The manner in which replace in a unique index must treat
@@ -615,6 +577,13 @@ struct index_vtab {
 					    const char *key,
 					    uint32_t part_count,
 					    const char *pos);
+	/** The same as create_iterator but skip first @offset tuples. */
+	struct iterator *(*create_iterator_with_offset)(struct index *index,
+							enum iterator_type type,
+							const char *key,
+							uint32_t part_count,
+							const char *pos,
+							uint32_t offset);
 	/** Create an index read view. */
 	struct index_read_view *(*create_read_view)(struct index *index);
 	/** Introspection (index:stat()) */
@@ -657,13 +626,14 @@ struct index {
 	uint32_t dense_id;
 	/**
 	 * List of gap_item's describing gap reads in the index with NULL
-	 * successor. Those gap reads happen when reading from empty index,
+	 * successor OR full scan gaps.
+	 * The first type happens when reading from empty index,
 	 * or when reading from rightmost part of ordered index (TREE).
-	 * @sa struct gap_item.
+	 * The second type happens when a full scan was finished for
+	 * unordered index (HASH).
+	 * @sa struct gap_item_base.
 	 */
-	struct rlist nearby_gaps;
-	/** List of full scans of the index. @sa struct full_scan_item. */
-	struct rlist full_scans;
+	struct rlist read_gaps;
 };
 
 /**
@@ -698,6 +668,9 @@ struct index_read_view_vtab {
 	/** Free an index read view instance. */
 	void
 	(*free)(struct index_read_view *rv);
+	/* Count the amount of tuples matching the key in the view. */
+	ssize_t (*count)(struct index_read_view *rv, enum iterator_type type,
+			 const char *key, uint32_t part_count);
 	/**
 	 * Look up a tuple by a full key in a read view.
 	 *
@@ -724,6 +697,13 @@ struct index_read_view_vtab {
 			   const char *key, uint32_t part_count,
 			   const char *pos,
 			   struct index_read_view_iterator *it);
+	/** The same as create_iterator but skip first @offset tuples. */
+	int
+	(*create_iterator_with_offset)(struct index_read_view *rv,
+				       enum iterator_type type,
+				       const char *key, uint32_t part_count,
+				       const char *pos, uint32_t offset,
+				       struct index_read_view_iterator *it);
 };
 
 /**
@@ -749,6 +729,9 @@ struct index_read_view {
 struct index_read_view_iterator_base {
 	/** Pointer to the index read view. */
 	struct index_read_view *index;
+	/** Destroy a read view iterator. */
+	void
+	(*destroy)(struct index_read_view_iterator *iterator);
 	/**
 	 * Iterate to the next tuple in the read view.
 	 *
@@ -778,7 +761,7 @@ struct index_read_view_iterator_base {
 };
 
 /** Size of the index_read_view_iterator struct. */
-#define INDEX_READ_VIEW_ITERATOR_SIZE 64
+#define INDEX_READ_VIEW_ITERATOR_SIZE 80
 
 static_assert(sizeof(struct index_read_view_iterator_base) <=
 	      INDEX_READ_VIEW_ITERATOR_SIZE,
@@ -801,42 +784,23 @@ struct index_read_view_iterator {
 };
 
 /**
- * Check if replacement of an old tuple with a new one is
- * allowed.
+ * Check if replacement of an old tuple with a new one is allowed.
+ * Return 0 on success, -1 on error (diag is set).
  */
-static inline uint32_t
-replace_check_dup(struct tuple *old_tuple, struct tuple *dup_tuple,
-		  enum dup_replace_mode mode)
-{
-	if (dup_tuple == NULL) {
-		if (mode == DUP_REPLACE) {
-			assert(old_tuple != NULL);
-			/*
-			 * dup_replace_mode is DUP_REPLACE, and
-			 * a tuple with the same key is not found.
-			 */
-			return ER_CANT_UPDATE_PRIMARY_KEY;
-		}
-	} else { /* dup_tuple != NULL */
-		if (dup_tuple != old_tuple &&
-		    (old_tuple != NULL || mode == DUP_INSERT)) {
-			/*
-			 * There is a duplicate of new_tuple,
-			 * and it's not old_tuple: we can't
-			 * possibly delete more than one tuple
-			 * at once.
-			 */
-			return ER_TUPLE_FOUND;
-		}
-	}
-	return 0;
-}
+int
+index_check_dup(struct index *index, struct tuple *old_tuple,
+		struct tuple *new_tuple, struct tuple *dup_tuple,
+		enum dup_replace_mode mode);
+
+/** Add payload fields with index details to the error. */
+void
+error_set_index(struct error *error, const struct index_def *index_def);
 
 /**
  * Initialize an index instance.
  * Note, this function copies the given index definition.
  */
-int
+void
 index_create(struct index *index, struct engine *engine,
 	     const struct index_vtab *vtab, struct index_def *def);
 
@@ -974,6 +938,15 @@ index_replace(struct index *index, struct tuple *old_tuple,
 }
 
 static inline struct iterator *
+index_create_iterator_with_offset(struct index *index, enum iterator_type type,
+				  const char *key, uint32_t part_count,
+				  const char *pos, uint32_t offset)
+{
+	return index->vtab->create_iterator_with_offset(
+		index, type, key, part_count, pos, offset);
+}
+
+static inline struct iterator *
 index_create_iterator_after(struct index *index, enum iterator_type type,
 			    const char *key, uint32_t part_count,
 			    const char *pos)
@@ -1041,7 +1014,7 @@ index_end_build(struct index *index)
  * Initialize an index read view instance.
  * Note, this function copies the given index definition.
  */
-int
+void
 index_read_view_create(struct index_read_view *rv,
 		       const struct index_read_view_vtab *vtab,
 		       struct index_def *def);
@@ -1050,12 +1023,31 @@ index_read_view_create(struct index_read_view *rv,
 void
 index_read_view_delete(struct index_read_view *rv);
 
+static inline ssize_t
+index_read_view_count(struct index_read_view *rv, enum iterator_type type,
+		      const char *key, uint32_t part_count)
+{
+	return rv->vtab->count(rv, type, key, part_count);
+}
+
 static inline int
 index_read_view_get_raw(struct index_read_view *rv,
 			const char *key, uint32_t part_count,
 			struct read_view_tuple *result)
 {
 	return rv->vtab->get_raw(rv, key, part_count, result);
+}
+
+static inline int
+index_read_view_create_iterator_with_offset(struct index_read_view *rv,
+					    enum iterator_type type,
+					    const char *key,
+					    uint32_t part_count,
+					    const char *pos, uint32_t offset,
+					    struct index_read_view_iterator *it)
+{
+	return rv->vtab->create_iterator_with_offset(rv, type, key, part_count,
+						     pos, offset, it);
 }
 
 static inline int
@@ -1080,7 +1072,7 @@ index_read_view_create_iterator(struct index_read_view *rv,
 static inline void
 index_read_view_iterator_destroy(struct index_read_view_iterator *iterator)
 {
-	TRASH(iterator);
+	iterator->base.destroy(iterator);
 }
 
 static inline int
@@ -1116,6 +1108,10 @@ int generic_index_max(struct index *, const char *, uint32_t, struct tuple **);
 int generic_index_random(struct index *, uint32_t, struct tuple **);
 ssize_t generic_index_count(struct index *, enum iterator_type,
 			    const char *, uint32_t);
+ssize_t
+generic_index_read_view_count(struct index_read_view *rv,
+			      enum iterator_type type, const char *key,
+			      uint32_t part_count);
 int
 generic_index_get_internal(struct index *index, const char *key,
 			   uint32_t part_count, struct tuple **result);
@@ -1134,6 +1130,17 @@ struct iterator *
 generic_index_create_iterator(struct index *base, enum iterator_type type,
 			      const char *key, uint32_t part_count,
 			      const char *pos);
+struct iterator *
+generic_index_create_iterator_with_offset(struct index *base,
+					  enum iterator_type type,
+					  const char *key, uint32_t part_count,
+					  const char *pos, uint32_t offset);
+int
+generic_index_read_view_create_iterator_with_offset(
+	struct index_read_view *base, enum iterator_type type,
+	const char *key, uint32_t part_count,
+	const char *pos, uint32_t offset,
+	struct index_read_view_iterator *it);
 int generic_index_build_next(struct index *, struct tuple *);
 void generic_index_end_build(struct index *);
 int
@@ -1154,6 +1161,8 @@ generic_iterator_position(struct iterator *it, const char **pos,
 int
 generic_index_read_view_iterator_position(struct index_read_view_iterator *it,
 					  const char **pos, uint32_t *size);
+void
+generic_index_read_view_iterator_destroy(struct index_read_view_iterator *it);
 
 #if defined(__cplusplus)
 } /* extern "C" */

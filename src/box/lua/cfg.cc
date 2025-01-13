@@ -82,6 +82,14 @@ lbox_cfg_set_bootstrap_strategy(struct lua_State *L)
 }
 
 static int
+lbox_cfg_set_bootstrap_leader(struct lua_State *L)
+{
+	if (box_set_bootstrap_leader() != 0)
+		luaT_error(L);
+	return 0;
+}
+
+static int
 lbox_cfg_set_replication(struct lua_State *L)
 {
 	try {
@@ -173,6 +181,14 @@ static int
 lbox_cfg_set_wal_queue_max_size(struct lua_State *L)
 {
 	if (box_set_wal_queue_max_size() != 0)
+		luaT_error(L);
+	return 0;
+}
+
+static int
+lbox_cfg_set_replication_synchro_queue_max_size(struct lua_State *L)
+{
+	if (box_set_replication_synchro_queue_max_size() != 0)
 		luaT_error(L);
 	return 0;
 }
@@ -404,6 +420,14 @@ lbox_cfg_set_replication_anon(struct lua_State *L)
 	return 0;
 }
 
+static int
+lbox_cfg_set_replication_anon_ttl(struct lua_State *L)
+{
+	if (box_set_replication_anon_ttl() < 0)
+		luaT_error(L);
+	return 0;
+}
+
 /** box.cfg.instance_name. */
 static int
 lbox_cfg_set_instance_name(struct lua_State *L)
@@ -480,6 +504,13 @@ lbox_cfg_set_auth_type(struct lua_State *L)
 	return 0;
 }
 
+static int
+lbox_cfg_get_force_recovery(struct lua_State *L)
+{
+	lua_pushboolean(L, box_is_force_recovery);
+	return 1;
+}
+
 void
 box_lua_cfg_init(struct lua_State *L)
 {
@@ -488,6 +519,7 @@ box_lua_cfg_init(struct lua_State *L)
 		{"cfg_load", lbox_cfg_load},
 		{"cfg_set_listen", lbox_cfg_set_listen},
 		{"cfg_set_bootstrap_strategy", lbox_cfg_set_bootstrap_strategy},
+		{"cfg_set_bootstrap_leader", lbox_cfg_set_bootstrap_leader},
 		{"cfg_set_replication", lbox_cfg_set_replication},
 		{"cfg_set_worker_pool_threads", lbox_cfg_set_worker_pool_threads},
 		{"cfg_set_readahead", lbox_cfg_set_readahead},
@@ -498,6 +530,7 @@ box_lua_cfg_init(struct lua_State *L)
 		{"cfg_set_checkpoint_interval", lbox_cfg_set_checkpoint_interval},
 		{"cfg_set_checkpoint_wal_threshold", lbox_cfg_set_checkpoint_wal_threshold},
 		{"cfg_set_wal_queue_max_size", lbox_cfg_set_wal_queue_max_size},
+		{"cfg_set_replication_synchro_queue_max_size", lbox_cfg_set_replication_synchro_queue_max_size},
 		{"cfg_set_wal_cleanup_delay", lbox_cfg_set_wal_cleanup_delay},
 		{"cfg_set_read_only", lbox_cfg_set_read_only},
 		{"cfg_set_memtx_memory", lbox_cfg_set_memtx_memory},
@@ -519,6 +552,7 @@ box_lua_cfg_init(struct lua_State *L)
 		{"cfg_set_replication_sync_timeout", lbox_cfg_set_replication_sync_timeout},
 		{"cfg_set_replication_skip_conflict", lbox_cfg_set_replication_skip_conflict},
 		{"cfg_set_replication_anon", lbox_cfg_set_replication_anon},
+		{"cfg_set_replication_anon_ttl", lbox_cfg_set_replication_anon_ttl},
 		{"cfg_set_replicaset_name", lbox_cfg_set_replicaset_name},
 		{"cfg_set_instance_name", lbox_cfg_set_instance_name},
 		{"cfg_set_cluster_name", lbox_cfg_set_cluster_name},
@@ -528,6 +562,7 @@ box_lua_cfg_init(struct lua_State *L)
 		{"cfg_set_txn_timeout", lbox_cfg_set_txn_timeout},
 		{"cfg_set_txn_isolation", lbox_cfg_set_txn_isolation},
 		{"cfg_set_auth_type", lbox_cfg_set_auth_type},
+		{"cfg_get_force_recovery", lbox_cfg_get_force_recovery},
 		{NULL, NULL}
 	};
 

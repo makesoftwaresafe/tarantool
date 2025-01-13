@@ -30,13 +30,16 @@
  */
 #include "box.h"
 #include "error.h"
+#include "event.h"
 #include "journal.h"
+#include "port.h"
 #include "raft.h"
 #include "relay.h"
 #include "replication.h"
 #include "txn_limbo.h"
 #include "xrow.h"
 #include "errinj.h"
+#include "watcher.h"
 
 struct raft box_raft_global = {
 	/*
@@ -63,8 +66,7 @@ static struct trigger box_raft_on_quorum_gain;
 /** Triggers executed once the node loses a quorum of connected peers. */
 static struct trigger box_raft_on_quorum_loss;
 
-struct rlist box_raft_on_broadcast =
-	RLIST_HEAD_INITIALIZER(box_raft_on_broadcast);
+struct event *box_raft_on_election_event;
 
 /**
  * Worker fiber does all the asynchronous work, which may need yields and can be
@@ -89,7 +91,8 @@ static void
 box_raft_election_fencing_resume(void);
 
 static void
-box_raft_msg_to_request(const struct raft_msg *msg, struct raft_request *req)
+box_raft_msg_to_request(const struct raft_msg *msg, struct raft_request *req,
+			enum group_id group_id)
 {
 	*req = (struct raft_request) {
 		.term = msg->term,
@@ -98,6 +101,7 @@ box_raft_msg_to_request(const struct raft_msg *msg, struct raft_request *req)
 		.is_leader_seen = msg->is_leader_seen,
 		.state = msg->state,
 		.vclock = msg->vclock,
+		.group_id = group_id,
 	};
 }
 
@@ -122,14 +126,22 @@ box_raft_update_synchro_queue(struct raft *raft)
 		return;
 	int rc = 0;
 	uint32_t errcode = 0;
+	bool try_again;
 	do {
+		try_again = false;
 		rc = box_promote_qsync();
 		if (rc != 0) {
 			struct error *err = diag_last_error(diag_get());
 			errcode = box_error_code(err);
 			diag_log();
+			if (!fiber_is_cancelled() &&
+			    (errcode == ER_QUORUM_WAIT ||
+			    errcode == ER_IN_ANOTHER_PROMOTE)) {
+				try_again = true;
+				fiber_sleep(0);
+			}
 		}
-	} while (rc != 0 && errcode == ER_QUORUM_WAIT && !fiber_is_cancelled());
+	} while (try_again);
 }
 
 static int
@@ -292,6 +304,19 @@ box_raft_fence(void)
 	raft_resign(raft);
 }
 
+void
+box_raft_leader_step_off(void)
+{
+	struct raft *raft = box_raft();
+	if (!raft->is_enabled || raft->state != RAFT_STATE_LEADER)
+		return;
+
+	/* It will be unfenced the next time new term is written. */
+	txn_limbo_fence(&txn_limbo);
+	raft_resign(raft);
+	raft_restore(raft);
+}
+
 /**
  * Configure the raft node according to whether it has a quorum of connected
  * peers or not. It can't start elections, when it doesn't.
@@ -343,7 +368,7 @@ box_raft_checkpoint_local(struct raft_request *req)
 {
 	struct raft_msg msg;
 	raft_checkpoint_local(box_raft(), &msg);
-	box_raft_msg_to_request(&msg, req);
+	box_raft_msg_to_request(&msg, req, GROUP_LOCAL);
 }
 
 void
@@ -351,7 +376,7 @@ box_raft_checkpoint_remote(struct raft_request *req)
 {
 	struct raft_msg msg;
 	raft_checkpoint_remote(box_raft(), &msg);
-	box_raft_msg_to_request(&msg, req);
+	box_raft_msg_to_request(&msg, req, GROUP_DEFAULT);
 }
 
 int
@@ -362,16 +387,22 @@ box_raft_process(struct raft_request *req, uint32_t source)
 	return raft_process_msg(box_raft(), &msg, source);
 }
 
+int
+box_raft_run_on_election_triggers(void)
+{
+	return event_run_triggers(box_raft_on_election_event, NULL);
+}
+
 static void
 box_raft_broadcast(struct raft *raft, const struct raft_msg *msg)
 {
 	(void)raft;
 	assert(raft == box_raft());
 	struct raft_request req;
-	box_raft_msg_to_request(msg, &req);
+	box_raft_msg_to_request(msg, &req, GROUP_DEFAULT);
 	replicaset_foreach(replica)
 		relay_push_raft(replica->relay, &req);
-	trigger_run(&box_raft_on_broadcast, NULL);
+	box_raft_run_on_election_triggers();
 }
 
 static void
@@ -384,7 +415,7 @@ box_raft_write(struct raft *raft, const struct raft_msg *msg)
 	assert(msg->state == 0);
 
 	struct raft_request req;
-	box_raft_msg_to_request(msg, &req);
+	box_raft_msg_to_request(msg, &req, GROUP_LOCAL);
 	struct region *region = &fiber()->gc;
 	uint32_t svp = region_used(region);
 	struct xrow_header row;
@@ -615,6 +646,13 @@ box_raft_election_fencing_resume(void)
 }
 
 void
+box_raft_on_wal_error_f(struct watcher *watcher)
+{
+	(void)watcher;
+	box_raft_leader_step_off();
+}
+
+void
 box_raft_init(void)
 {
 	static const struct raft_vtab box_raft_vtab = {
@@ -630,17 +668,30 @@ box_raft_init(void)
 		       NULL, NULL);
 	trigger_create(&box_raft_on_quorum_loss, box_raft_on_quorum_change_f,
 		       NULL, NULL);
+	struct watcher *watcher = xmalloc(sizeof(*watcher));
+	const char *key = "box.wal_error";
+	size_t key_len = strlen(key);
+	box_register_watcher(key, key_len, box_raft_on_wal_error_f,
+			     (watcher_destroy_f)free, 0,
+			     watcher);
+	box_raft_on_election_event = event_get("box.ctl.on_election", true);
+	event_ref(box_raft_on_election_event);
+}
+
+void
+box_raft_shutdown(void)
+{
+	if (box_raft_worker == NULL)
+		return;
+	fiber_cancel(box_raft_worker);
+	fiber_join(box_raft_worker);
+	box_raft_worker = NULL;
 }
 
 void
 box_raft_free(void)
 {
 	struct raft *raft = box_raft();
-	/*
-	 * Can't join the fiber, because the event loop is stopped already, and
-	 * yields are not allowed.
-	 */
-	box_raft_worker = NULL;
 	raft_destroy(raft);
 	/*
 	 * Invalidate so as box_raft() would fail if any usage attempt happens.
@@ -648,4 +699,6 @@ box_raft_free(void)
 	raft->state = 0;
 
 	box_raft_remove_quorum_triggers();
+	event_unref(box_raft_on_election_event);
+	box_raft_on_election_event = NULL;
 }

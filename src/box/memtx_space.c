@@ -30,6 +30,7 @@
  */
 #include "memtx_space.h"
 #include "space.h"
+#include "space_upgrade.h"
 #include "iproto_constants.h"
 #include "txn.h"
 #include "memtx_tx.h"
@@ -46,7 +47,6 @@
 #include "memtx_space_upgrade.h"
 #include "memtx_tuple_compression.h"
 #include "schema.h"
-#include "result.h"
 #include "small/region.h"
 
 /*
@@ -75,21 +75,56 @@ static size_t
 memtx_space_bsize(struct space *space)
 {
 	struct memtx_space *memtx_space = (struct memtx_space *)space;
-	return memtx_space->bsize;
+	return memtx_space->tuple_stat[TUPLE_ARENA_MEMTX].data_size +
+	       memtx_space->tuple_stat[TUPLE_ARENA_MALLOC].data_size;
 }
 
 /* {{{ DML */
 
 void
-memtx_space_update_bsize(struct space *space, struct tuple *old_tuple,
-			 struct tuple *new_tuple)
+memtx_space_update_tuple_stat(struct space *space, struct tuple *old_tuple,
+			      struct tuple *new_tuple)
 {
 	assert(space->vtab->destroy == &memtx_space_destroy);
 	struct memtx_space *memtx_space = (struct memtx_space *)space;
-	ssize_t old_bsize = old_tuple ? box_tuple_bsize(old_tuple) : 0;
-	ssize_t new_bsize = new_tuple ? box_tuple_bsize(new_tuple) : 0;
-	assert((ssize_t)memtx_space->bsize + new_bsize - old_bsize >= 0);
-	memtx_space->bsize += new_bsize - old_bsize;
+	struct tuple_info info, *stat;
+
+	if (new_tuple != NULL) {
+		tuple_info(new_tuple, &info);
+
+		assert(info.arena_type == TUPLE_ARENA_MEMTX ||
+		       info.arena_type == TUPLE_ARENA_MALLOC);
+		stat = &memtx_space->tuple_stat[info.arena_type];
+
+		stat->data_size += info.data_size;
+		stat->header_size += info.header_size;
+		stat->field_map_size += info.field_map_size;
+		stat->waste_size += info.waste_size;
+	}
+
+	if (old_tuple != NULL) {
+		tuple_info(old_tuple, &info);
+
+		assert(info.arena_type == TUPLE_ARENA_MEMTX ||
+		       info.arena_type == TUPLE_ARENA_MALLOC);
+		stat = &memtx_space->tuple_stat[info.arena_type];
+
+		assert(stat->data_size >= info.data_size);
+		assert(stat->header_size >= info.header_size);
+		assert(stat->field_map_size >= info.field_map_size);
+
+		stat->data_size -= info.data_size;
+		stat->header_size -= info.header_size;
+		stat->field_map_size -= info.field_map_size;
+		/*
+		 * Avoid negative values, since waste_size is calculated
+		 * imprecisely.
+		 */
+		if (stat->waste_size > info.waste_size)
+			stat->waste_size -= info.waste_size;
+		else
+			stat->waste_size = 0;
+	}
 }
 
 /**
@@ -121,7 +156,13 @@ memtx_space_replace_build_next(struct space *space, struct tuple *old_tuple,
 			       enum dup_replace_mode mode,
 			       struct tuple **result)
 {
-	assert(old_tuple == NULL && mode == DUP_INSERT);
+	assert(old_tuple == NULL);
+	/*
+	 * If before_replace trigger changes tuple, the request is updated
+	 * and request type is changed to REPLACE, so we can meet
+	 * DUP_REPLACE_OR_INSERT here.
+	 */
+	assert(mode == DUP_INSERT || mode == DUP_REPLACE_OR_INSERT);
 	(void)mode;
 	*result = NULL;
 	if (old_tuple) {
@@ -136,7 +177,7 @@ memtx_space_replace_build_next(struct space *space, struct tuple *old_tuple,
 	}
 	if (index_build_next(space->index[0], new_tuple) != 0)
 		return -1;
-	memtx_space_update_bsize(space, NULL, new_tuple);
+	memtx_space_update_tuple_stat(space, NULL, new_tuple);
 	tuple_ref(new_tuple);
 	return 0;
 }
@@ -155,7 +196,7 @@ memtx_space_replace_primary_key(struct space *space, struct tuple *old_tuple,
 	if (index_replace(space->index[0], old_tuple,
 			  new_tuple, mode, &old_tuple, &successor) != 0)
 		return -1;
-	memtx_space_update_bsize(space, old_tuple, new_tuple);
+	memtx_space_update_tuple_stat(space, old_tuple, new_tuple);
 	if (new_tuple != NULL)
 		tuple_ref(new_tuple);
 	*result = old_tuple;
@@ -252,16 +293,6 @@ memtx_space_replace_all_keys(struct space *space, struct tuple *old_tuple,
 			     enum dup_replace_mode mode,
 			     struct tuple **result)
 {
-	struct memtx_engine *memtx = (struct memtx_engine *)space->engine;
-	/*
-	 * Ensure we have enough slack memory to guarantee
-	 * successful statement-level rollback.
-	 */
-	if (memtx_index_extent_reserve(memtx, new_tuple != NULL ?
-				       RESERVE_EXTENTS_BEFORE_REPLACE :
-				       RESERVE_EXTENTS_BEFORE_DELETE) != 0)
-		return -1;
-
 	uint32_t i = 0;
 
 	/* Update the primary key */
@@ -307,7 +338,7 @@ memtx_space_replace_all_keys(struct space *space, struct tuple *old_tuple,
 			goto rollback;
 	}
 
-	memtx_space_update_bsize(space, old_tuple, new_tuple);
+	memtx_space_update_tuple_stat(space, old_tuple, new_tuple);
 	if (new_tuple != NULL)
 		tuple_ref(new_tuple);
 	*result = old_tuple;
@@ -395,12 +426,11 @@ memtx_space_execute_replace(struct space *space, struct txn *txn,
 	struct tuple *new_tuple =
 		space->format->vtab.tuple_new(space->format, request->tuple,
 					      request->tuple_end);
-	if (new_tuple == NULL)
+	if (new_tuple == NULL) {
+		error_set_space(diag_last_error(diag_get()), space->def);
 		return -1;
+	}
 	tuple_ref(new_tuple);
-
-	if (mode == DUP_INSERT)
-		stmt->does_require_old_tuple = true;
 
 	if (memtx_space_replace_tuple(space, stmt, NULL, new_tuple,
 				      mode) != 0) {
@@ -417,12 +447,12 @@ memtx_space_execute_delete(struct space *space, struct txn *txn,
 {
 	struct txn_stmt *stmt = txn_current_stmt(txn);
 	/* Try to find the tuple by unique key. */
-	struct index *pk = index_find_unique(space, request->index_id);
+	struct index *pk = index_find(space, request->index_id);
 	if (pk == NULL)
 		return -1;
 	const char *key = request->key;
 	uint32_t part_count = mp_decode_array(&key);
-	if (exact_key_validate(pk->def->key_def, key, part_count) != 0)
+	if (exact_key_validate(pk->def, key, part_count) != 0)
 		return -1;
 	struct tuple *old_tuple;
 	if (index_get_internal(pk, key, part_count, &old_tuple) != 0)
@@ -433,17 +463,17 @@ memtx_space_execute_delete(struct space *space, struct txn *txn,
 		return 0;
 	}
 
-	/*
-	 * We have to delete exactly old_tuple just because we return it as
-	 * a result.
-	 */
-	stmt->does_require_old_tuple = true;
-
 	if (memtx_space_replace_tuple(space, stmt, old_tuple, NULL,
 				      DUP_REPLACE_OR_INSERT) != 0)
 		return -1;
-	*result = result_process(space, stmt->old_tuple);
-	return *result == NULL ? -1 : 0;
+	if (unlikely(space->upgrade != NULL)) {
+		*result = space_upgrade_apply(space->upgrade, stmt->old_tuple);
+		if (*result == NULL)
+			return -1;
+	} else {
+		*result = stmt->old_tuple;
+	}
+	return 0;
 }
 
 static int
@@ -452,12 +482,12 @@ memtx_space_execute_update(struct space *space, struct txn *txn,
 {
 	struct txn_stmt *stmt = txn_current_stmt(txn);
 	/* Try to find the tuple by unique key. */
-	struct index *pk = index_find_unique(space, request->index_id);
+	struct index *pk = index_find(space, request->index_id);
 	if (pk == NULL)
 		return -1;
 	const char *key = request->key;
 	uint32_t part_count = mp_decode_array(&key);
-	if (exact_key_validate(pk->def->key_def, key, part_count) != 0)
+	if (exact_key_validate(pk->def, key, part_count) != 0)
 		return -1;
 	struct tuple *old_tuple;
 	if (index_get_internal(pk, key, part_count, &old_tuple) != 0)
@@ -467,36 +497,33 @@ memtx_space_execute_update(struct space *space, struct txn *txn,
 		*result = NULL;
 		return 0;
 	}
-
-	struct tuple *decompressed = memtx_tuple_decompress(old_tuple);
-	if (decompressed == NULL)
-		return -1;
-	tuple_bless(decompressed);
-	decompressed = result_process(space, decompressed);
-	if (decompressed == NULL)
+	struct tuple *prepared = old_tuple;
+	if (memtx_prepare_result_tuple(space, &prepared) != 0)
 		return -1;
 
 	/* Update the tuple; legacy, request ops are in request->tuple */
 	uint32_t new_size = 0, bsize;
 	struct tuple_format *format = space->format;
-	const char *old_data = tuple_data_range(decompressed, &bsize);
+	const char *old_data = tuple_data_range(prepared, &bsize);
 	size_t region_svp = region_used(&fiber()->gc);
 	const char *new_data =
 		xrow_update_execute(request->tuple, request->tuple_end,
 				    old_data, old_data + bsize, format,
 				    &new_size, request->index_base, NULL);
-	if (new_data == NULL)
+	if (new_data == NULL) {
+		error_set_index(diag_last_error(diag_get()), pk->def);
 		return -1;
+	}
 
 	struct tuple *new_tuple =
 		space->format->vtab.tuple_new(format, new_data,
 					      new_data + new_size);
 	region_truncate(&fiber()->gc, region_svp);
-	if (new_tuple == NULL)
+	if (new_tuple == NULL) {
+		error_set_index(diag_last_error(diag_get()), pk->def);
 		return -1;
+	}
 	tuple_ref(new_tuple);
-
-	stmt->does_require_old_tuple = true;
 
 	if (memtx_space_replace_tuple(space, stmt, old_tuple, new_tuple,
 				      DUP_REPLACE) != 0) {
@@ -516,10 +543,12 @@ memtx_space_execute_upsert(struct space *space, struct txn *txn,
 	 * Check all tuple fields: we should produce an error on
 	 * malformed tuple even if upsert turns into an update.
 	 */
-	if (tuple_validate_raw(space->format, request->tuple))
+	if (tuple_validate_raw(space->format, request->tuple)) {
+		error_set_space(diag_last_error(diag_get()), space->def);
 		return -1;
+	}
 
-	struct index *index = index_find_unique(space, 0);
+	struct index *index = index_find(space, 0);
 	if (index == NULL)
 		return -1;
 
@@ -563,6 +592,8 @@ memtx_space_execute_upsert(struct space *space, struct txn *txn,
 		 */
 		if (xrow_update_check_ops(request->ops, request->ops_end,
 					  format, request->index_base) != 0) {
+			error_set_space(diag_last_error(diag_get()),
+					space->def);
 			return -1;
 		}
 		new_tuple =
@@ -572,16 +603,11 @@ memtx_space_execute_upsert(struct space *space, struct txn *txn,
 			return -1;
 		tuple_ref(new_tuple);
 	} else {
-		struct tuple *decompressed = memtx_tuple_decompress(old_tuple);
-		if (decompressed == NULL)
+		struct tuple *prepared = old_tuple;
+		if (memtx_prepare_result_tuple(space, &prepared) != 0)
 			return -1;
-		tuple_bless(decompressed);
-		decompressed = result_process(space, decompressed);
-		if (decompressed == NULL)
-			return -1;
-
 		uint32_t new_size = 0, bsize;
-		const char *old_data = tuple_data_range(decompressed, &bsize);
+		const char *old_data = tuple_data_range(prepared, &bsize);
 		/*
 		 * Update the tuple.
 		 * xrow_upsert_execute() fails on totally wrong
@@ -596,15 +622,21 @@ memtx_space_execute_upsert(struct space *space, struct txn *txn,
 					    format, &new_size,
 					    request->index_base, false,
 					    &column_mask);
-		if (new_data == NULL)
+		if (new_data == NULL) {
+			error_set_space(diag_last_error(diag_get()),
+					space->def);
 			return -1;
+		}
 
 		new_tuple =
 			space->format->vtab.tuple_new(format, new_data,
 						      new_data + new_size);
 		region_truncate(&fiber()->gc, region_svp);
-		if (new_tuple == NULL)
+		if (new_tuple == NULL) {
+			error_set_space(diag_last_error(diag_get()),
+					space->def);
 			return -1;
+		}
 		tuple_ref(new_tuple);
 
 		struct index *pk = space->index[0];
@@ -614,15 +646,14 @@ memtx_space_execute_upsert(struct space *space, struct txn *txn,
 				  HINT_NONE, pk->def->key_def) != 0) {
 			/* Primary key is changed: log error and do nothing. */
 			diag_set(ClientError, ER_CANT_UPDATE_PRIMARY_KEY,
-				 space_name(space));
+				 space_name(space), space_id(space),
+				 old_tuple, new_tuple, NULL);
 			diag_log();
 			tuple_unref(new_tuple);
 			return 0;
 		}
 	}
 	assert(new_tuple != NULL);
-
-	stmt->does_require_old_tuple = true;
 
 	/*
 	 * It's OK to use DUP_REPLACE_OR_INSERT: we don't risk
@@ -831,19 +862,22 @@ memtx_space_check_index_def(struct space *space, struct index_def *index_def)
 			 index_def->name, space_name(space));
 		return -1;
 	}
-	/* Only HASH and TREE indexes checks parts there */
-	/* Check that there are no ANY, ARRAY, MAP parts */
-	for (uint32_t i = 0; i < key_def->part_count; i++) {
-		struct key_part *part = &key_def->parts[i];
-		if (part->type <= FIELD_TYPE_ANY ||
-		    part->type >= FIELD_TYPE_INTERVAL) {
-			diag_set(ClientError, ER_MODIFY_INDEX,
-				 index_def->name, space_name(space),
-				 tt_sprintf("field type '%s' is not supported",
-					    field_type_strs[part->type]));
-			return -1;
-		}
+
+	if (index_def->type != TREE && index_def->opts.hint == INDEX_HINT_ON &&
+	    recovery_state == FINISHED_RECOVERY) {
+		/*
+		 * The error is silenced during recovery to be able to recover
+		 * the indexes with incorrect hint options.
+		 */
+		diag_set(ClientError, ER_MODIFY_INDEX, index_def->name,
+			 space_name(space),
+			 "hint is only reasonable with memtx tree index");
+		return -1;
 	}
+
+	/* Only HASH and TREE indexes check parts there. */
+	if (index_def_check_field_types(index_def, space_name(space)) != 0)
+		return -1;
 	return 0;
 }
 
@@ -942,6 +976,18 @@ struct memtx_ddl_state {
 	struct tuple *cursor;
 	/* Primary key key_def to compare new tuples with cursor. */
 	struct key_def *cmp_def;
+	/*
+	 * List of all transactional triggers created by the DDL for concurrent
+	 * statements. They must be destroyed when the DDL is over since the
+	 * object is going to be invalidated. It is OK because all owners of
+	 * the triggers are already prepared and on their rollback the DDL
+	 * will be rolled back as well and on their commit we won't need the
+	 * triggers anymore.
+	 *
+	 * NB: must be used only without MVCC, otherwise something must have
+	 * gone wrong.
+	 */
+	struct rlist stmt_triggers;
 	struct diag diag;
 	int rc;
 };
@@ -981,17 +1027,19 @@ memtx_space_check_format(struct space *space, struct tuple_format *format)
 {
 	struct txn *txn = in_txn();
 
+	if (tuple_format1_can_store_format2_tuples(format, space->format))
+		return 0;
 	if (space->index_count == 0)
 		return 0;
 	struct index *pk = space->index[0];
 	if (index_size(pk) == 0)
 		return 0;
 
-	struct iterator *it = index_create_iterator(pk, ITER_ALL, NULL, 0);
-	if (it == NULL)
+	if (txn_check_singlestatement(txn, "space format check") != 0)
 		return -1;
 
-	if (txn_check_singlestatement(txn, "space format check") != 0)
+	struct iterator *it = index_create_iterator(pk, ITER_ALL, NULL, 0);
+	if (it == NULL)
 		return -1;
 
 	struct memtx_engine *memtx = (struct memtx_engine *)space->engine;
@@ -1000,6 +1048,7 @@ memtx_space_check_format(struct space *space, struct tuple_format *format)
 	state.cmp_def = pk->def->key_def;
 	state.rc = 0;
 	diag_create(&state.diag);
+	rlist_create(&state.stmt_triggers);
 
 	struct trigger on_replace;
 	trigger_create(&on_replace, memtx_check_on_replace, &state, NULL);
@@ -1027,6 +1076,13 @@ memtx_space_check_format(struct space *space, struct tuple_format *format)
 
 		ERROR_INJECT_YIELD(ERRINJ_CHECK_FORMAT_DELAY);
 
+		ERROR_INJECT_COUNTDOWN(ERRINJ_CHECK_FORMAT_DELAY_COUNTDOWN, {
+			struct errinj *e =
+				errinj(ERRINJ_CHECK_FORMAT_DELAY, ERRINJ_BOOL);
+			e->bparam = true;
+			ERROR_INJECT_YIELD(ERRINJ_CHECK_FORMAT_DELAY);
+		});
+
 		tuple_unref(state.cursor);
 		if (state.rc != 0) {
 			rc = -1;
@@ -1037,6 +1093,7 @@ memtx_space_check_format(struct space *space, struct tuple_format *format)
 	iterator_delete(it);
 	diag_destroy(&state.diag);
 	trigger_clear(&on_replace);
+	assert(rlist_empty(&state.stmt_triggers));
 	return rc;
 }
 
@@ -1052,7 +1109,6 @@ memtx_space_drop_primary_key(struct space *space)
 	 *   can be put back online properly.
 	 */
 	memtx_space->replace = memtx_space_replace_no_keys;
-	memtx_space->bsize = 0;
 }
 
 static void
@@ -1069,21 +1125,35 @@ memtx_init_ephemeral_space(struct space *space)
 }
 
 /*
- * Ongoing index build state with statement used by
- * corresponding on_rollback triggers to prevent rollbacked changes appearance.
+ * Struct to allocate by memtx_build_on_replace trigger, contains
+ * transactional statement triggers with their data.
  */
-struct index_build_on_rollback_data {
+struct memtx_build_stmt_trigger {
+	/** Link in memtx_ddl_state::stmt_triggers. */
+	struct rlist in_state;
+	/** See memtx_build_on_replace_rollback. */
+	struct trigger on_rollback;
+	/** See memtx_build_on_replace_commit. */
+	struct trigger on_commit;
+	/** State of the DDL. */
 	struct memtx_ddl_state *state;
-	struct txn_stmt *stmt;
 };
 
+/**
+ * Rolls back a replace in the index that was done during its
+ * background build.
+ */
 static int
-memtx_build_on_replace_rollback(struct trigger *trigger, void *event)
+memtx_build_on_replace_rollback(struct trigger *base, void *event)
 {
-	(void)event;
-	struct index_build_on_rollback_data *data = trigger->data;
-	struct txn_stmt *stmt = data->stmt;
-	struct memtx_ddl_state *state = data->state;
+	struct txn_stmt *stmt = (struct txn_stmt *)event;
+	struct memtx_build_stmt_trigger *trigger =
+		container_of(base, struct memtx_build_stmt_trigger,
+			     on_rollback);
+	struct memtx_ddl_state *state = trigger->state;
+
+	/* The trigger is fired and will be deleted - remove from the state. */
+	rlist_del_entry(trigger, in_state);
 	/*
 	 * Old tuple's format is valid if it exists.
 	 */
@@ -1119,14 +1189,19 @@ memtx_build_on_replace_rollback(struct trigger *trigger, void *event)
 	return 0;
 }
 
-/*
- * Struct to allocate by memtx_build_on_replace trigger
- * (on_rollback trigger with its data).
+/**
+ * Deletes the transactional statement triggers from
+ * memtx_ddl_state::stmt_triggers since they are going to be deleted.
  */
-struct on_rollback_trigger_with_data {
-	struct trigger on_rollback;
-	struct index_build_on_rollback_data data;
-};
+static int
+memtx_build_on_replace_commit(struct trigger *base, void *event)
+{
+	(void)event;
+	struct memtx_build_stmt_trigger *trigger =
+		container_of(base, struct memtx_build_stmt_trigger, on_commit);
+	rlist_del_entry(trigger, in_state);
+	return 0;
+}
 
 static int
 memtx_build_on_replace(struct trigger *trigger, void *event)
@@ -1179,30 +1254,18 @@ memtx_build_on_replace(struct trigger *trigger, void *event)
 	 * problem when rollbacked changes appears in
 	 * built-in-background index.
 	 */
-	struct on_rollback_trigger_with_data *on_rollback_associates = NULL;
-	struct errinj *inj = errinj(ERRINJ_BUILD_INDEX_ON_ROLLBACK_ALLOC,
-				    ERRINJ_BOOL);
-	if (inj == NULL || inj->bparam == false) {
-		on_rollback_associates = region_aligned_alloc(
-			&in_txn()->region,
-			sizeof(struct on_rollback_trigger_with_data),
-			alignof(struct on_rollback_trigger_with_data));
-	}
-	if (on_rollback_associates == NULL) {
-		diag_set(OutOfMemory,
-			 sizeof(struct on_rollback_trigger_with_data),
-			 "region_aligned_alloc",
-			 "struct on_rollback_trigger_with_data");
-		diag_move(diag_get(), &state->diag);
-		state->rc = -1;
-		return 0;
-	}
-	on_rollback_associates->data.stmt = stmt;
-	on_rollback_associates->data.state = state;
-	trigger_create(&on_rollback_associates->on_rollback,
-		       memtx_build_on_replace_rollback,
-		       &on_rollback_associates->data, NULL);
-	txn_stmt_on_rollback(stmt, &on_rollback_associates->on_rollback);
+	struct memtx_build_stmt_trigger *stmt_trigger =
+		xregion_alloc_object(&in_txn()->region,
+				     struct memtx_build_stmt_trigger);
+	rlist_add_entry(&state->stmt_triggers, stmt_trigger, in_state);
+	stmt_trigger->state = state;
+
+	trigger_create(&stmt_trigger->on_rollback,
+		       memtx_build_on_replace_rollback, NULL, NULL);
+	trigger_create(&stmt_trigger->on_commit,
+		       memtx_build_on_replace_commit, NULL, NULL);
+	txn_stmt_on_rollback(stmt, &stmt_trigger->on_rollback);
+	txn_stmt_on_commit(stmt, &stmt_trigger->on_commit);
 	return 0;
 }
 
@@ -1237,6 +1300,9 @@ memtx_space_build_index(struct space *src_space, struct index *new_index,
 		return -1;
 	}
 
+	if (txn_check_singlestatement(txn, "index build") != 0)
+		return -1;
+
 	/* Now deal with any kind of add index during normal operation. */
 	struct iterator *it = index_create_iterator(pk, ITER_ALL, NULL, 0);
 	if (it == NULL)
@@ -1250,8 +1316,9 @@ memtx_space_build_index(struct space *src_space, struct index *new_index,
 	 */
 	bool can_yield = pk->def->type != HASH;
 
-	if (txn_check_singlestatement(txn, "index build") != 0)
-		return -1;
+	inj = errinj(ERRINJ_BUILD_INDEX_DISABLE_YIELD, ERRINJ_BOOL);
+	if (inj != NULL && inj->bparam == true)
+		can_yield = false;
 
 	struct memtx_engine *memtx = (struct memtx_engine *)src_space->engine;
 	struct memtx_ddl_state state;
@@ -1266,10 +1333,20 @@ memtx_space_build_index(struct space *src_space, struct index *new_index,
 		state.cmp_def = pk->def->key_def;
 		state.rc = 0;
 		diag_create(&state.diag);
+		rlist_create(&state.stmt_triggers);
 
 		trigger_create(&on_replace, memtx_build_on_replace, &state,
 			       NULL);
-		trigger_add(&src_space->on_replace, &on_replace);
+		/*
+		 * If MVCC is enabled, all concurrent writes that we haven't
+		 * read will be conflicted, so we don't need to set the trigger.
+		 * Moreover, concurrent transaction can be rolled back much
+		 * later than the index will be built so the memtx_ddl_state
+		 * will be invalid in this case since it's allocated on stack
+		 * of this function.
+		 */
+		if (!memtx_tx_manager_use_mvcc_engine)
+			trigger_add(&src_space->on_replace, &on_replace);
 	}
 
 	/*
@@ -1309,6 +1386,8 @@ memtx_space_build_index(struct space *src_space, struct index *new_index,
 			break;
 		assert(old_tuple == NULL); /* Guaranteed by DUP_INSERT. */
 		(void) old_tuple;
+		ERROR_INJECT_DOUBLE(ERRINJ_BUILD_INDEX_TIMEOUT, inj->dparam > 0,
+				    thread_sleep(inj->dparam));
 		/*
 		 * All tuples stored in a memtx space must be
 		 * referenced by the primary index.
@@ -1337,6 +1416,11 @@ memtx_space_build_index(struct space *src_space, struct index *new_index,
 		 */
 		ERROR_INJECT_YIELD(ERRINJ_BUILD_INDEX_DELAY);
 		tuple_unref(state.cursor);
+		if (fiber_is_cancelled()) {
+			diag_set(FiberIsCancelled);
+			rc = -1;
+			break;
+		}
 		/*
 		 * The on_replace trigger may have failed
 		 * during the yield.
@@ -1349,6 +1433,11 @@ memtx_space_build_index(struct space *src_space, struct index *new_index,
 	}
 	iterator_delete(it);
 	if (can_yield) {
+		struct memtx_build_stmt_trigger *trg;
+		rlist_foreach_entry(trg, &state.stmt_triggers, in_state) {
+			trigger_clear(&trg->on_rollback);
+			trigger_clear(&trg->on_commit);
+		}
 		diag_destroy(&state.diag);
 		trigger_clear(&on_replace);
 	}
@@ -1361,16 +1450,53 @@ memtx_space_prepare_alter(struct space *old_space, struct space *new_space)
 	struct memtx_space *old_memtx_space = (struct memtx_space *)old_space;
 	struct memtx_space *new_memtx_space = (struct memtx_space *)new_space;
 
-	if (old_memtx_space->bsize != 0 &&
-	    space_is_temporary(old_space) != space_is_temporary(new_space)) {
+	if (memtx_space_bsize(old_space) != 0 &&
+	    space_is_data_temporary(old_space) !=
+	    space_is_data_temporary(new_space)) {
 		diag_set(ClientError, ER_ALTER_SPACE, old_space->def->name,
-			 "can not switch temporary flag on a non-empty space");
+			 "can not change data-temporariness on a non-empty "
+			 "space");
 		return -1;
 	}
 
 	new_memtx_space->replace = old_memtx_space->replace;
-	new_memtx_space->bsize = old_memtx_space->bsize;
 	return 0;
+}
+
+/**
+ * Copy memory usage statistics to the newly altered space from the old space.
+ * In case of DropIndex or TruncateIndex alter operations, the new space will be
+ * empty, and tuple statistics must not be copied.
+ */
+static void
+memtx_space_finish_alter(struct space *old_space, struct space *new_space)
+{
+	struct memtx_space *old_memtx_space = (struct memtx_space *)old_space;
+	struct memtx_space *new_memtx_space = (struct memtx_space *)new_space;
+
+	bool is_empty = new_space->index_count == 0 ||
+			index_size(new_space->index[0]) == 0;
+	if (!is_empty) {
+		new_memtx_space->tuple_stat[TUPLE_ARENA_MEMTX] =
+			old_memtx_space->tuple_stat[TUPLE_ARENA_MEMTX];
+		new_memtx_space->tuple_stat[TUPLE_ARENA_MALLOC] =
+			old_memtx_space->tuple_stat[TUPLE_ARENA_MALLOC];
+	}
+}
+
+/**
+ * Invalidate the space in transaction manager.
+ */
+static void
+memtx_space_invalidate(struct space *space)
+{
+	/*
+	 * Abort all concurrent transactions and invalidate space in MVCC
+	 * only if it is enabled. Otherwise, there is no need to abort
+	 * anything since memtx transactions don't yield without MVCC.
+	 */
+	if (memtx_tx_manager_use_mvcc_engine)
+		memtx_tx_invalidate_space(space, in_txn());
 }
 
 /* }}} DDL */
@@ -1382,6 +1508,7 @@ static const struct space_vtab memtx_space_vtab = {
 	/* .execute_delete = */ memtx_space_execute_delete,
 	/* .execute_update = */ memtx_space_execute_update,
 	/* .execute_upsert = */ memtx_space_execute_upsert,
+	/* .execute_insert_arrow = */ generic_space_execute_insert_arrow,
 	/* .ephemeral_replace = */ memtx_space_ephemeral_replace,
 	/* .ephemeral_delete = */ memtx_space_ephemeral_delete,
 	/* .ephemeral_rowid_next = */ memtx_space_ephemeral_rowid_next,
@@ -1395,8 +1522,9 @@ static const struct space_vtab memtx_space_vtab = {
 	/* .build_index = */ memtx_space_build_index,
 	/* .swap_index = */ generic_space_swap_index,
 	/* .prepare_alter = */ memtx_space_prepare_alter,
+	/* .finish_alter = */ memtx_space_finish_alter,
 	/* .prepare_upgrade = */ memtx_space_prepare_upgrade,
-	/* .invalidate = */ generic_space_invalidate,
+	/* .invalidate = */ memtx_space_invalidate,
 };
 
 struct space *
@@ -1414,10 +1542,6 @@ memtx_space_new(struct memtx_engine *memtx,
 	int key_count = 0;
 	size_t region_svp = region_used(&fiber()->gc);
 	struct key_def **keys = index_def_to_key_def(key_list, &key_count);
-	if (keys == NULL) {
-		free(memtx_space);
-		return NULL;
-	}
 	struct tuple_format *format =
 		space_tuple_format_new(&memtx_tuple_format_vtab,
 				       memtx, keys, key_count, def);
@@ -1438,7 +1562,7 @@ memtx_space_new(struct memtx_engine *memtx,
 	/* Format is now referenced by the space. */
 	tuple_format_unref(format);
 
-	memtx_space->bsize = 0;
+	memset(&memtx_space->tuple_stat, 0, sizeof(memtx_space->tuple_stat));
 	memtx_space->rowid = 0;
 	memtx_space->replace = memtx_space_replace_no_keys;
 	return (struct space *)memtx_space;

@@ -49,11 +49,37 @@
 #include "session.h"
 #include "rmean.h"
 #include "box/sql/port.h"
+#include "tweaks.h"
 
 const char *sql_info_key_strs[] = {
 	"row_count",
 	"autoincrement_ids",
 };
+
+/** Whether to enable access checks for SQL requests. */
+static bool sql_access_check_is_enabled = true;
+TWEAK_BOOL(sql_access_check_is_enabled);
+
+/** Checks if the current user may execute an SQL request. */
+static int
+access_check_sql(void)
+{
+	if (!sql_access_check_is_enabled)
+		return 0;
+	struct credentials *cr = effective_user();
+	user_access_t access = PRIV_X | PRIV_U;
+	access &= ~cr->universal_access;
+	if (access == 0)
+		return 0;
+	access &= ~universe.access_sql[cr->auth_token].effective;
+	if (access == 0)
+		return 0;
+	struct user *user = user_find(cr->uid);
+	if (user != NULL)
+		diag_set(AccessDeniedError, priv_name(PRIV_X),
+			 schema_object_name(SC_SQL), "", user->def->name);
+	return -1;
+}
 
 /**
  * Convert sql row into a tuple and append to a port.
@@ -76,7 +102,8 @@ sql_row_to_port(struct Vdbe *stmt, struct region *region, struct port *port)
 	if (tuple == NULL)
 		goto error;
 	region_truncate(region, svp);
-	return port_c_add_tuple(port, tuple);
+	port_c_add_tuple(port, tuple);
+	return 0;
 
 error:
 	region_truncate(region, svp);
@@ -256,4 +283,59 @@ sql_prepare_and_execute(const char *sql, int len, const struct sql_bind *bind,
 		return 0;
 	port_destroy(port);
 	return -1;
+}
+
+int
+box_process_sql(const struct sql_request *request, struct port *port)
+{
+	if (access_check_sql() != 0)
+		return -1;
+	struct region *region = &fiber()->gc;
+	struct sql_bind *bind = NULL;
+	int bind_count = 0;
+	if (request->bind != NULL) {
+		bind_count = sql_bind_list_decode(request->bind, &bind);
+		if (bind_count < 0)
+			return -1;
+	}
+	/*
+	 * There are four options:
+	 * 1. Prepare SQL query (IPROTO_PREPARE + SQL string);
+	 * 2. Unprepare SQL query (IPROTO_PREPARE + stmt id);
+	 * 3. Execute SQL query (IPROTO_EXECUTE + SQL string);
+	 * 4. Execute prepared query (IPROTO_EXECUTE + stmt id).
+	 */
+	if (request->execute) {
+		if (request->sql_text != NULL) {
+			assert(request->stmt_id == NULL);
+			const char *sql = request->sql_text;
+			uint32_t len;
+			sql = mp_decode_str(&sql, &len);
+			return sql_prepare_and_execute(sql, len,
+						       bind, bind_count,
+						       port, region);
+		} else {
+			assert(request->stmt_id != NULL);
+			const char *data = request->stmt_id;
+			uint32_t stmt_id = mp_decode_uint(&data);
+			return sql_execute_prepared(stmt_id, bind, bind_count,
+						    port, region);
+		}
+	} else {
+		if (request->sql_text != NULL) {
+			assert(request->stmt_id == NULL);
+			const char *sql = request->sql_text;
+			uint32_t len;
+			sql = mp_decode_str(&sql, &len);
+			return sql_prepare(sql, len, port);
+		} else {
+			assert(request->stmt_id != NULL);
+			const char *data = request->stmt_id;
+			uint32_t stmt_id = mp_decode_uint(&data);
+			if (sql_unprepare(stmt_id) != 0)
+				return -1;
+			port_sql_create(port, NULL, UNPREPARE, false);
+			return 0;
+		}
+	}
 }

@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout tarantool
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           ref: ${{ matrix.branch }}
           fetch-depth: 0
@@ -41,13 +41,13 @@ jobs:
       - uses: ./.github/actions/environment
 
       - name: Checkout bench-run
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           path: bench-run
           repository: tarantool/bench-run
 
       - name: Checkout sysbench
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           path: sysbench
           repository: tarantool/sysbench
@@ -147,7 +147,7 @@ jobs:
         if: failure()
 
       - name: Collect artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: perf_sysbench_${{ matrix.branch }}

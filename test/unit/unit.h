@@ -30,6 +30,7 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h> /* exit() */
 
@@ -66,18 +67,12 @@ extern "C" {
 		return check_plan();	// print resume
 	}
 @endcode
-
-
 */
 
-#if !UNIT_TAP_COMPATIBLE
-
-#define header() printf("\t*** %s ***\n", __func__)
-#define footer() printf("\t*** %s: done ***\n", __func__)
-
-
 /* private function, use ok(...) instead */
-int _ok(int condition, const char *fmt, ...);
+void
+_ok(int condition, const char *expr, const char *file, int line,
+    const char *fmt, ...);
 
 /* private function, use note(...) or diag(...) instead */
 void _space(FILE *stream);
@@ -89,57 +84,46 @@ Before anything else, you need a testing plan.  This basically declares
 how many tests your program is going to run to protect against premature
 failure.
 */
-void plan(int count);
+void
+_plan(int count, bool tap);
 
 /**
 @brief check if plan is reached and print report
 */
 int check_plan(void);
 
-#endif
+/*
+ * The ok macro is defined so that it can be called without a message:
+ *
+ *   ok(true);
+ *   ok(true, "message");
+ *   ok(true, "message %d", i);
+ *
+ * It supports up to 7 format arguments.
+ */
+#define _select_10th(f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, ...) f10
+#define _ok0(cond, expr, ...)						\
+	_select_10th(, ##__VA_ARGS__,					\
+		     _ok(cond, expr, __FILE__, __LINE__, __VA_ARGS__),	\
+		     _ok(cond, expr, __FILE__, __LINE__, __VA_ARGS__),	\
+		     _ok(cond, expr, __FILE__, __LINE__, __VA_ARGS__),	\
+		     _ok(cond, expr, __FILE__, __LINE__, __VA_ARGS__),	\
+		     _ok(cond, expr, __FILE__, __LINE__, __VA_ARGS__),	\
+		     _ok(cond, expr, __FILE__, __LINE__, __VA_ARGS__),	\
+		     _ok(cond, expr, __FILE__, __LINE__, __VA_ARGS__),	\
+		     _ok(cond, expr, __FILE__, __LINE__, __VA_ARGS__),	\
+		     _ok(cond, expr, __FILE__, __LINE__, "line %d", __LINE__))
 
-#define ok(condition, fmt, args...)	{		\
-	int res = _ok(condition, fmt, ##args);		\
-	if (!res) {					\
-		_space(stderr);			\
-		fprintf(stderr, "#   Failed test '");	\
-		fprintf(stderr, fmt, ##args);		\
-		fprintf(stderr, "'\n");			\
-		_space(stderr);			\
-		fprintf(stderr, "#   in %s at line %d\n", __FILE__, __LINE__); \
-	}						\
-}
+#define ok(cond, ...)		_ok0(cond, #cond, ##__VA_ARGS__)
+#define is(a, b, ...)		_ok0((a) == (b), #a " == " #b, ##__VA_ARGS__)
+#define isnt(a, b, ...)		_ok0((a) != (b), #a " != " #b, ##__VA_ARGS__)
 
-#define is(a, b, fmt, args...)	{			\
-	int res = _ok((a) == (b), fmt, ##args);	\
-	if (!res) {					\
-		_space(stderr);			\
-		fprintf(stderr, "#   Failed test '");	\
-		fprintf(stderr, fmt, ##args);		\
-		fprintf(stderr, "'\n");			\
-		_space(stderr);			\
-		fprintf(stderr, "#   in %s at line %d\n", __FILE__, __LINE__); \
-	}						\
-}
-
-#define isnt(a, b, fmt, args...) {			\
-	int res = _ok((a) != (b), fmt, ##args);	\
-	if (!res) {					\
-		_space(stderr);			\
-		fprintf(stderr, "#   Failed test '");	\
-		fprintf(stderr, fmt, ##args);		\
-		fprintf(stderr, "'\n");			\
-		_space(stderr);			\
-		fprintf(stderr, "#   in %s at line %d\n", __FILE__, __LINE__); \
-	}						\
-}
+#define is_str(a, b, fmt, args...) ok(strcmp(a, b) == 0, fmt, ##args)
 
 #if UNIT_TAP_COMPATIBLE
 
-#include <stdarg.h> /* va_start(), va_end() */
-
 #define header()					\
-	do { 						\
+	do {						\
 		_space(stdout);				\
 		printf("# *** %s ***\n", __func__);	\
 	} while (0)
@@ -150,95 +134,15 @@ int check_plan(void);
 		printf("# *** %s: done ***\n", __func__); \
 	} while (0)
 
-enum { MAX_LEVELS = 10 };
+#define plan(count) _plan(count, true)
 
-static int tests_done[MAX_LEVELS];
-static int tests_failed[MAX_LEVELS];
-static int plan_test[MAX_LEVELS];
+#else /* !UNIT_TAP_COMPATIBLE */
 
-static int level = -1;
+#define header() printf("\t*** %s ***\n", __func__)
+#define footer() printf("\t*** %s: done ***\n", __func__)
+#define plan(count) _plan(count, false)
 
-/**
- * private function, use note(...) or diag(...) instead
- */
-static inline void
-_space(FILE *stream)
-{
-	for (int i = 0; i < level; i++) {
-		fprintf(stream, "    ");
-	}
-}
-
-/**
- * private function, use ok(...) instead
- */
-static inline int
-_ok(int condition, const char *fmt, ...)
-{
-	va_list ap;
-
-	_space(stdout);
-	printf("%s %d - ", condition ? "ok" : "not ok", ++tests_done[level]);
-	if (!condition)
-		tests_failed[level]++;
-	va_start(ap, fmt);
-	vprintf(fmt, ap);
-	printf("\n");
-	va_end(ap);
-	return condition;
-}
-
-/**
- * @brief set and print plan
- * @param count
- * Before anything else, you need a testing plan.  This basically declares
- * how many tests your program is going to run to protect against premature
- * failure.
- */
-static inline void
-plan(int count)
-{
-	++level;
-	plan_test[level] = count;
-	tests_done[level] = 0;
-	tests_failed[level] = 0;
-
-	if (level == 0)
-		printf("TAP version 13\n");
-
-	_space(stdout);
-	printf("%d..%d\n", 1, plan_test[level]);
-}
-
-/**
- * @brief check if plan is reached and print report
- */
-static inline int
-check_plan(void)
-{
-	int r = 0;
-	if (tests_done[level] != plan_test[level]) {
-		_space(stderr);
-		fprintf(stderr,
-			"# Looks like you planned %d tests but ran %d.\n",
-			plan_test[level], tests_done[level]);
-		r = -1;
-	}
-
-	if (tests_failed[level]) {
-		_space(stderr);
-		fprintf(stderr, "# Looks like you failed %d test of %d run.\n",
-			tests_failed[level], tests_done[level]);
-		r = tests_failed[level];
-	}
-	--level;
-	if (level >= 0) {
-		is(r, 0, "subtests");
-	}
-	return r;
-}
-
-#endif
+#endif /* !UNIT_TAP_COMPATIBLE */
 
 #if defined(__cplusplus)
 }

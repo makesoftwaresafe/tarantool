@@ -4,7 +4,17 @@
 local NEW = true
 local OLD = false
 
+local ffi = require('ffi')
 local tweaks = require('internal.tweaks')
+
+ffi.cdef[[
+    /**
+     * Update the state of synchronous replication for system spaces from the
+     * compat action.
+     */
+    void
+    system_spaces_update_is_sync_state_from_compat(void)
+]]
 
 local options_format = {
     default        = 'string',
@@ -44,6 +54,15 @@ channel close.
 https://tarantool.io/compat/fiber_channel_close_mode
 ]]
 
+local SQL_PRIV_BRIEF = [[
+Whether to enable access checks for SQL requests. The old behavior is to let
+any user execute an arbitrary SQL request over IPROTO. With the new behavior,
+only users that were granted the 'execute' privilege on 'sql' or 'universe'
+have access to SQL.
+
+https://tarantool.io/compat/sql_priv
+]]
+
 local SQL_SEQ_SCAN_DEFAULT_BRIEF = [[
 Whether seq_seq_scan session setting should be set to true or false during
 initialization or new session creation.
@@ -58,6 +77,93 @@ with all its replicasets.
 https://tarantool.io/compat/box_info_cluster_meaning
 ]]
 
+local BINARY_DATA_DECODING_BRIEF = [[
+Whether a binary data field should be stored in a varbinary object or a plain
+string when decoded in Lua.
+
+https://tarantool.io/compat/binary_data_decoding
+]]
+
+local BOX_TUPLE_NEW_VARARG_BRIEF = [[
+Whether `box.tuple.new` should interpret the argument list as an array of tuple
+fields (i.e., vararg) - this does not allow passing a tuple format as a second
+argument.
+
+https://tarantool.io/compat/box_tuple_new_vararg
+]]
+
+local BOX_SESSION_PUSH_DEPRECATION_BRIEF = [[
+Function `box.session.push` is deprecated. The new behavior is to raise
+an error on any attempt to use it.
+
+https://tarantool.io/compat/box_session_push_deprecation
+]]
+
+local C_FUNC_IPROTO_MULTIRETURN_BRIEF = [[
+Whether the results of the C stored function should be encoded with an
+additional msgpack array when returning them via iproto.
+
+https://tarantool.io/compat/c_func_iproto_multireturn
+]]
+
+local BOX_TUPLE_EXTENSION_BRIEF = [[
+Controls IPROTO_FEATURE_CALL_RET_TUPLE_EXTENSION and
+IPROTO_FEATURE_CALL_ARG_TUPLE_EXTENSION feature bits.
+
+https://tarantool.io/compat/box_tuple_extension
+]]
+
+local BOX_SPACE_MAX_BRIEF = [[
+Controls the max space id (box.schema.SPACE_MAX). The old limit is 2147483647.
+The new limit is 2147483646. The limit was decremented because the old value is
+used as an error indicator in the box C API.
+
+https://tarantool.io/compat/box_space_max
+]]
+
+local BOX_ERROR_UNPACK_TYPE_AND_CODE_BRIEF = [[
+Whether to show redundant fields in box.error.unpack(). The new behaviour
+is not to show 'base_type' and 'custom_type' fields. 'code' field is also not
+shown if it is 0. Note that 'base_type' is still accessible for error object.
+
+https://tarantool.io/compat/box_error_unpack_type_and_code
+]]
+
+local BOX_ERROR_SERIALIZE_VERBOSE = [[
+Controls the verbosity of box.error's serialization. Before, only the error
+message was serialized, omitting all other potentially useful fields. Now, a
+more verbose representation is used.
+
+https://tarantool.io/compat/box_error_serialize_verbose
+]]
+
+local BOX_CONSIDER_SYSTEM_SPACES_SYNCHRONOUS = [[
+Controls whether to consider system spaces synchronous when the
+synchronous queue is claimed, regardless of the user-provided `is_sync` option.
+Either enables synchronous replication for system spaces when the synchronous
+queue is claimed, overriding the user-provided 'is_sync' space option, or falls
+back to the user-provided 'is_sync' space option.
+
+https://tarantool.io/compat/box_consider_system_spaces_synchronous
+]]
+
+local WAL_CLEANUP_DELAY_DEPRECATION_BRIEF = [[
+Whether option 'wal_cleanup_delay' can be used. The old behavior is to log
+a deprecation warning when it's used, the new one - raise an error.
+If Tarantool participates in a cluster, xlogs needed for other replicas will
+be retained by persistent WAL GC.
+
+https://tarantool.io/compat/wal_cleanup_delay_deprecation
+]]
+
+local REPLICATION_SYNCHRO_TIMEOUT_COMPAT_BRIEF = [[
+Determines whether the replication_synchro_timeout option rolls back
+transactions or it only used to wait confirmation in promote/demote and
+gc-checkpointing.
+
+https://tarantool.io/compat/replication_synchro_timeout
+]]
+
 -- Returns an action callback that toggles a tweak.
 local function tweak_action(tweak_name, old_tweak_value, new_tweak_value)
     return function(is_new)
@@ -69,6 +175,10 @@ local function tweak_action(tweak_name, old_tweak_value, new_tweak_value)
     end
 end
 
+-- Create the tweak action once here and pass it to the closure below.
+local box_consider_system_spaces_synchronous_tweak_action =
+    tweak_action('box_consider_system_spaces_synchronous', false, true)
+
 -- Contains options descriptions in following format:
 -- * default  (string)
 -- * brief    (string)
@@ -78,27 +188,33 @@ end
 -- * action   (function)
 local options = {
     json_escape_forward_slash = {
-        default = 'old',
+        default = 'new',
         obsolete = nil,
         brief = JSON_ESCAPE_BRIEF,
         run_action_now = true,
         action = tweak_action('json_escape_forward_slash', true, false),
     },
     yaml_pretty_multiline = {
-        default = 'old',
+        default = 'new',
         obsolete = nil,
         brief = YAML_PRETTY_MULTILINE_BRIEF,
         action = tweak_action('yaml_pretty_multiline', false, true),
     },
     fiber_channel_close_mode = {
-        default = 'old',
+        default = 'new',
         obsolete = nil,
         brief = FIBER_CHANNEL_GRACEFUL_CLOSE_BRIEF,
         action = tweak_action('fiber_channel_close_mode',
                               'forceful', 'graceful'),
     },
+    sql_priv = {
+        default = 'new',
+        obsolete = nil,
+        brief = SQL_PRIV_BRIEF,
+        action = tweak_action('sql_access_check_is_enabled', false, true)
+    },
     sql_seq_scan_default = {
-        default = 'old',
+        default = 'new',
         obsolete = nil,
         brief = SQL_SEQ_SCAN_DEFAULT_BRIEF,
         action = tweak_action('sql_seq_scan_default', true, false),
@@ -108,6 +224,82 @@ local options = {
         obsolete = nil,
         brief = BOX_INFO_CLUSTER_MEANING_BRIEF,
         action = tweak_action('box_info_cluster_new_meaning', false, true),
+    },
+    binary_data_decoding = {
+        default = 'new',
+        obsolete = nil,
+        brief = BINARY_DATA_DECODING_BRIEF,
+        action = function(is_new)
+            tweaks.yaml_decode_binary_as_string = not is_new
+            tweaks.msgpack_decode_binary_as_string = not is_new
+        end,
+    },
+    box_tuple_new_vararg = {
+        default = 'new',
+        obsolete = nil,
+        brief = BOX_TUPLE_NEW_VARARG_BRIEF,
+        action = function() end,
+    },
+    box_session_push_deprecation = {
+        default = 'old',
+        obsolete = nil,
+        brief = BOX_SESSION_PUSH_DEPRECATION_BRIEF,
+        run_action_now = true,
+        action = tweak_action('box_session_push_is_disabled', false, true),
+    },
+    c_func_iproto_multireturn = {
+        default = 'new',
+        obsolete = nil,
+        brief = C_FUNC_IPROTO_MULTIRETURN_BRIEF,
+        run_action_now = true,
+        action = tweak_action('c_func_iproto_multireturn', false, true),
+    },
+    box_tuple_extension = {
+        default = 'new',
+        obsolete = nil,
+        brief = BOX_TUPLE_EXTENSION_BRIEF,
+        run_action_now = true,
+        action = tweak_action('box_tuple_extension', false, true)
+    },
+    box_space_max = {
+        default = 'new',
+        obsolete = nil,
+        brief = BOX_SPACE_MAX_BRIEF,
+        action = tweak_action('BOX_SPACE_MAX', 2147483647, 2147483646)
+    },
+    box_error_unpack_type_and_code = {
+        default = 'old',
+        obsolete = nil,
+        brief = BOX_ERROR_UNPACK_TYPE_AND_CODE_BRIEF,
+        action = function() end
+    },
+    box_error_serialize_verbose = {
+        default = 'old',
+        obsolete = nil,
+        brief = BOX_ERROR_SERIALIZE_VERBOSE,
+        action = function() end,
+    },
+    box_consider_system_spaces_synchronous = {
+      default = 'old',
+      obsolete = nil,
+      brief = BOX_CONSIDER_SYSTEM_SPACES_SYNCHRONOUS,
+      action = function(is_new)
+            box_consider_system_spaces_synchronous_tweak_action(is_new)
+            ffi.C.system_spaces_update_is_sync_state_from_compat()
+      end
+    },
+    wal_cleanup_delay_deprecation = {
+        default = 'old',
+        obsolete = nil,
+        brief = WAL_CLEANUP_DELAY_DEPRECATION_BRIEF,
+        action = function() end,
+    },
+    replication_synchro_timeout = {
+        default = 'old',
+        obsolete = nil,
+        brief = REPLICATION_SYNCHRO_TIMEOUT_COMPAT_BRIEF,
+        action = tweak_action(
+            'replication_synchro_timeout_rollback_enabled', true, false),
     },
 }
 
@@ -233,6 +425,12 @@ local function set_option(name, val)
 end
 
 local compat = { }
+
+-- src/box/lua/config/applier/compat.lua needs information about
+-- default values.
+function compat._options()
+    return options
+end
 
 function compat.dump(mode)
     -- dump() works in one of the following modes:
@@ -398,6 +596,37 @@ function compat_mt.__newindex(_, key, val)
     set_option(key, val)
 end
 
+local compat_option_methods = {}
+
+-- Returns the effective compat option value - 'old' or 'new'.
+local function option_value(option)
+    if option.current == 'default' then
+        return option.default
+    else
+        return option.current
+    end
+end
+
+-- Whether the effective value of the option is `new`.
+function compat_option_methods.is_new(option)
+    if type(option) ~= 'table' then
+        error('usage: compat.<option_name>:is_new()')
+    end
+    return option_value(option) == 'new'
+end
+
+-- Whether the effective value of the option is `old`.
+function compat_option_methods.is_old(option)
+    if type(option) ~= 'table' then
+        error('usage: compat.<option_name>:is_old()')
+    end
+    return option_value(option) == 'old'
+end
+
+local compat_option_mt = {
+    __index = compat_option_methods,
+}
+
 function compat_mt.__index(_, key)
     if not options[key] then
         error(('Invalid option %s'):format(key))
@@ -416,7 +645,7 @@ function compat_mt.__index(_, key)
         result.current = 'old'
     end
 
-    return result
+    return setmetatable(result, compat_option_mt)
 end
 
 compat_mt.__serialize = serialize_compat

@@ -364,6 +364,15 @@ luaT_httpc_request(lua_State *L)
 		httpc_set_accept_encoding(req, lua_tostring(L, -1));
 	lua_pop(L, 1);
 
+	lua_getfield(L, 5, "http_version");
+	if (!lua_isnil(L, -1)) {
+		if (httpc_set_http_version(req, lua_tostring(L, -1))) {
+			httpc_request_delete(req);
+			return luaT_error(L);
+		}
+	}
+	lua_pop(L, 1);
+
 	bool chunked = false;
 	lua_getfield(L, 5, "chunked");
 	if (!lua_isnil(L, -1) && lua_isboolean(L, -1))
@@ -504,7 +513,11 @@ luaT_httpc_new(lua_State *L)
 static int
 luaT_httpc_cleanup(lua_State *L)
 {
-	httpc_env_destroy(luaT_httpc_checkenv(L));
+	struct httpc_env *env = luaT_httpc_checkenv(L);
+	httpc_env_finish(env);
+	if (env->req_count == 0) {
+		httpc_env_destroy(env);
+	}
 
 	/** remove all methods operating on ctx */
 	lua_newtable(L);
@@ -607,7 +620,8 @@ luaT_httpc_io_finish(lua_State *L)
 static int
 luaT_httpc_io_cleanup(lua_State *L)
 {
-	httpc_io_destroy(luaT_httpc_checkio(L));
+	struct httpc_io *io = luaT_httpc_checkio(L);
+	httpc_io_destroy(io);
 
 	/** remove all methods operating on io */
 	lua_newtable(L);

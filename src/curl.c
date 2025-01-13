@@ -69,7 +69,7 @@ curl_multi_process(CURLM *multi, curl_socket_t sockfd, int events)
 	}
 
 	/*
-	 * Check for resuls
+	 * Check for results.
 	 */
 
 	CURLMsg *msg;
@@ -259,11 +259,32 @@ error_exit:
 }
 
 void
+curl_env_finish(struct curl_env *env)
+{
+	assert(env);
+	if (env->multi != NULL) {
+		CURL **list = curl_multi_get_handles(env->multi);
+		if (list) {
+			for (int i = 0; list[i]; i++) {
+				/* We are not interested in mcode and
+				 * setting curl_diag_set_merror, because
+				 * it is a destructor.
+				 */
+				curl_multi_remove_handle(env->multi, list[i]);
+			}
+			curl_free(list);
+		}
+		curl_multi_cleanup(env->multi);
+	}
+}
+
+void
 curl_env_destroy(struct curl_env *env)
 {
 	assert(env);
-	if (env->multi != NULL)
-		curl_multi_cleanup(env->multi);
+
+	assert(mempool_count(&env->sock_pool) == 0);
+	assert(mempool_used(&env->sock_pool) == 0);
 
 	mempool_destroy(&env->sock_pool);
 }

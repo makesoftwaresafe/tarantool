@@ -40,13 +40,15 @@
 #include <tarantool_eio.h>
 #include <msgpuck.h>
 
-#include "coio_file.h"
+#include "coio_task.h"
 #include "tt_static.h"
 #include "error.h"
 #include "xrow.h"
 #include "iproto_constants.h"
 #include "errinj.h"
+#include "salad/grp_alloc.h"
 #include "trivia/util.h"
+#include "retention_period.h"
 
 /*
  * FALLOC_FL_KEEP_SIZE flag has existed since fallocate() was
@@ -359,6 +361,7 @@ xdir_create(struct xdir *dir, const char *dirname, enum xdir_type type,
 		unreachable();
 	}
 	dir->type = type;
+	dir->retention_period = 0;
 }
 
 /**
@@ -419,16 +422,11 @@ xdir_index_file(struct xdir *dir, int64_t signature)
 	}
 
 	/*
-	 * Append the clock describing the file to the
-	 * directory index.
+	 * Append the clock describing the file to the directory index.
+	 * If retention feature is available (EE), then additional memory is
+	 * allocated. Time, when xlog protection should stop is saved there.
 	 */
-	struct vclock *vclock = (struct vclock *) malloc(sizeof(*vclock));
-	if (vclock == NULL) {
-		diag_set(OutOfMemory, sizeof(*vclock), "malloc", "vclock");
-		xlog_cursor_close(&cursor, false);
-		return -1;
-	}
-
+	struct vclock *vclock = retention_vclock_new();
 	vclock_copy(vclock, &meta->vclock);
 	xlog_cursor_close(&cursor, false);
 	vclockset_insert(&dir->index, vclock);
@@ -627,6 +625,8 @@ xdir_scan(struct xdir *dir, bool is_dir_required)
 			i++;
 		}
 	}
+	/* Initialize expiration time of all files, saved inside index. */
+	retention_index_update(dir, 0);
 	rc = 0;
 
 exit:
@@ -648,6 +648,31 @@ xdir_check(struct xdir *dir)
 	return 0;
 }
 
+void
+xdir_set_retention_period(struct xdir *xdir, double period)
+{
+	double old_period = xdir->retention_period;
+	xdir->retention_period = period;
+	retention_index_update(xdir, old_period);
+}
+
+void
+xdir_get_retention_vclock(struct xdir *xdir, struct vclock *vclock)
+{
+	retention_index_get(&xdir->index, vclock);
+}
+
+void
+xdir_set_retention_vclock(struct xdir *xdir, struct vclock *vclock)
+{
+	if (xdir->retention_period == 0)
+		return;
+
+	struct vclock *find = vclockset_match(&xdir->index, vclock);
+	assert(vclock_compare(find, vclock) == 0);
+	retention_vclock_set(find, xdir->retention_period);
+}
+
 const char *
 xdir_format_filename(struct xdir *dir, int64_t signature,
 		enum log_suffix suffix)
@@ -658,41 +683,38 @@ xdir_format_filename(struct xdir *dir, int64_t signature,
 					      inprogress_suffix : "");
 }
 
-static void
-xdir_say_gc(int result, int errorno, const char *filename)
-{
-	if (result == 0) {
-		say_info("removed %s", filename);
-	} else if (errorno != ENOENT) {
-		errno = errorno;
-		say_syserror("error while removing %s", filename);
-	}
-}
-
-static int
-xdir_complete_gc(eio_req *req)
-{
-	xdir_say_gc(req->result, req->errorno, EIO_PATH(req));
-	return 0;
-}
-
 void
 xdir_collect_garbage(struct xdir *dir, int64_t signature, unsigned flags)
 {
+	unsigned rm_flags = XLOG_RM_VERBOSE;
+	if (flags & XDIR_GC_ASYNC)
+		rm_flags |= XLOG_RM_ASYNC;
+
+	struct vclock retention_vclock;
+	retention_index_get(&dir->index, &retention_vclock);
+	if (vclock_is_set(&retention_vclock) &&
+	    signature > vclock_sum(&retention_vclock)) {
+		/*
+		 * This should not normally happen and can be a reason of
+		 * xdir_retention misusage: retention_vclock must be always
+		 * checked before invoking garbage collection. As we cannot
+		 * return error code from this function (gc already updated
+		 * its vclock), the best we can do is warning.
+		 */
+		assert(false);
+		say_warn("Requested xdir gc vclock is greater than "
+			 "retention vclock. Using retention vclock instead");
+		signature = vclock_sum(&retention_vclock);
+	}
+
 	struct vclock *vclock;
 	while ((vclock = vclockset_first(&dir->index)) != NULL &&
 	       vclock_sum(vclock) < signature) {
 		const char *filename =
 			xdir_format_filename(dir, vclock_sum(vclock), NONE);
-		if (flags & XDIR_GC_ASYNC) {
-			eio_unlink(filename, 0, xdir_complete_gc, NULL);
-		} else {
-			int rc = unlink(filename);
-			xdir_say_gc(rc, errno, filename);
-		}
+		xlog_remove_file(filename, rm_flags);
 		vclockset_remove(&dir->index, vclock);
 		free(vclock);
-
 		if (flags & XDIR_GC_REMOVE_ONE)
 			break;
 	}
@@ -706,17 +728,26 @@ xdir_remove_file_by_vclock(struct xdir *dir, struct vclock *to_remove)
 		return -1;
 	const char *filename =
 		xdir_format_filename(dir, vclock_sum(find), NONE);
-	int rc = unlink(filename);
-	xdir_say_gc(rc, errno, filename);
-	if (rc != 0)
+	if (!xlog_remove_file(filename, XLOG_RM_VERBOSE))
 		return -1;
 	vclockset_remove(&dir->index, find);
 	free(find);
 	return 0;
 }
 
+/** Default implementation of xlog_file_is_temporary(). */
+static bool
+xlog_file_is_temporary_default(const char *filename)
+{
+	char *ext = strrchr(filename, '.');
+	return ext != NULL && strcmp(ext, inprogress_suffix) == 0;
+}
+
+xlog_file_is_temporary_f xlog_file_is_temporary =
+				xlog_file_is_temporary_default;
+
 void
-xdir_collect_inprogress(struct xdir *xdir)
+xdir_remove_temporary_files(struct xdir *xdir)
 {
 	const char *dirname = xdir->dirname;
 	DIR *dh = opendir(dirname);
@@ -727,33 +758,10 @@ xdir_collect_inprogress(struct xdir *xdir)
 	}
 	struct dirent *dent;
 	while ((dent = readdir(dh)) != NULL) {
-		char *ext = strrchr(dent->d_name, '.');
-		if (ext == NULL || strcmp(ext, inprogress_suffix) != 0)
-			continue;
-
-		char path[PATH_MAX];
-		int rc;
-		if ((size_t)snprintf(path, sizeof(path), "%s/%s", dirname,
-				     dent->d_name) >= sizeof(path)) {
-			/*
-			 * If we allocated a large enough buffer for the path,
-			 * unlink would fail with this error according to the
-			 * POSIX standard.
-			 */
-			errno = ENAMETOOLONG;
-			rc = -1;
-		} else {
-			rc = unlink(path);
-		}
-		if (rc < 0)
-			/*
-			 * In case the path got truncated, print the expected
-			 * path.
-			 */
-			say_syserror("error while removing %s/%s",
-				     dirname, dent->d_name);
-		else
-			say_info("removed %s", path);
+		const char *filename = tt_snprintf(PATH_MAX, "%s/%s",
+						   dirname, dent->d_name);
+		if (xlog_file_is_temporary(filename))
+			xlog_remove_file(filename, XLOG_RM_VERBOSE);
 	}
 	closedir(dh);
 }
@@ -761,9 +769,7 @@ xdir_collect_inprogress(struct xdir *xdir)
 void
 xdir_add_vclock(struct xdir *xdir, const struct vclock *vclock)
 {
-	struct vclock *copy = malloc(sizeof(*vclock));
-	if (copy == NULL)
-		panic("failed to allocate vclock");
+	struct vclock *copy = retention_vclock_new();
 	vclock_copy(copy, vclock);
 	vclockset_insert(&xdir->index, copy);
 }
@@ -774,7 +780,7 @@ xdir_add_vclock(struct xdir *xdir, const struct vclock *vclock)
 /* {{{ struct xlog */
 
 int
-xlog_rename(struct xlog *l)
+xlog_materialize(struct xlog *l)
 {
 	char *filename = l->filename;
 	char new_filename[PATH_MAX];
@@ -828,16 +834,20 @@ xlog_clear(struct xlog *l)
 	l->fd = -1;
 }
 
+/**
+ * Frees the write context allocated in xlog_init().
+ * The xlog file must be closed.
+ */
 static void
-xlog_destroy(struct xlog *xlog)
+xlog_free(struct xlog *xlog)
 {
+	assert(xlog->fd < 0);
 	assert(xlog->obuf.slabc == &cord()->slabc);
 	assert(xlog->zbuf.slabc == &cord()->slabc);
 	obuf_destroy(&xlog->obuf);
 	obuf_destroy(&xlog->zbuf);
 	ZSTD_freeCCtx(xlog->zctx);
-	TRASH(xlog);
-	xlog->fd = -1;
+	xlog->zctx = NULL;
 }
 
 int
@@ -885,7 +895,6 @@ xlog_create(struct xlog *xlog, const char *name, int flags,
 	 */
 	xlog->fd = open(xlog->filename, flags, 0644);
 	if (xlog->fd < 0) {
-		say_syserror("open, [%s]", xlog->filename);
 		diag_set(SystemError, "failed to create file '%s'",
 			 xlog->filename);
 		goto err_open;
@@ -909,9 +918,10 @@ xlog_create(struct xlog *xlog, const char *name, int flags,
 	return 0;
 err_write:
 	close(xlog->fd);
-	unlink(xlog->filename); /* try to remove incomplete file */
+	xlog->fd = -1;
+	xlog_remove_file(xlog->filename, 0); /* try to remove incomplete file */
 err_open:
-	xlog_destroy(xlog);
+	xlog_free(xlog);
 err:
 	return -1;
 }
@@ -982,8 +992,9 @@ no_eof:
 	return 0;
 err_read:
 	close(xlog->fd);
+	xlog->fd = -1;
 err_open:
-	xlog_destroy(xlog);
+	xlog_free(xlog);
 err:
 	return -1;
 }
@@ -1037,10 +1048,8 @@ xdir_create_xlog(struct xdir *dir, struct xlog *xlog,
 		return -1;
 
 	/* Rename xlog file */
-	if (dir->suffix != INPROGRESS && xlog_rename(xlog)) {
-		int save_errno = errno;
-		xlog_close(xlog, false);
-		errno = save_errno;
+	if (dir->suffix != INPROGRESS && xlog_materialize(xlog) != 0) {
+		xlog_discard(xlog);
 		return -1;
 	}
 
@@ -1096,7 +1105,7 @@ xlog_tx_write_plain(struct xlog *log)
 	 * now populate it with data.
 	 */
 	char *fixheader = (char *)log->obuf.iov[0].iov_base;
-	*(log_magic_t *)fixheader = row_marker;
+	memcpy(fixheader, &row_marker, sizeof(log_magic_t));
 	char *data = fixheader + sizeof(log_magic_t);
 
 	data = mp_encode_uint(data,
@@ -1199,7 +1208,7 @@ xlog_tx_write_zstd(struct xlog *log)
 		offset = 0;
 	}
 
-	*(log_magic_t *)fixheader = zrow_marker;
+	memcpy(fixheader, &zrow_marker, sizeof(log_magic_t));
 	char *data;
 	data = fixheader + sizeof(log_magic_t);
 	data = mp_encode_uint(data,
@@ -1356,8 +1365,7 @@ xlog_write_row(struct xlog *log, const struct xrow_header *packet)
 	/** don't write sync to the disk */
 	size_t region_svp = region_used(&fiber()->gc);
 	int iovcnt;
-	xrow_header_encode(packet, /*sync=*/0, /*fixheader_len=*/0,
-			   iov, &iovcnt);
+	xrow_encode(packet, /*sync=*/0, /*fixheader_len=*/0, iov, &iovcnt);
 	for (int i = 0; i < iovcnt; ++i) {
 		struct errinj *inj = errinj(ERRINJ_WAL_WRITE_PARTIAL,
 					    ERRINJ_INT);
@@ -1458,30 +1466,41 @@ sync_cb(eio_req *req)
 	return 0;
 }
 
-int
+/**
+ * Syncs an xlog object to disk.
+ *
+ * If the sync_is_async flag is set in xlog_opts, fsync is called
+ * asynchronously, without checking the result.
+ *
+ * Returns 0 on success. On failure, sets diag returns -1.
+ */
+static int
 xlog_sync(struct xlog *l)
 {
 	if (l->opts.sync_is_async) {
 		int fd = dup(l->fd);
 		if (fd == -1) {
-			say_syserror("%s: dup() failed", l->filename);
+			diag_set(SystemError, "failed to duplicate fd %d",
+				 l->fd);
 			return -1;
 		}
 		eio_fsync(fd, 0, sync_cb, (void *) (intptr_t) fd);
 	} else if (fsync(l->fd) < 0) {
-		say_syserror("%s: fsync failed", l->filename);
+		diag_set(SystemError, "failed to sync file '%s'", l->filename);
 		return -1;
 	}
 	return 0;
 }
 
+/**
+ * Writes the EOF marker to the xlog file.
+ *
+ * Returns 0 on success. On failure, sets diag returns -1.
+ */
 static int
 xlog_write_eof(struct xlog *l)
 {
-	ERROR_INJECT(ERRINJ_WAL_WRITE_EOF, {
-		diag_set(ClientError, ER_INJECTION, "xlog write injection");
-		return -1;
-	});
+	ERROR_INJECT(ERRINJ_WAL_WRITE_EOF, return 0);
 
 	/*
 	 * Free disk space preallocated with xlog_fallocate().
@@ -1489,41 +1508,56 @@ xlog_write_eof(struct xlog *l)
 	 * we'll get "data after eof marker" error on recovery.
 	 */
 	if (l->allocated > 0 && ftruncate(l->fd, l->offset) < 0) {
-		diag_set(SystemError, "ftruncate() failed");
+		diag_set(SystemError, "failed to truncate file '%s'",
+			 l->filename);
 		return -1;
 	}
 
 	if (fio_writen(l->fd, &eof_marker, sizeof(eof_marker)) < 0) {
-		diag_set(SystemError, "write() failed");
+		diag_set(SystemError, "failed to write to file '%s'",
+			 l->filename);
 		return -1;
 	}
 	return 0;
 }
 
 int
-xlog_close(struct xlog *l, bool reuse_fd)
+xlog_close_reuse_fd(struct xlog *l, int *fd)
 {
-	int rc = xlog_write_eof(l);
-	if (rc < 0)
-		say_error("%s: failed to write EOF marker: %s", l->filename,
-			  diag_last_error(diag_get())->errmsg);
-
-	/*
-	 * Sync the file before closing, since
-	 * otherwise we can end up with a partially
-	 * written file in case of a crash.
-	 * We sync even if file open O_SYNC, simplify code for low cost
-	 */
-	xlog_sync(l);
-
-	if (!reuse_fd) {
-		rc = close(l->fd);
-		if (rc < 0)
-			say_syserror("%s: close() failed", l->filename);
-	}
-
-	xlog_destroy(l);
+	assert(l->fd >= 0);
+	int rc = xlog_flush(l) < 0 ? -1 : 0;
+	if (rc == 0)
+		rc = xlog_write_eof(l);
+	if (rc == 0)
+		rc = xlog_sync(l);
+	*fd = l->fd;
+	l->fd = -1;
+	xlog_free(l);
 	return rc;
+}
+
+int
+xlog_close(struct xlog *l)
+{
+	int fd;
+	int rc = xlog_close_reuse_fd(l, &fd);
+	close(fd);
+	return rc;
+}
+
+void
+xlog_discard(struct xlog *l)
+{
+	if (l->fd >= 0) {
+		close(l->fd);
+		l->fd = -1;
+		xlog_free(l);
+	}
+	if (l->filename[0] != '\0') {
+		assert(l->is_inprogress);
+		xlog_remove_file(l->filename, 0);
+		l->filename[0] = '\0';
+	}
 }
 
 /* }}} */
@@ -1855,9 +1889,8 @@ xlog_tx_cursor_next_row(struct xlog_tx_cursor *tx_cursor,
 	if (ibuf_used(&tx_cursor->rows) == 0)
 		return 1;
 	/* Return row from xlog tx buffer */
-	int rc = xrow_header_decode(xrow,
-				    (const char **)&tx_cursor->rows.rpos,
-				    (const char *)tx_cursor->rows.wpos, false);
+	int rc = xrow_decode(xrow, (const char **)&tx_cursor->rows.rpos,
+			     (const char *)tx_cursor->rows.wpos, false);
 	if (rc != 0) {
 		diag_set(XlogError, "can't parse row");
 		/* Discard remaining row data */
@@ -1865,6 +1898,17 @@ xlog_tx_cursor_next_row(struct xlog_tx_cursor *tx_cursor,
 		return -1;
 	}
 
+	return 0;
+}
+
+int
+xlog_tx_cursor_next_row_raw(struct xlog_tx_cursor *tx_cursor,
+			    const char ***data, const char **end)
+{
+	if (ibuf_used(&tx_cursor->rows) == 0)
+		return 1;
+	*data = (const char **)&tx_cursor->rows.rpos;
+	*end = (const char *)tx_cursor->rows.wpos;
 	return 0;
 }
 
@@ -1908,7 +1952,10 @@ xlog_cursor_next_tx(struct xlog_cursor *i)
 {
 	int rc;
 	assert(xlog_cursor_is_open(i));
-
+	if (i->state == XLOG_CURSOR_TX) {
+		i->state = XLOG_CURSOR_ACTIVE;
+		xlog_tx_cursor_destroy(&i->tx_cursor);
+	}
 	/* load at least magic to check eof */
 	rc = xlog_cursor_ensure(i, sizeof(log_magic_t));
 	if (rc < 0)
@@ -1961,12 +2008,17 @@ xlog_cursor_next_row(struct xlog_cursor *cursor, struct xrow_header *xrow)
 	assert(xlog_cursor_is_open(cursor));
 	if (cursor->state != XLOG_CURSOR_TX)
 		return 1;
-	int rc = xlog_tx_cursor_next_row(&cursor->tx_cursor, xrow);
-	if (rc != 0) {
-		cursor->state = XLOG_CURSOR_ACTIVE;
-		xlog_tx_cursor_destroy(&cursor->tx_cursor);
-	}
-	return rc;
+	return xlog_tx_cursor_next_row(&cursor->tx_cursor, xrow);
+}
+
+int
+xlog_cursor_next_row_raw(struct xlog_cursor *cursor,
+			 const char ***data, const char **end)
+{
+	assert(xlog_cursor_is_open(cursor));
+	if (cursor->state != XLOG_CURSOR_TX)
+		return 1;
+	return xlog_tx_cursor_next_row_raw(&cursor->tx_cursor, data, end);
 }
 
 int
@@ -2117,6 +2169,102 @@ xlog_cursor_close(struct xlog_cursor *i, bool reuse_fd)
 	 * Do not trash the cursor object since the caller might
 	 * still want to access its state and/or meta information.
 	 */
+}
+
+/* }}} */
+
+/* {{{ xlog_remove_file */
+
+/** xlog_remove_file() coio task. */
+struct xlog_remove_file_task {
+	/** Base class. */
+	struct coio_task base;
+	/** Path to the file. */
+	char *filename;
+	/** Bitwise combination of XLOG_RM_* flags. */
+	unsigned flags;
+};
+
+/** Default implementation of xlog_remove_file_impl(). */
+static int
+xlog_remove_file_impl_default(const char *filename, bool *existed)
+{
+	if (unlink(filename) != 0) {
+		if (errno != ENOENT) {
+			diag_set(SystemError, "failed to unlink file '%s'",
+				 filename);
+			return -1;
+		}
+		*existed = false;
+	} else {
+		*existed = true;
+	}
+	return 0;
+}
+
+xlog_remove_file_impl_f xlog_remove_file_impl = xlog_remove_file_impl_default;
+
+/** Blocking implementation of xlog_remove_file(). */
+static bool
+xlog_remove_file_blocking(const char *filename, unsigned flags)
+{
+	bool existed;
+	if (xlog_remove_file_impl(filename, &existed) != 0) {
+		diag_log();
+		diag_clear(diag_get());
+		say_error("error while removing %s", filename);
+		return false;
+	}
+	if (existed && (flags & XLOG_RM_VERBOSE) != 0)
+		say_info("removed %s", filename);
+	return true;
+}
+
+static int
+xlog_remove_file_cb(struct coio_task *base)
+{
+	struct xlog_remove_file_task *task =
+		(struct xlog_remove_file_task *)base;
+	xlog_remove_file_blocking(task->filename, task->flags);
+	return 0;
+}
+
+static int
+xlog_remove_file_done_cb(struct coio_task *base)
+{
+	struct xlog_remove_file_task *task =
+		(struct xlog_remove_file_task *)base;
+	TRASH(task);
+	free(task);
+	return 0;
+}
+
+/** Asynchronous implementation of xlog_remove_file(). */
+static bool
+xlog_remove_file_async(const char *filename, unsigned flags)
+{
+	struct xlog_remove_file_task *task;
+	struct grp_alloc all = grp_alloc_initializer();
+	grp_alloc_reserve_data(&all, sizeof(*task));
+	grp_alloc_reserve_str0(&all, filename);
+	grp_alloc_use(&all, xmalloc(grp_alloc_size(&all)));
+	task = grp_alloc_create_data(&all, sizeof(*task));
+	task->filename = grp_alloc_create_str0(&all, filename);
+	task->flags = flags;
+	assert(grp_alloc_size(&all) == 0);
+	coio_task_create(&task->base, xlog_remove_file_cb,
+			 xlog_remove_file_done_cb);
+	coio_task_post(&task->base);
+	return true;
+}
+
+bool
+xlog_remove_file(const char *filename, unsigned flags)
+{
+	if (flags & XLOG_RM_ASYNC)
+		return xlog_remove_file_async(filename, flags);
+	else
+		return xlog_remove_file_blocking(filename, flags);
 }
 
 /* }}} */

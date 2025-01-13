@@ -127,20 +127,14 @@ field_foreign_key_failed(const struct tuple_constraint *constr,
 			 const struct tuple_field *field,
 			 const char *message)
 {
-	struct error *err;
 	const char *field_path = NULL;
 	if (field != NULL) {
 		field_path = tuple_field_path(field, constr->space->format);
-		err = diag_set(ClientError, ER_FIELD_FOREIGN_KEY_FAILED,
-			       constr->def.name, field_path, message);
+		diag_set(ClientError, ER_FIELD_FOREIGN_KEY_FAILED,
+			 constr->def.name, field_path, message, field->id);
 	} else {
-		err = diag_set(ClientError, ER_COMPLEX_FOREIGN_KEY_FAILED,
-			       constr->def.name, message);
-	}
-	error_set_str(err, "name", constr->def.name);
-	if (field != NULL) {
-		error_set_str(err, "field_path", field_path);
-		error_set_uint(err, "field_id", field->id);
+		diag_set(ClientError, ER_COMPLEX_FOREIGN_KEY_FAILED,
+			 constr->def.name, message);
 	}
 }
 
@@ -619,6 +613,40 @@ tuple_constraint_fkey_destroy(struct tuple_constraint *constr)
 	constr->space = NULL;
 }
 
+/**
+ * Check that spaces @a space and @a foreign_space are compatible with
+ * the foreign key constraint @a constr.
+ * Return 0 on success, return -1 and set diag in case of error.
+ */
+static int
+tuple_constraint_fkey_check_spaces(struct tuple_constraint *constr,
+				   struct space *space,
+				   struct space *foreign_space)
+{
+	if (space_is_temporary(foreign_space)) {
+		diag_set(ClientError, ER_CREATE_FOREIGN_KEY,
+			 constr->def.name, constr->space->def->name,
+			 "foreign space can't be temporary");
+		return -1;
+	}
+	if (space_is_data_temporary(foreign_space) &&
+	    !space_is_data_temporary(space)) {
+		diag_set(ClientError, ER_CREATE_FOREIGN_KEY,
+			 constr->def.name, constr->space->def->name,
+			 "foreign key from non-data-temporary space"
+			 " can't refer to data-temporary space");
+		return -1;
+	}
+	if (space_is_local(foreign_space) && !space_is_local(space)) {
+		diag_set(ClientError, ER_CREATE_FOREIGN_KEY,
+			 constr->def.name, constr->space->def->name,
+			 "foreign key from non-local space"
+			 " can't refer to local space");
+		return -1;
+	}
+	return 0;
+}
+
 int
 tuple_constraint_fkey_init(struct tuple_constraint *constr,
 			   struct space *space, int32_t field_no)
@@ -637,6 +665,9 @@ tuple_constraint_fkey_init(struct tuple_constraint *constr,
 	enum space_cache_holder_type type = SPACE_HOLDER_FOREIGN_KEY;
 	if (foreign_space != NULL) {
 		/* Space was found, use it. */
+		if (tuple_constraint_fkey_check_spaces(constr, space,
+						       foreign_space) != 0)
+			return -1;
 		space_cache_pin(foreign_space, &constr->space_cache_holder,
 				tuple_constraint_fkey_space_cache_on_replace,
 				type, fkey_same_space);

@@ -411,7 +411,7 @@ local function io_read(self, opts, timeout)
     end
 
     if chunk < 0 then
-        error('io:read(): chunk can not be negative')
+        error('io:read(): chunk size can not be negative')
     end
 
     chunk = math.min(chunk, IO_CHUNK_DEFAULT)
@@ -424,7 +424,7 @@ local function io_read(self, opts, timeout)
     local len = check(self, chunk, delimiter)
     if len ~= nil then
         local data = ffi.string(rbuf.rpos, len)
-        rbuf.rpos = rbuf.rpos + len
+        rbuf:consume(len)
         return data
     end
 
@@ -438,15 +438,15 @@ local function io_read(self, opts, timeout)
             self._errno = nil
             local len = rbuf:size()
             local data = ffi.string(rbuf.rpos, len)
-            rbuf.rpos = rbuf.rpos + len
+            rbuf:consume(len)
             return data
         else
-            rbuf.wpos = rbuf.wpos + res
+            rbuf:alloc(res)
             local len = check(self, chunk, delimiter)
             if len ~= nil then
                 self._errno = nil
                 local data = ffi.string(rbuf.rpos, len)
-                rbuf.rpos = rbuf.rpos + len
+                rbuf:consume(len)
                 return data
             end
         end
@@ -524,6 +524,8 @@ end
 --          a server sends as part of an 3xx response;
 --
 --      accept_encoding - enables automatic decompression of HTTP responses;
+--
+--      http_version - describes an http version;
 --
 --      chunked - enables chunked io interface;
 --
@@ -613,6 +615,9 @@ curl_mt = {
                         read = io_read,
                         write = io_write,
                         finish = io_finish,
+                    },
+                    _internal = {
+                        httpc = self,
                     },
                 })
             end
@@ -751,5 +756,6 @@ for _, name in ipairs({ 'get', 'delete', 'trace', 'options', 'head',
                      'connect', 'post', 'put', 'patch', 'request'}) do
     this_module[name] = http_default_wrap(name)
 end
+this_module.curl = http_default.curl
 
 return this_module

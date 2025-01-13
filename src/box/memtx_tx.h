@@ -62,11 +62,13 @@ enum memtx_tx_alloc_object {
 	/**
 	 * Deprecated object of type struct memtx_tx_conflict.
 	 * Left for statistics compatibility.
-	 * TODO: remove it considering monitoring module.
+	 * TODO(gh-8149): remove it considering monitoring module.
 	 */
 	MEMTX_TX_OBJECT_CONFLICT = 0,
 	/**
-	 * Object of type struct tx_conflict_tracker.
+	 * Deprecated object of type struct tx_conflict_tracker.
+	 * Left for statistics compatibility.
+	 * TODO(gh-8149): remove it considering monitoring module.
 	 */
 	MEMTX_TX_OBJECT_CONFLICT_TRACKER = 1,
 	/**
@@ -142,7 +144,7 @@ memtx_tx_statistics_collect(struct memtx_tx_statistics *stats);
  * Initialize MVCC part of a transaction.
  * Must be called even if MVCC engine is not enabled in config.
  */
-int
+void
 memtx_tx_register_txn(struct txn *txn);
 
 /**
@@ -165,16 +167,6 @@ memtx_tx_manager_free();
  */
 void
 memtx_tx_acquire_ddl(struct txn *tx);
-
-/**
- * Mark all transactions except for a given as aborted due to conflict:
- * when DDL operation is about to be committed other transactions are
- * considered to use obsolete schema so that should be aborted.
- *
- * NB: can trigger story garbage collection.
- */
-void
-memtx_tx_abort_all_for_ddl(struct txn *ddl_owner);
 
 /**
  * @brief Add a statement to transaction manager's history.
@@ -249,10 +241,9 @@ memtx_tx_prepare_finalize(struct txn *txn);
  * NB: can trigger story garbage collection.
  *
  * @param stmt current statement.
- * @param bsize the space bsize.
  */
 void
-memtx_tx_history_commit_stmt(struct txn_stmt *stmt, size_t *bsize);
+memtx_tx_history_commit_stmt(struct txn_stmt *stmt);
 
 /** Helper of memtx_tx_tuple_clarify */
 struct tuple *
@@ -261,7 +252,7 @@ memtx_tx_tuple_clarify_slow(struct txn *txn, struct space *space,
 			    uint32_t mk_index);
 
 /** Helper of memtx_tx_track_point */
-int
+void
 memtx_tx_track_point_slow(struct txn *txn, struct index *index,
 			  const char *key);
 
@@ -275,24 +266,21 @@ memtx_tx_track_point_slow(struct txn *txn, struct index *index,
  *
  * @return 0 on success, -1 on memory error.
  */
-static inline int
+static inline void
 memtx_tx_track_point(struct txn *txn, struct space *space,
 		     struct index *index, const char *key)
 {
 	if (!memtx_tx_manager_use_mvcc_engine)
-		return 0;
-	if (txn == NULL)
-		return 0;
-	/* Skip ephemeral spaces. */
-	if (space == NULL || space->def->id == 0)
-		return 0;
-	return memtx_tx_track_point_slow(txn, index, key);
+		return;
+	if (txn == NULL || space == NULL || space->def->opts.is_ephemeral)
+		return;
+	memtx_tx_track_point_slow(txn, index, key);
 }
 
 /**
  * Helper of memtx_tx_track_gap.
  */
-int
+void
 memtx_tx_track_gap_slow(struct txn *txn, struct space *space, struct index *index,
 			struct tuple *successor, enum iterator_type type,
 			const char *key, uint32_t part_count);
@@ -306,29 +294,77 @@ memtx_tx_track_gap_slow(struct txn *txn, struct space *space, struct index *inde
  * it's faster to use memtx_tx_track_point).
  *
  * NB: can trigger story garbage collection.
- *
- * @return 0 on success, -1 on memory error.
  */
-static inline int
+static inline void
 memtx_tx_track_gap(struct txn *txn, struct space *space, struct index *index,
 		   struct tuple *successor, enum iterator_type type,
 		   const char *key, uint32_t part_count)
 {
 	if (!memtx_tx_manager_use_mvcc_engine)
+		return;
+	if (txn == NULL || space == NULL || space->def->opts.is_ephemeral)
+		return;
+	memtx_tx_track_gap_slow(txn, space, index, successor,
+				type, key, part_count);
+}
+
+/**
+ * Helper of memtx_tx_track_count.
+ */
+uint32_t
+memtx_tx_track_count_until_slow(struct txn *txn, struct space *space,
+				struct index *index, enum iterator_type type,
+				const char *key, uint32_t part_count,
+				struct tuple *until, hint_t until_hint);
+
+/**
+ * Record in TX manager that a transaction @a txn have counted @a index from @a
+ * space by @a key and iterator @a type. This function must be used for queries
+ * that count tuples in indexes (for example, index:size or index:count).
+ *
+ * NB: can trigger story garbage collection.
+ *
+ * @return the amount of invisible tuples counted.
+ */
+static inline uint32_t
+memtx_tx_track_count(struct txn *txn, struct space *space,
+		     struct index *index, enum iterator_type type,
+		     const char *key, uint32_t part_count)
+{
+	if (!memtx_tx_manager_use_mvcc_engine)
 		return 0;
-	if (txn == NULL)
+	return memtx_tx_track_count_until_slow(txn, space, index, type, key,
+					       part_count, NULL, HINT_NONE);
+}
+
+/**
+ * Record in TX manager that a transaction @a txn have counted @a index from @a
+ * space by @a key and iterator @a type @a until a tuple. This function must be
+ * used when all tuples matching the key and iterator until the given one are
+ * skipped by a transaction without reading (e. g. select with offset).
+ *
+ * NB: can trigger story garbage collection.
+ *
+ * @return the amount of invisible tuples counted.
+ *
+ * @pre The @a until tuple (if not NULL) must be clarified by @a txn.
+ */
+static inline uint32_t
+memtx_tx_track_count_until(struct txn *txn, struct space *space,
+			   struct index *index, enum iterator_type type,
+			   const char *key, uint32_t part_count,
+			   struct tuple *until, hint_t until_hint)
+{
+	if (!memtx_tx_manager_use_mvcc_engine)
 		return 0;
-	/* Skip ephemeral spaces. */
-	if (space == NULL || space->def->id == 0)
-		return 0;
-	return memtx_tx_track_gap_slow(txn, space, index, successor,
-				       type, key, part_count);
+	return memtx_tx_track_count_until_slow(txn, space, index, type, key,
+					       part_count, until, until_hint);
 }
 
 /**
  * Helper of memtx_tx_track_full_scan.
  */
-int
+void
 memtx_tx_track_full_scan_slow(struct txn *txn, struct index *index);
 
 /**
@@ -341,18 +377,15 @@ memtx_tx_track_full_scan_slow(struct txn *txn, struct index *index);
  *
  * @return 0 on success, -1 on memory error.
  */
-static inline int
+static inline void
 memtx_tx_track_full_scan(struct txn *txn, struct space *space,
 			 struct index *index)
 {
 	if (!memtx_tx_manager_use_mvcc_engine)
-		return 0;
-	if (txn == NULL)
-		return 0;
-	/* Skip ephemeral spaces. */
-	if (space == NULL || space->def->id == 0)
-		return 0;
-	return memtx_tx_track_full_scan_slow(txn, index);
+		return;
+	if (txn == NULL || space == NULL || space->def->opts.is_ephemeral)
+		return;
+	memtx_tx_track_full_scan_slow(txn, index);
 }
 
 /**
@@ -382,9 +415,14 @@ memtx_tx_tuple_clarify(struct txn *txn, struct space *space,
 	return memtx_tx_tuple_clarify_slow(txn, space, tuple, index, mk_index);
 }
 
+/**
+ * Helper of invisible count functions.
+ */
 uint32_t
-memtx_tx_index_invisible_count_slow(struct txn *txn,
-				    struct space *space, struct index *index);
+memtx_tx_index_invisible_count_matching_until_slow(
+	struct txn *txn, struct space *space, struct index *index,
+	enum iterator_type type, const char *key, uint32_t part_count,
+	struct tuple *until, hint_t until_hint);
 
 /**
  * When MVCC engine is enabled, an index can contain temporary non-committed
@@ -393,8 +431,6 @@ memtx_tx_index_invisible_count_slow(struct txn *txn,
  * standalone observer.
  * The function calculates tje number of tuples that are physically present
  * in index, but have no visible value.
- *
- * NB: can trigger story garbage collection.
  */
 static inline uint32_t
 memtx_tx_index_invisible_count(struct txn *txn,
@@ -402,7 +438,47 @@ memtx_tx_index_invisible_count(struct txn *txn,
 {
 	if (!memtx_tx_manager_use_mvcc_engine)
 		return 0;
-	return memtx_tx_index_invisible_count_slow(txn, space, index);
+	return memtx_tx_index_invisible_count_matching_until_slow(
+		txn, space, index, ITER_GE, NULL, 0, NULL, HINT_NONE);
+}
+
+/**
+ * Same as memtx_tx_index_invisible_count but only counts tuples matching to
+ * the given key and iterator up to the given tuple (exclusively) according to
+ * the index order.
+ *
+ * E. g. for index: [1, 2, 3, 4, 5], given all items in the index are invisible
+ * to the transaction, counting matching LE 3 until 1 will give 2 (3 and 2 will
+ * be counted, 1 will not since the count is exclusive).
+ */
+static inline uint32_t
+memtx_tx_index_invisible_count_matching_until(
+	struct txn *txn, struct space *space, struct index *index,
+	enum iterator_type type, const char *key, uint32_t part_count,
+	struct tuple *until, hint_t until_hint)
+{
+	if (!memtx_tx_manager_use_mvcc_engine)
+		return 0;
+	return memtx_tx_index_invisible_count_matching_until_slow(
+		txn, space, index, type, key, part_count, until, until_hint);
+}
+
+/** Helper of memtx_tx_tuple_is_visible. */
+bool
+memtx_tx_tuple_key_is_visible_slow(struct txn *txn, struct space *space,
+				   struct index *index, struct tuple *tuple);
+
+/**
+ * Detect whether key of @a tuple from @a index of @a space is visible
+ * to @a txn.
+ */
+static inline bool
+memtx_tx_tuple_key_is_visible(struct txn *txn, struct space *space,
+			      struct index *index, struct tuple *tuple)
+{
+	if (!memtx_tx_manager_use_mvcc_engine)
+		return true;
+	return memtx_tx_tuple_key_is_visible_slow(txn, space, index, tuple);
 }
 
 /**
@@ -414,32 +490,25 @@ void
 memtx_tx_clean_txn(struct txn *txn);
 
 /**
- * Notify manager tha an index is deleted and free data, save in index.
+ * Invalidate space in memtx tx: abort all concurrent transactions interacting
+ * with the space and remove all the objects associated with the space and its
+ * schema. The indexes are populated with tuples according to what `ddl_owner`
+ * observes.
  *
  * NB: can trigger story garbage collection.
  */
 void
-memtx_tx_on_index_delete(struct index *index);
-
-/**
- * Notify manager the a space is deleted.
- * It's necessary because there is a chance that garbage collector hasn't
- * deleted all stories of that space and in that case some actions of
- * story's destructor are not applicable.
- *
- * NB: can trigger story garbage collection.
- */
-void
-memtx_tx_on_space_delete(struct space *space);
+memtx_tx_invalidate_space(struct space *space, struct txn *ddl_owner);
 
 /**
  * Create a snapshot cleaner.
  * @param cleaner - cleaner to create.
  * @param space - space for which the cleaner must be created.
+ * @param index - index for which the cleaner must be created.
  */
 void
 memtx_tx_snapshot_cleaner_create(struct memtx_tx_snapshot_cleaner *cleaner,
-				 struct space *space);
+				 struct space *space, struct index *index);
 
 /** Helper of txm_snapshot_clafify. */
 struct tuple *
@@ -473,6 +542,10 @@ memtx_tx_snapshot_cleaner_destroy(struct memtx_tx_snapshot_cleaner *cleaner);
  */
 API_EXPORT void
 memtx_tx_story_gc_step(void);
+
+#if defined(ENABLE_READ_VIEW)
+# include "memtx_tx_read_view.h"
+#endif /* defined(ENABLE_READ_VIEW) */
 
 #if defined(__cplusplus)
 } /* extern "C" */

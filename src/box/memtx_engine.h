@@ -91,25 +91,13 @@ enum memtx_recovery_state {
 	MEMTX_OK,
 };
 
-enum memtx_reserve_extents_num {
-	/**
-	 * This number is calculated based on the
-	 * max (realistic) number of insertions
-	 * a deletion from a B-tree or an R-tree
-	 * can lead to, and, as a result, the max
-	 * number of new block allocations.
-	 */
-	RESERVE_EXTENTS_BEFORE_DELETE = 8,
-	RESERVE_EXTENTS_BEFORE_REPLACE = 16
-};
-
 /**
  * The size of the biggest memtx iterator. Used with
  * mempool_create. This is the size of the block that will be
  * allocated for each iterator (except rtree index iterator that
  * is significantly bigger so has own pool).
  */
-#define MEMTX_ITERATOR_SIZE (176)
+#define MEMTX_ITERATOR_SIZE (184)
 
 typedef void
 (*memtx_on_indexes_built_cb)(void);
@@ -126,11 +114,6 @@ struct memtx_engine {
 	uint64_t snap_io_rate_limit;
 	/** Skip invalid snapshot records if this flag is set. */
 	bool force_recovery;
-	/**
-	 * Cord being currently used to join replica. It is only
-	 * needed to be able to cancel it on shutdown.
-	 */
-	struct cord *replica_join_cord;
 	/**
 	 * A callback run once memtx engine builds secondary indexes for the
 	 * data.
@@ -149,19 +132,12 @@ struct memtx_engine {
 	struct slab_cache slab_cache;
 	/** Slab cache for allocating index extents. */
 	struct slab_cache index_slab_cache;
-	/** Index extent allocator. */
+	/** Index extent source. */
 	struct mempool index_extent_pool;
+	/** Index extent allocator. */
+	struct matras_allocator index_extent_allocator;
 	/** Index extent allocator statistics. */
 	struct matras_stats index_extent_stats;
-	/**
-	 * To ensure proper statement-level rollback in case
-	 * of out of memory conditions, we maintain a number
-	 * of slack memory extents reserved before a statement
-	 * is begun. If there isn't enough slack memory,
-	 * we don't begin the statement.
-	 */
-	int num_reserved_extents;
-	void *reserved_extents;
 	/** Maximal allowed tuple size, box.cfg.memtx_max_tuple_size. */
 	size_t max_tuple_size;
 	/** Memory pool for rtree index iterator. */
@@ -186,6 +162,13 @@ struct memtx_engine {
 	 * Format used for allocating functional index keys.
 	 */
 	struct tuple_format *func_key_format;
+	/**
+	 * Number of threads used to sort keys of secondary indexes on engine
+	 * start.
+	 */
+	int sort_threads;
+	/** Set of extents allocated using malloc. */
+	struct mh_ptr_t *malloc_extents;
 };
 
 struct memtx_gc_task;
@@ -221,7 +204,7 @@ struct memtx_engine *
 memtx_engine_new(const char *snap_dirname, bool force_recovery,
 		 uint64_t tuple_arena_max_size, uint32_t objsize_min,
 		 bool dontdump, unsigned granularity,
-		 const char *allocator, float alloc_factor,
+		 const char *allocator, float alloc_factor, int threads_num,
 		 memtx_on_indexes_built_cb on_indexes_built);
 
 /**
@@ -260,27 +243,6 @@ extern struct tuple *
 		       const char *end, bool validate);
 
 /**
- * Allocate a block of size MEMTX_EXTENT_SIZE for memtx index
- * @ctx must point to memtx engine
- */
-void *
-memtx_index_extent_alloc(void *ctx);
-
-/**
- * Free a block previously allocated by memtx_index_extent_alloc
- * @ctx must point to memtx engine
- */
-void
-memtx_index_extent_free(void *ctx, void *extent);
-
-/**
- * Reserve num extents in pool.
- * Ensure that next num extent_alloc will succeed w/o an error
- */
-int
-memtx_index_extent_reserve(struct memtx_engine *memtx, int num);
-
-/**
  * Generic implementation of index_vtab::def_change_requires_rebuild,
  * common for all kinds of memtx indexes.
  */
@@ -296,7 +258,7 @@ memtx_set_tuple_format_vtab(const char *allocator_name);
  * to format in which, it should be visible for users.
  */
 int
-memtx_prepare_result_tuple(struct tuple **result);
+memtx_prepare_result_tuple(struct space *space, struct tuple **result);
 
 /**
  * Prepares a tuple retrieved from a consistent index read view to be returned
@@ -362,13 +324,14 @@ memtx_engine_new_xc(const char *snap_dirname, bool force_recovery,
 		    uint64_t tuple_arena_max_size, uint32_t objsize_min,
 		    bool dontdump, unsigned granularity,
 		    const char *allocator, float alloc_factor,
+		    int sort_threads,
 		    memtx_on_indexes_built_cb on_indexes_built)
 {
 	struct memtx_engine *memtx;
 	memtx = memtx_engine_new(snap_dirname, force_recovery,
 				 tuple_arena_max_size, objsize_min, dontdump,
 				 granularity, allocator, alloc_factor,
-				 on_indexes_built);
+				 sort_threads, on_indexes_built);
 	if (memtx == NULL)
 		diag_raise();
 	return memtx;

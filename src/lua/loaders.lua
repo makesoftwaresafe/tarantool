@@ -14,34 +14,6 @@ local ROCKS_LUA_TEMPLATES = {
     ROCKS_LUA_PATH .. '/?/init.lua',
 }
 
--- Tarantool's builtin modules.
---
--- Similar to _LOADED (package.loaded).
-local builtin_modules = debug.getregistry()._TARANTOOL_BUILTIN
-
--- Loader for built-in modules.
-local function builtin_loader(name)
-    -- A loader is more like a searching function rather than a
-    -- loading function (fun fact: package.loaders was renamed to
-    -- package.searchers in Lua 5.2).
-    --
-    -- A loader (a searcher) typically searches for a file and, if
-    -- the file is found, loads it and returns a function to
-    -- execute it. Typically just result of loadfile(file).
-    --
-    -- Our 'filesystem' is a table of modules, a 'file' is an
-    -- entry in the table. If a module is found, the loader
-    -- returns a function that 'executes' it. The function just
-    -- returns the module itself.
-    if builtin_modules[name] ~= nil then
-        return function(_name)
-            return builtin_modules[name]
-        end
-    end
-
-    return ("\n\tno field loaders.builtin['%s']"):format(name)
-end
-
 local package_searchroot
 
 local function searchroot()
@@ -86,80 +58,211 @@ local function traverse_path(path)
     return paths
 end
 
--- Generate a search function, which performs searching through
--- templates setup in options.
+-- Generate a path builder function, which yields the set of the
+-- paths to be searched through for the desired module.
 --
--- @param path_fn function which returns a base path for the
---     resulting template
+-- @param basepath_fn function which returns a base path for the
+--     resulting path set
 -- @param templates table with lua search templates
 -- @param need_traverse bool flag which tells search function to
 --     build multiple paths by expanding base path up to the
 --     root ('/')
--- @return a searcher function which builds a path template and
---     calls package.searchpath
-local function gen_search_func(path_fn, templates, need_traverse)
-    assert(type(path_fn) == 'function', 'path_fn must be a function')
+-- @return a path builder function which builds and yields the
+--     resulting path set
+local function gen_path_builder(basepath_fn, templates, need_traverse)
+    assert(type(basepath_fn) == 'function', 'basepath_fn must be a function')
     assert(type(templates) == 'table', 'templates must be a table')
 
-    return function(name)
-        local path = path_fn() or '.'
-        local paths = need_traverse and traverse_path(path) or { path }
+    return function()
+        local base = basepath_fn() or '.'
+        local dirs = need_traverse and traverse_path(base) or { base }
 
         local searchpaths = {}
 
-        for _, path in ipairs(paths) do
+        for _, dir in ipairs(dirs) do
             for _, template in pairs(templates) do
-                table.insert(searchpaths, minifio.pathjoin(path, template))
+                table.insert(searchpaths, minifio.pathjoin(dir, template))
             end
         end
 
-        local searchpath = table.concat(searchpaths, ';')
-
-        return package.searchpath(name, searchpath)
+        return table.concat(searchpaths, ';')
     end
 end
 
--- Compose a loader function from options.
+local path = {
+    package = function() return package.path end,
+    cwd = {
+        dot = gen_path_builder(searchroot, LUA_TEMPLATES),
+        rocks = gen_path_builder(searchroot, ROCKS_LUA_TEMPLATES, true),
+    }
+}
+
+local cpath = {
+    package = function() return package.cpath end,
+    cwd = {
+        dot = gen_path_builder(searchroot, LIB_TEMPLATES),
+        rocks = gen_path_builder(searchroot, ROCKS_LIB_TEMPLATES, true),
+    }
+}
+
+local function gen_file_searcher(loader, pathogen)
+    assert(type(loader) == 'function', '<loader> must be a function')
+    assert(type(pathogen) == 'function', '<pathogen> must be a function')
+
+    return function(name)
+        local path, errmsg = package.searchpath(name, pathogen())
+        if not path then
+            return errmsg
+        end
+        return loader, path
+    end
+end
+
+local function gen_croot_searcher(searcher)
+    assert(type(searcher) == 'function', '<searcher> must be a function')
+
+    return function(name)
+        local path = name:match('[^.]+')
+        local loader, data = searcher(path)
+        -- XXX: <loader> (i.e. the first return value) contains
+        -- error message in this case. Just propagate it to the
+        -- <require> frame...
+        if not data then
+           return loader
+        end
+        -- XXX: ... Otherwise, there is a croot module found.
+        -- Yield the C module loader with the found croot module.
+        assert(loader == load_lib, 'Invalid searcher provided')
+        return loader, data
+    end
+end
+
+local function yield_builtin_loader(loader, sentinel)
+    return function(data)
+        if data == sentinel then
+            return loader
+        end
+        return ('%s loader is used to load %s module'):format(sentinel, data)
+    end, sentinel
+
+end
+
+-- Lua table with "package searchers".
+local searchers = debug.getregistry()._TARANTOOL_PACKAGE_SEARCHERS
+
+rawset(searchers, 'preload', function(name)
+    assert(type(package.preload) == 'table',
+           "'package.preload' must be a table")
+    local loader = package.preload[name]
+    if loader ~= nil then
+        return yield_builtin_loader(loader, ':preload:')
+    end
+    return ("\n\tno field package.preload['%s']"):format(name)
+end)
+
+-- Tarantool's builtin modules.
 --
--- @param search_fn function will be used to search a file from
---     path template
--- @param load_fn function will be used to load a file, found by
---     search function
+-- Similar to _LOADED (package.loaded).
+local builtin_modules = debug.getregistry()._TARANTOOL_BUILTIN
+
+-- Searcher for builtin modules.
+rawset(searchers, 'builtin', function(name)
+    local module = builtin_modules[name]
+    if module ~= nil then
+        return yield_builtin_loader(function(_) return module end, ':builtin:')
+    end
+    return ("\n\tno field loaders.builtin['%s']"):format(name)
+end)
+
+rawset(searchers, 'path.package', gen_file_searcher(load_lua, path.package))
+rawset(searchers, 'cpath.package', gen_file_searcher(load_lib, cpath.package))
+rawset(searchers, 'path.cwd.dot', gen_file_searcher(load_lua, path.cwd.dot))
+rawset(searchers, 'cpath.cwd.dot', gen_file_searcher(load_lib, cpath.cwd.dot))
+rawset(searchers, 'path.cwd.rocks', gen_file_searcher(load_lua, path.cwd.rocks))
+rawset(searchers, 'cpath.cwd.rocks', gen_file_searcher(load_lib, cpath.cwd.rocks))
+
+-- FIXME: There are two problems with croot problems in Tarantool:
+--   1. Since Tarantool uses original croot loader from LuaJIT, it
+--      ignores all paths except ones specified in <package.path>.
+--      However, there might be some croot-like modules in the
+--      Tarantool-specific cpaths (cwd or application root).
+--      It looks like croot machinery is not widely used, if this
+--      bug bothers nobody, but it's still need to be fixed.
+--   2. Similar situation relates to the overriding mechanism,
+--      that was recently introduced: there is no "prefixed" croot
+--      loader and all libraries using croot loading machinery are
+--      ignored for the overridden paths as a result.
+rawset(searchers, 'croot.cwd', gen_croot_searcher(searchers['cpath.package']))
+
+-- Indices in <searchers> table must represent the order of the
+-- functions in <package.loaders> below.
+rawset(searchers, 2, searchers['path.cwd.dot'])
+rawset(searchers, 3, searchers['cpath.cwd.dot'])
+rawset(searchers, 4, searchers['path.cwd.rocks'])
+rawset(searchers, 5, searchers['cpath.cwd.rocks'])
+rawset(searchers, 6, searchers['path.package'])
+rawset(searchers, 7, searchers['cpath.package'])
+rawset(searchers, 8, searchers['croot.cwd'])
+
+-- Compose a loader function from options. The function accepts
+-- the table with the searchers and the index, so the user can
+-- override the particular searcher.
+--
+-- @param searchers table with the searcher function to be used
+--     to search a file from path template
+-- @param index in searchers table to be used in the loader to be
+--     generated
 -- @return function a loader, which first search for the file and
 --     then loads it
-local function gen_loader_func(search_fn, load_fn)
-    assert(type(search_fn) == 'function', 'search_fn must be defined')
-    assert(type(load_fn) == 'function', 'load_fn must be defined')
+local function gen_legacy_loader(searchers, index)
+    assert(type(searchers) == 'table', '<searchers> must be defined')
+    assert(type(searchers[index]) == 'function',
+           'searchers[index] must be a function')
 
     return function(name)
         if not name then
             return "empty name of module"
         end
-        local file, err = search_fn(name)
-        if not file then
-            return err
+        local loader, data = searchers[index](name)
+        -- XXX: <loader> (i.e. the first return value) contains
+        -- error message in this case. Just propagate it to the
+        -- <require> frame...
+        if not data then
+           return loader
         end
-        local loaded, err = load_fn(file, name)
-        if err == nil then
+        -- XXX: ... Otherwise, this is a valid module loader.
+        -- Load the given <data> and return the result.
+        local loaded, err = loader(data, name)
+        local message = ("error loading module '%s' from file '%s':\n\t%s")
+                        :format(name, data, err)
+        if loaded then
             return loaded
         else
-            return err
+            if _G.box and _G.box.error then
+                box.error(box.error.PROC_LUA, message, 3)
+            else
+                error(message, 3)
+            end
         end
     end
 end
 
-local search_lua = gen_search_func(searchroot, LUA_TEMPLATES)
-local search_lib = gen_search_func(searchroot, LIB_TEMPLATES)
-local search_rocks_lua = gen_search_func(searchroot, ROCKS_LUA_TEMPLATES, true)
-local search_rocks_lib = gen_search_func(searchroot, ROCKS_LIB_TEMPLATES, true)
-
+-- XXX: Though <package.search> looks like a handy public
+-- function, it's only the helper used for searching Tarantool
+-- C modules. Hence, despite it uses the same searchers as loaders
+-- for Lua modules do, it follows its own semantics ignoring
+-- preload, override, builtin modules, and application specific
+-- locations.
+-- FIXME: Lua paths look really odd in the list, since the
+-- function is used to load only C modules. However, these paths
+-- are left to avoid breaking change.
 local search_funcs = {
-    search_lua,
-    search_lib,
-    search_rocks_lua,
-    search_rocks_lib,
-    function(name) return package.searchpath(name, package.path) end,
-    function(name) return package.searchpath(name, package.cpath) end,
+    searchers['path.cwd.dot'],
+    searchers['cpath.cwd.dot'],
+    searchers['path.cwd.rocks'],
+    searchers['cpath.cwd.rocks'],
+    searchers['path.package'],
+    searchers['cpath.package'],
 }
 
 local function search(name)
@@ -167,27 +270,29 @@ local function search(name)
         return "empty name of module"
     end
     for _, searcher in ipairs(search_funcs) do
-        local file = searcher(name)
-        if file ~= nil then
+        local loader, file = searcher(name)
+        if type(loader) == 'function' then
             return file
         end
     end
     return nil
 end
 
--- Accept a loader and return a loader, which search by a prefixed
--- module name.
+-- Accept a searcher and return a searcher, which search by a
+-- prefixed module name.
 --
 -- The module receives the original (unprefixed) module name in
 -- the argument (three dots).
-local function prefix_loader(prefix, subloader)
+local function prefix_searcher(prefix, subsearcher)
     return function(name)
         local prefixed_name = prefix .. '.' .. name
         -- On success the return value is a function, which
-        -- executes module's initialization code. require() calls
-        -- it with one argument: the module name (it can be
+        -- implements loading mechanism for particular file.
+        -- If the file is loaded successfully, the loader yields
+        -- module initialization function that is called by
+        -- <require> with one argument: the module name (it can be
         -- received in the module using three dots). Since
-        -- require() knows nothing about our prefixing it passes
+        -- <require> knows nothing about our prefixing, it passes
         -- the original name there.
         --
         -- It is expected behavior in our case. The prefixed
@@ -195,43 +300,43 @@ local function prefix_loader(prefix, subloader)
         -- we would add more package.{path,cpath} entries. It
         -- shouldn't change the string passed to the module's
         -- initialization code.
-        return subloader(prefixed_name)
+        return subsearcher(prefixed_name)
     end
 end
 
--- Accept a loader and return the same loader, but enabled only
--- when given condition (a function return value) is true.
-local function conditional_loader(subloader, onoff)
+-- Accept a searcher and return the same searcher, but enabled
+-- only when given condition (a function return value) is true.
+local function conditional_searcher(subsearcher, onoff)
     assert(type(onoff) == 'function')
     return function(name)
         if onoff(name) then
-            return subloader(name)
+            return subsearcher(name)
         end
-        -- It is okay to return nothing, require() ignores it.
+        -- It is okay to return nothing, <require> ignores it.
     end
 end
 
--- Accept an array of loaders and return a loader, whose effect is
--- equivalent to calling the loaders in a row.
-local function chain_loaders(subloaders)
+-- Accept an array of searchers and return a searcher, whose
+-- effect is equivalent to calling the searchers in a row.
+local function chain_searchers(subsearchers)
     return function(name)
         -- Error accumulator.
         local err = ''
 
-        for _, loader in ipairs(subloaders) do
-            local loaded = loader(name)
+        for _, searcher in ipairs(subsearchers) do
+            local loader, data = searcher(name)
             -- Whether the module found? Let's return it.
             --
-            -- loaded is a function, which executes module's
-            -- initialization code.
-            if type(loaded) == 'function' then
-                return loaded
+            -- <loader> is a function, which implements loading
+            -- routine for particular <data> module.
+            if type(loader) == 'function' then
+                return loader, data
             end
-            -- If the module is not found and the loader function
-            -- returns an error, add the error into the
+            -- If the module is not found and the searcher
+            -- function returns an error, add the error into the
             -- accumulator.
-            if type(loaded) == 'string' then
-                err = err .. loaded
+            if type(loader) == 'string' then
+                err = err .. loader
             end
             -- Ignore any other return value: require() does the
             -- same.
@@ -241,14 +346,6 @@ local function chain_loaders(subloaders)
     end
 end
 
--- loader_preload 1
-table.insert(package.loaders, 2, gen_loader_func(search_lua, load_lua))
-table.insert(package.loaders, 3, gen_loader_func(search_lib, load_lib))
-table.insert(package.loaders, 4, gen_loader_func(search_rocks_lua, load_lua))
-table.insert(package.loaders, 5, gen_loader_func(search_rocks_lib, load_lib))
--- package.path   6
--- package.cpath  7
--- croot          8
 
 -- Search for modules next to the main script.
 --
@@ -266,44 +363,52 @@ if script ~= nil and script ~= '-' then
     end
 
     -- Search non-recursively, only next to the script.
-    local search_app_lua = gen_search_func(script_dir_fn, LUA_TEMPLATES)
-    local search_app_lib = gen_search_func(script_dir_fn, LIB_TEMPLATES)
-    local search_app_rocks_lua = gen_search_func(script_dir_fn,
-        ROCKS_LUA_TEMPLATES)
-    local search_app_rocks_lib = gen_search_func(script_dir_fn,
-        ROCKS_LIB_TEMPLATES)
+    path.app = {
+        dot = gen_path_builder(script_dir_fn, LUA_TEMPLATES),
+        rocks = gen_path_builder(script_dir_fn, ROCKS_LUA_TEMPLATES),
+    }
+    cpath.app = {
+        dot = gen_path_builder(script_dir_fn, LIB_TEMPLATES),
+        rocks = gen_path_builder(script_dir_fn, ROCKS_LIB_TEMPLATES)
+    }
 
-    -- Mix the script directory loaders into corresponding
-    -- searchroot based loaders. It allows to avoid changing
-    -- ordinals of the loaders and also makes the override
-    -- loader search here.
+    rawset(searchers, 'path.app.dot', gen_file_searcher(load_lua, path.app.dot))
+    rawset(searchers, 'cpath.app.dot', gen_file_searcher(load_lib, cpath.app.dot))
+    rawset(searchers, 'path.app.rocks', gen_file_searcher(load_lua, path.app.rocks))
+    rawset(searchers, 'cpath.app.rocks', gen_file_searcher(load_lib, cpath.app.rocks))
+
+    -- Mix the script directory searchers into corresponding
+    -- searchroot based searchers. It allows to avoid changing
+    -- ordinals of the searchers (and hence package.loaders) and
+    -- also makes the override loader search here.
     --
     -- We can just add more paths to package.path/package.cpath,
     -- but:
     --
     -- * Search for override modules is implemented as a loader.
-    -- * Search inside .rocks in implemented as a loaders.
+    -- * Search inside .rocks directory is implemented as a
+    --   separate searchers.
     --
     -- And it is simpler to wrap this logic rather than repeat.
     -- It is possible (and maybe even desirable) to reimplement
-    -- all the loaders logic as paths generation, but we should
+    -- all the searchers logic as paths generation, but we should
     -- do that for all the logic at once.
-    package.loaders[2] = chain_loaders({
-        package.loaders[2],
-        gen_loader_func(search_app_lua, load_lua),
-    })
-    package.loaders[3] = chain_loaders({
-        package.loaders[3],
-        gen_loader_func(search_app_lib, load_lib),
-    })
-    package.loaders[4] = chain_loaders({
-        package.loaders[4],
-        gen_loader_func(search_app_rocks_lua, load_lua),
-    })
-    package.loaders[5] = chain_loaders({
-        package.loaders[5],
-        gen_loader_func(search_app_rocks_lib, load_lib),
-    })
+    rawset(searchers, 2, chain_searchers({
+        searchers[2],
+        searchers['path.app.dot'],
+    }))
+    rawset(searchers, 3, chain_searchers({
+        searchers[3],
+        searchers['cpath.app.dot'],
+    }))
+    rawset(searchers, 4, chain_searchers({
+        searchers[4],
+        searchers['path.app.rocks'],
+    }))
+    rawset(searchers, 5, chain_searchers({
+        searchers[5],
+        searchers['cpath.app.rocks'],
+    }))
 end
 
 local function getenv_boolean(varname, default)
@@ -331,43 +436,64 @@ local function getenv_boolean(varname, default)
 end
 
 -- true/false if explicitly enabled or disabled, nil otherwise.
-local override_loader_is_enabled
+local override_searcher_is_enabled
 
 -- Whether the override loader is enabled.
-local function override_loader_onoff(_name)
+local function override_searcher_onoff(_name)
     -- Follow the switch if it is explicitly enabled or disabled.
-    if override_loader_is_enabled ~= nil then
-        return override_loader_is_enabled
+    if override_searcher_is_enabled ~= nil then
+        return override_searcher_is_enabled
     end
 
     -- Follow the environment variable otherwise.
     return getenv_boolean('TT_OVERRIDE_BUILTIN', true)
 end
 
-local override_loader = conditional_loader(chain_loaders({
-    prefix_loader('override', package.loaders[2]),
-    prefix_loader('override', package.loaders[3]),
-    prefix_loader('override', package.loaders[4]),
-    prefix_loader('override', package.loaders[5]),
-    prefix_loader('override', package.loaders[6]),
-    prefix_loader('override', package.loaders[7]),
-}), override_loader_onoff)
+rawset(searchers, 'override', conditional_searcher(chain_searchers({
+    prefix_searcher('override', searchers[2]),
+    prefix_searcher('override', searchers[3]),
+    prefix_searcher('override', searchers[4]),
+    prefix_searcher('override', searchers[5]),
+    prefix_searcher('override', searchers[6]),
+    prefix_searcher('override', searchers[7]),
+}), override_searcher_onoff))
 
--- Add two loaders:
+-- Join three searchers:
 --
--- - Search for override.<module_name> module. It is necessary for
---   overriding built-in modules.
--- - Search for a built-in module (compiled into tarantool's
+-- - Searcher for preload LuaJIT modules.
+-- - Searcher for override.<module_name> module. It is necessary
+--   for overriding built-in modules.
+-- - Searcher for a built-in module (compiled into tarantool's
 --   executable).
 --
--- Those two loaders are mixed into the first loader to don't
--- change ordinals of the loaders 2-8. It is possible that someone
--- has a logic based on those loader positions.
-package.loaders[1] = chain_loaders({
-    package.loaders[1],
-    override_loader,
-    builtin_loader,
-})
+-- Those three searchers are mixed into the first searcher to
+-- don't change ordinals of the searchers (and hence, loaders)
+-- 2-8. It is possible that someone has a logic based on those
+-- loader positions.
+rawset(searchers, 1, chain_searchers({
+    searchers['preload'],
+    searchers['override'],
+    searchers['builtin'],
+}))
+
+-- XXX: The default LuaJIT loaders are:
+-- [1]: preload
+-- [2]: package.path
+-- [3]: package.cpath
+-- [4]: croot
+--
+-- Tarantool loaders just maps the <searchers> table:
+-- [1]: preload -> override -> builtin
+-- [2]: path.cwd.dot -> [path.app.dot]
+-- [3]: cpath.cwd.dot -> [cpath.app.dot]
+-- [4]: path.cwd.rocks -> [path.app.rocks]
+-- [5]: cpath.cwd.rocks -> [cpath.app.rocks]
+-- [6]: package.path
+-- [7]: package.cpath
+-- [8]: croot
+for index, _ in ipairs(searchers) do
+    rawset(package.loaders, index, gen_legacy_loader(searchers, index))
+end
 
 rawset(package, "search", search)
 rawset(package, "searchroot", searchroot)
@@ -394,15 +520,41 @@ _G.require = function(modname)
     return raw_require(modname)
 end
 
+-- Load first available module from the given ones.
+--
+-- It just calls `require()` on the provided arguments (in the
+-- given order) and once this call succeeds, the function returns
+-- its result.
+--
+-- If neither of the given modules can be `require`'d, an error is
+-- raised.
+local function require_first(...)
+    if select('#', ...) == 0 then
+        error('loaders.require_first expects at least one argument', 0)
+    end
+
+    for i = 1, select('#', ...) do
+        local module_name = select(i, ...)
+        local ok, res = pcall(require, module_name)
+        if ok then
+            return res
+        end
+    end
+
+    local modules_str = ('"%s"'):format(table.concat({...}, '", "'))
+    error(('neither of modules %s are found'):format(modules_str), 0)
+end
+
 return {
     ROCKS_LIB_PATH = ROCKS_LIB_PATH,
     ROCKS_LUA_PATH = ROCKS_LUA_PATH,
     builtin = builtin_modules,
+    searchers = searchers,
     override_builtin_enable = function()
-        override_loader_is_enabled = true
+        override_searcher_is_enabled = true
     end,
     override_builtin_disable = function()
-        override_loader_is_enabled = false
+        override_searcher_is_enabled = false
     end,
     -- It is `true` during tarantool initialization, but once all
     -- the built-in modules are ready, will be set to `nil`.
@@ -418,4 +570,5 @@ return {
     --
     -- Usage: loaders.no_package_loaded[modname] = true
     no_package_loaded = no_package_loaded,
+    require_first = require_first,
 }

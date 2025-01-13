@@ -81,9 +81,6 @@ struct func;
  *
  * @param expr Expression to parse.
  * @param expr_len Length of @an expr.
- *
- * @retval NULL on error.
- * @retval not NULL Expr AST pointer on success.
  */
 struct Expr *
 sql_expr_compile(const char *expr, int expr_len);
@@ -116,6 +113,14 @@ sql_trigger_compile(const char *sql);
  */
 void
 sql_trigger_delete(struct sql_trigger *trigger);
+
+/**
+ * Free AST pointed by the trigger and all the other triggers linked to it.
+ *
+ * @param trigger AST object.
+ */
+void
+sql_trigger_delete_all(struct sql_trigger *trigger);
 
 /**
  * Get server triggers list by space_id.
@@ -156,17 +161,6 @@ sql_trigger_name(struct sql_trigger *trigger);
  */
 uint32_t
 sql_trigger_space_id(struct sql_trigger *trigger);
-
-/**
- * Given space_id and field number, return default value
- * for the field.
- * @param space_id Space ID.
- * @param fieldno Field index.
- * @retval Pointer to AST corresponding to default value.
- * Can be NULL if no DEFAULT specified or it is a view.
- */
-struct Expr*
-space_column_default_expr(uint32_t space_id, uint32_t fieldno);
 
 /**
  * Return the number of bytes required to create a duplicate of the
@@ -288,7 +282,6 @@ sql_select_delete(struct Select *select);
  *
  * @param select Select to be investigated.
  * @retval List containing all involved table names.
- *         NULL in case of OOM.
  */
 struct SrcList *
 sql_select_expand_from_tables(struct Select *select);

@@ -43,8 +43,10 @@ extern "C" {
 enum {
 	/** Maximal iproto package body length (2GiB) */
 	IPROTO_BODY_LEN_MAX = 2147483648UL,
-	/* Maximal length of text handshake (greeting) */
+	/** Size of iproto greeting message. */
 	IPROTO_GREETING_SIZE = 128,
+	/** Size of salt sent in iproto greeting message. */
+	IPROTO_SALT_SIZE = 32,
 	/** marker + len + prev crc32 + cur crc32 + (padding) */
 	XLOG_FIXHEADER_SIZE = 19
 };
@@ -154,6 +156,10 @@ extern const char *iproto_flag_bit_strs[];
 	/** Position of last selected tuple in response. */		\
 	_(POSITION, 0x35, MP_STR)					\
 									\
+	/** Also request keys. See the comment above. */		\
+	/** The data in Arrow format. */				\
+	_(ARROW, 0x36, MP_EXT)						\
+									\
 	/* Leave a gap between response keys and SQL keys. */		\
 	_(SQL_TEXT, 0x40, MP_STR)					\
 	_(SQL_BIND, 0x41, MP_ARRAY)					\
@@ -208,6 +214,30 @@ extern const char *iproto_flag_bit_strs[];
 	 * when identifier is present (i.e., the identifier is ignored).
 	 */								\
 	_(INDEX_NAME, 0x5f, MP_STR)					\
+	/**
+	 * Mapping of format identifier to format clause consisting of field
+	 * names and field types.
+	 */								\
+	_(TUPLE_FORMATS, 0x60, MP_MAP)					\
+	/**
+	 * Flag indicating whether the transaction is synchronous.
+	 */								\
+	 _(IS_SYNC, 0x61, MP_BOOL)					\
+	 /**
+	  * Flag indicating whether checkpoint join should be done.
+	  */								\
+	 _(IS_CHECKPOINT_JOIN, 0x62, MP_BOOL)				\
+	 /**
+	  * Shows the signature of the checkpoint to read from.
+	  * Requires CHECKPOINT_JOIN to be true.
+	  */								\
+	 _(CHECKPOINT_VCLOCK, 0x63, MP_MAP)				\
+	 /**
+	  * Shows the lsn to start sending from. Server sends all rows
+	  * >= IPROTO_CHECKPOINT_LSN. Requires CHECKPOINT_JOIN to be
+	  * true and CHECKPOINT_VCLOCK to be set.
+	  */								\
+	 _(CHECKPOINT_LSN, 0x64, MP_UINT)				\
 
 #define IPROTO_KEY_MEMBER(s, v, ...) IPROTO_ ## s = v,
 
@@ -263,6 +293,7 @@ extern const char *iproto_metadata_key_strs[];
 	_(CAN_LEAD, 0x07)						\
 	_(BOOTSTRAP_LEADER_UUID, 0x08)					\
 	_(REGISTERED_REPLICA_UUIDS, 0x09)				\
+	_(INSTANCE_NAME, 0x0a)						\
 
 #define IPROTO_BALLOT_KEY_MEMBER(s, v) IPROTO_BALLOT_ ## s = v,
 
@@ -319,6 +350,8 @@ iproto_key_bit(unsigned char key)
 	_(COMMIT, 15)							\
 	/* Rollback transaction */					\
 	_(ROLLBACK, 16)							\
+	/** INSERT Arrow request. */					\
+	_(INSERT_ARROW, 17)						\
 									\
 	_(RAFT, 30)							\
 	/** PROMOTE request. */						\
@@ -372,6 +405,11 @@ iproto_key_bit(unsigned char key)
 	_(WATCH, 74)							\
 	_(UNWATCH, 75)							\
 	_(EVENT, 76)							\
+	/**
+	 * Synchronous request to fetch the data that is currently attached to
+	 * a notification key without subscribing to changes.
+	 */								\
+	_(WATCH_ONCE, 77)						\
 									\
 	/**
 	 * The following three requests are reserved for vinyl types.
@@ -397,7 +435,7 @@ enum iproto_type {
 	IPROTO_UNKNOWN = -1,
 
 	/** The maximum typecode used for box.stat() */
-	IPROTO_TYPE_STAT_MAX = IPROTO_ROLLBACK + 1,
+	IPROTO_TYPE_STAT_MAX = IPROTO_INSERT_ARROW + 1,
 
 	/** Vinyl run info stored in .index file */
 	VY_INDEX_RUN_INFO = 100,
@@ -409,6 +447,9 @@ enum iproto_type {
 
 /** IPROTO type name by code */
 extern const char *iproto_type_strs[];
+
+/** IPROTO type name by code, in lower case. */
+extern char *iproto_type_lower_strs[];
 
 #define IPROTO_RAFT_KEYS(_)						\
 	_(TERM, 0)							\
@@ -450,8 +491,17 @@ iproto_type_name(uint16_t type)
 	}
 }
 
+/** Returns lowercase IPROTO type name by IPROTO `type'. */
+static inline const char *
+iproto_type_name_lower(uint16_t type)
+{
+	if (type < iproto_type_MAX)
+		return iproto_type_lower_strs[type];
+	return NULL;
+}
+
 /** Predefined replication group identifiers. */
-enum {
+enum group_id {
 	/**
 	 * Default replication group: changes made to the space
 	 * are replicated throughout the entire cluster.
@@ -481,7 +531,8 @@ static inline bool
 iproto_type_is_dml(uint16_t type)
 {
 	return (type >= IPROTO_SELECT && type <= IPROTO_DELETE) ||
-		type == IPROTO_UPSERT || type == IPROTO_NOP;
+		type == IPROTO_UPSERT || type == IPROTO_NOP ||
+		type == IPROTO_INSERT_ARROW;
 }
 
 /**
@@ -651,6 +702,27 @@ vy_row_index_key_name(enum vy_row_index_key key)
 		return NULL;
 	extern const char *vy_row_index_key_strs[];
 	return vy_row_index_key_strs[key];
+}
+
+/** Initialize the "IPROTO constants" subsystem. */
+static inline void
+iproto_constants_init(void)
+{
+	for (size_t i = 0; i < iproto_type_MAX; i++) {
+		const char *type_name = iproto_type_strs[i];
+		iproto_type_lower_strs[i] = type_name == NULL ? NULL :
+					    strtolowerdup(type_name);
+	}
+}
+
+/** Destroy the "IPROTO constants" subsystem. */
+static inline void
+iproto_constants_free(void)
+{
+	for (size_t i = 0; i < iproto_type_MAX; i++) {
+		free(iproto_type_lower_strs[i]);
+		iproto_type_lower_strs[i] = NULL;
+	}
 }
 
 #if defined(__cplusplus)

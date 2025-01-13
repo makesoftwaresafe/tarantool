@@ -143,10 +143,6 @@ box.space.loc:drop()
  | ---
  | - error: Can't modify data on a read-only instance - box.cfg.read_only is true
  | ...
-box.space.loc:truncate()
- | ---
- | - error: Can't modify data on a read-only instance - box.cfg.read_only is true
- | ...
 
 test_run:cmd('switch default')
  | ---
@@ -411,7 +407,7 @@ test_run:cmd([[create server replica with rpl_master=replica_anon1,\
  | ---
  | - true
  | ...
-test_run:cmd('start server replica with wait_load=False, wait=False')
+test_run:cmd('start server replica with wait_load=False, wait=False, crash_expected=True')
  | ---
  | - true
  | ...

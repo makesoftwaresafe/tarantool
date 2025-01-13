@@ -91,9 +91,8 @@ sysview_iterator_next(struct iterator *iterator, struct tuple **ret)
 	assert(iterator->free == sysview_iterator_free);
 	struct sysview_iterator *it = sysview_iterator(iterator);
 	*ret = NULL;
-	if (it->source->space_cache_version != space_cache_version)
-		return 0; /* invalidate iterator */
-	struct sysview_index *index = (struct sysview_index *)iterator->index;
+	struct sysview_index *index = (struct sysview_index *)
+		index_weak_ref_get_index_checked(&iterator->index_ref);
 	int rc;
 	while ((rc = iterator_next(it->source, ret)) == 0 && *ret != NULL) {
 		if (index->filter(it->space, *ret))
@@ -162,11 +161,7 @@ sysview_index_get(struct index *base, const char *key,
 	struct index *pk = index_find(source, index->source_index_id);
 	if (pk == NULL)
 		return -1;
-	if (!pk->def->opts.is_unique) {
-		diag_set(ClientError, ER_MORE_THAN_ONE_TUPLE);
-		return -1;
-	}
-	if (exact_key_validate(pk->def->key_def, key, part_count) != 0)
+	if (exact_key_validate(pk->def, key, part_count) != 0)
 		return -1;
 	struct tuple *tuple;
 	if (index_get(pk, key, part_count, &tuple) != 0)
@@ -198,6 +193,8 @@ static const struct index_vtab sysview_index_vtab = {
 	/* .get = */ sysview_index_get,
 	/* .replace = */ generic_index_replace,
 	/* .create_iterator = */ sysview_index_create_iterator,
+	/* .create_iterator_with_offset = */
+	generic_index_create_iterator_with_offset,
 	/* .create_read_view = */ generic_index_create_read_view,
 	/* .stat = */ generic_index_stat,
 	/* .compact = */ generic_index_compact,
@@ -475,18 +472,9 @@ sysview_space_create_index(struct space *space, struct index_def *def)
 		return NULL;
 	}
 
-	struct sysview_index *index =
-		(struct sysview_index *)calloc(1, sizeof(*index));
-	if (index == NULL) {
-		diag_set(OutOfMemory, sizeof(*index),
-			 "malloc", "struct sysview_index");
-		return NULL;
-	}
-	if (index_create(&index->base, (struct engine *)sysview,
-			 &sysview_index_vtab, def) != 0) {
-		free(index);
-		return NULL;
-	}
+	struct sysview_index *index = xcalloc(1, sizeof(*index));
+	index_create(&index->base, (struct engine *)sysview,
+		     &sysview_index_vtab, def);
 
 	index->source_space_id = source_space_id;
 	index->source_index_id = source_index_id;
@@ -501,6 +489,7 @@ static const struct space_vtab sysview_space_vtab = {
 	/* .execute_delete = */ sysview_space_execute_delete,
 	/* .execute_update = */ sysview_space_execute_update,
 	/* .execute_upsert = */ sysview_space_execute_upsert,
+	/* .execute_insert_arrow = */ generic_space_execute_insert_arrow,
 	/* .ephemeral_replace = */ generic_space_ephemeral_replace,
 	/* .ephemeral_delete = */ generic_space_ephemeral_delete,
 	/* .ephemeral_rowid_next = */ generic_space_ephemeral_rowid_next,
@@ -514,12 +503,13 @@ static const struct space_vtab sysview_space_vtab = {
 	/* .build_index = */ generic_space_build_index,
 	/* .swap_index = */ generic_space_swap_index,
 	/* .prepare_alter = */ generic_space_prepare_alter,
+	/* .finish_alter = */ generic_space_finish_alter,
 	/* .prepare_upgrade = */ generic_space_prepare_upgrade,
 	/* .invalidate = */ generic_space_invalidate,
 };
 
 static void
-sysview_engine_shutdown(struct engine *engine)
+sysview_engine_free(struct engine *engine)
 {
 	struct sysview_engine *sysview = (struct sysview_engine *)engine;
 	if (mempool_is_initialized(&sysview->iterator_pool))
@@ -547,10 +537,6 @@ sysview_engine_create_space(struct engine *engine, struct space_def *def,
 	 */
 	size_t region_svp = region_used(&fiber()->gc);
 	struct key_def **keys = index_def_to_key_def(key_list, &key_count);
-	if (keys == NULL) {
-		free(space);
-		return NULL;
-	}
 	struct tuple_format *format =
 		space_tuple_format_new(NULL, NULL, keys, key_count, def);
 	region_truncate(&fiber()->gc, region_svp);
@@ -570,7 +556,8 @@ sysview_engine_create_space(struct engine *engine, struct space_def *def,
 }
 
 static const struct engine_vtab sysview_engine_vtab = {
-	/* .shutdown = */ sysview_engine_shutdown,
+	/* .free = */ sysview_engine_free,
+	/* .shutdown = */ generic_engine_shutdown,
 	/* .create_space = */ sysview_engine_create_space,
 	/* .create_read_view = */ generic_engine_create_read_view,
 	/* .prepare_join = */ generic_engine_prepare_join,

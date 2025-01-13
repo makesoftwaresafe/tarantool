@@ -37,7 +37,7 @@
 #include "fio.h"
 #include "cbus.h"
 #include "memory.h"
-#include "coio_file.h"
+#include "coio_task.h"
 
 #include "replication.h"
 #include "tuple_bloom.h"
@@ -166,7 +166,13 @@ vy_run_env_stop_readers(struct vy_run_env *env)
 {
 	for (int i = 0; i < env->reader_pool_size; i++) {
 		struct vy_run_reader *reader = &env->reader_pool[i];
-		cord_cancel_and_join(&reader->cord);
+		cbus_stop_loop(&reader->reader_pipe);
+		cpipe_destroy(&reader->reader_pipe);
+	}
+	for (int i = 0; i < env->reader_pool_size; i++) {
+		struct vy_run_reader *reader = &env->reader_pool[i];
+		if (cord_join(&reader->cord) != 0)
+			panic_syserror("failed to join vinyl reader thread");
 	}
 	free(env->reader_pool);
 }
@@ -752,7 +758,7 @@ vy_page_xrow(struct vy_page *page, uint32_t stmt_no,
 	const char *data_end = stmt_no + 1 < page->row_count ?
 			       page->data + page->row_index[stmt_no + 1] :
 			       page->data + page->unpacked_size;
-	return xrow_header_decode(xrow, &data, data_end, false);
+	return xrow_decode(xrow, &data, data_end, false);
 }
 
 /* {{{ vy_run_iterator vy_run_iterator support functions */
@@ -787,12 +793,12 @@ vy_page_stmt(struct vy_page *page, uint32_t stmt_no,
  * In terms of STL, makes lower_bound for EQ,GE,LT and upper_bound for GT,LE
  * Additionally *equal_key argument is set to true if the found value is
  * equal to given key (set to false otherwise).
- * @retval position in the page
  */
-static uint32_t
+static int
 vy_page_find_key(struct vy_page *page, struct vy_entry key,
 		 struct key_def *cmp_def, struct tuple_format *format,
-		 enum iterator_type iterator_type, bool *equal_key)
+		 enum iterator_type iterator_type, uint32_t *pos,
+		 bool *equal_key)
 {
 	uint32_t beg = 0;
 	uint32_t end = page->row_count;
@@ -805,7 +811,7 @@ vy_page_find_key(struct vy_page *page, struct vy_entry key,
 		struct vy_entry fnd_key = vy_page_stmt(page, mid, cmp_def,
 						       format);
 		if (fnd_key.stmt == NULL)
-			return end;
+			return -1;
 		int cmp = vy_entry_compare(fnd_key, key, cmp_def);
 		cmp = cmp ? cmp : zero_cmp;
 		*equal_key = *equal_key || cmp == 0;
@@ -815,7 +821,8 @@ vy_page_find_key(struct vy_page *page, struct vy_entry key,
 			end = mid;
 		tuple_unref(fnd_key.stmt);
 	}
-	return end;
+	*pos = end;
+	return 0;
 }
 
 /**
@@ -926,7 +933,7 @@ vy_page_read(struct vy_page *page, const struct vy_page_info *page_info,
 	struct xrow_header xrow;
 	data_pos = page->data + page_info->row_index_offset;
 	data_end = page->data + page_info->unpacked_size;
-	if (xrow_header_decode(&xrow, &data_pos, data_end, true) == -1)
+	if (xrow_decode(&xrow, &data_pos, data_end, true) == -1)
 		goto error;
 	if (xrow.type != VY_RUN_ROW_INDEX) {
 		diag_set(ClientError, ER_INVALID_RUN_FILE,
@@ -982,12 +989,11 @@ vy_page_read_cb(struct cbus_call_msg *base)
 		return -1;
 	if (vy_page_read(task->page, task->page_info, task->run, zdctx) != 0)
 		return -1;
-	if (task->key.stmt != NULL) {
-		task->pos_in_page = vy_page_find_key(task->page, task->key,
-						     task->cmp_def, task->format,
-						     task->iterator_type,
-						     &task->equal_found);
-	}
+	if (task->key.stmt != NULL &&
+	    vy_page_find_key(task->page, task->key, task->cmp_def,
+			     task->format, task->iterator_type,
+			     &task->pos_in_page, &task->equal_found) != 0)
+		return -1;
 	return 0;
 }
 
@@ -1018,10 +1024,11 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 		page = itr->curr_page;
 	}
 	if (page != NULL) {
-		if (key.stmt != NULL)
-			*pos_in_page = vy_page_find_key(page, key, itr->cmp_def,
-							itr->format, iterator_type,
-							equal_found);
+		if (key.stmt != NULL &&
+		    vy_page_find_key(page, key, itr->cmp_def,
+				     itr->format, iterator_type,
+				     pos_in_page, equal_found) != 0)
+			return -1;
 		*result = page;
 		return 0;
 	}
@@ -1551,10 +1558,8 @@ vy_run_iterator_next_lsn(struct vy_run_iterator *itr, struct vy_entry *ret)
 
 	struct vy_run_iterator_pos next_pos;
 next:
-	if (vy_run_iterator_next_pos(itr, ITER_GE, &next_pos) != 0) {
-		vy_run_iterator_stop(itr);
+	if (vy_run_iterator_next_pos(itr, ITER_GE, &next_pos) != 0)
 		return 0;
-	}
 
 	struct vy_entry next;
 	if (vy_run_iterator_read(itr, next_pos, &next) != 0)
@@ -1660,8 +1665,8 @@ vy_run_recover(struct vy_run *run, const char *dir,
 			    space_id, iid, run->id, VY_FILE_INDEX);
 
 	struct xlog_cursor cursor;
-	ERROR_INJECT_COUNTDOWN(ERRINJ_VY_RUN_OPEN, {
-		diag_set(SystemError, "failed to open '%s' file", path);
+	ERROR_INJECT_COUNTDOWN(ERRINJ_VY_RUN_RECOVER_COUNTDOWN, {
+		diag_set(ClientError, ER_INJECTION, "vinyl run recover");
 		goto fail;
 	});
 	if (xlog_cursor_open(&cursor, path))
@@ -2084,23 +2089,20 @@ vy_run_write_index(struct vy_run *run, const char *dirpath,
 
 	ERROR_INJECT(ERRINJ_VY_INDEX_FILE_RENAME, {
 		diag_set(ClientError, ER_INJECTION, "vinyl index file rename");
-		xlog_close(&index_xlog, false);
-		return -1;
+		goto fail;
 	});
 
-	if (xlog_flush(&index_xlog) < 0 ||
-	    xlog_rename(&index_xlog) < 0)
+	if (xlog_close(&index_xlog) != 0 ||
+	    xlog_materialize(&index_xlog) != 0)
 		goto fail;
 
-	xlog_close(&index_xlog, false);
 	return 0;
 
 fail_rollback:
 	region_truncate(region, mem_used);
 	xlog_tx_rollback(&index_xlog);
 fail:
-	xlog_close(&index_xlog, false);
-	unlink(path);
+	xlog_discard(&index_xlog);
 	return -1;
 }
 
@@ -2195,6 +2197,7 @@ vy_run_writer_start_page(struct vy_run_writer *writer,
 	if (vy_page_info_create(page, writer->data_xlog.offset,
 				key, writer->cmp_def) != 0)
 		return -1;
+	run->info.page_count++;
 	xlog_tx_begin(&writer->data_xlog);
 	return 0;
 }
@@ -2218,7 +2221,7 @@ vy_run_writer_write_to_page(struct vy_run_writer *writer, struct vy_entry entry)
 	writer->last = entry;
 	vy_stmt_ref_if_possible(entry.stmt);
 	struct vy_run *run = writer->run;
-	struct vy_page_info *page = run->page_info + run->info.page_count;
+	struct vy_page_info *page = run->page_info + run->info.page_count - 1;
 	uint32_t *offset = (uint32_t *)ibuf_alloc(&writer->row_index_buf,
 						  sizeof(uint32_t));
 	if (offset == NULL) {
@@ -2246,7 +2249,8 @@ static int
 vy_run_writer_end_page(struct vy_run_writer *writer)
 {
 	struct vy_run *run = writer->run;
-	struct vy_page_info *page = run->page_info + run->info.page_count;
+	assert(run->info.page_count > 0);
+	struct vy_page_info *page = run->page_info + run->info.page_count - 1;
 
 	assert(page->row_count > 0);
 	assert(ibuf_used(&writer->row_index_buf) ==
@@ -2268,7 +2272,6 @@ vy_run_writer_end_page(struct vy_run_writer *writer)
 	if (written < 0)
 		return -1;
 	page->size = written;
-	run->info.page_count++;
 	vy_run_acct_page(run, page);
 	ibuf_reset(&writer->row_index_buf);
 	return 0;
@@ -2299,16 +2302,14 @@ out:
 /**
  * Destroy a run writer.
  * @param writer Writer to destroy.
- * @param reuse_fd True in a case of success run write. And else
- *        false.
  */
 static void
-vy_run_writer_destroy(struct vy_run_writer *writer, bool reuse_fd)
+vy_run_writer_destroy(struct vy_run_writer *writer)
 {
 	if (writer->last.stmt != NULL)
 		vy_stmt_unref_if_possible(writer->last.stmt);
 	if (xlog_is_open(&writer->data_xlog))
-		xlog_close(&writer->data_xlog, reuse_fd);
+		xlog_discard(&writer->data_xlog);
 	if (writer->bloom != NULL)
 		tuple_bloom_builder_delete(writer->bloom);
 	ibuf_destroy(&writer->row_index_buf);
@@ -2326,7 +2327,7 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 
 	struct vy_run *run = writer->run;
 	if (vy_run_is_empty(run)) {
-		vy_run_writer_destroy(writer, false);
+		vy_run_writer_destroy(writer);
 		rc = 0;
 		goto out;
 	}
@@ -2352,9 +2353,11 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 	});
 
 	/* Sync data and link the file to the final name. */
-	if (xlog_sync(&writer->data_xlog) < 0 ||
-	    xlog_rename(&writer->data_xlog) < 0)
+	if (xlog_close_reuse_fd(&writer->data_xlog, &run->fd) != 0 ||
+	    xlog_materialize(&writer->data_xlog) != 0) {
+		xlog_discard(&writer->data_xlog);
 		goto out;
+	}
 
 	if (writer->bloom != NULL) {
 		run->info.bloom = tuple_bloom_new(writer->bloom,
@@ -2366,8 +2369,7 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 			       writer->space_id, writer->iid) != 0)
 		goto out;
 
-	run->fd = writer->data_xlog.fd;
-	vy_run_writer_destroy(writer, true);
+	vy_run_writer_destroy(writer);
 	rc = 0;
 out:
 	region_truncate(&fiber()->gc, region_svp);
@@ -2377,7 +2379,7 @@ out:
 void
 vy_run_writer_abort(struct vy_run_writer *writer)
 {
-	vy_run_writer_destroy(writer, false);
+	vy_run_writer_destroy(writer);
 }
 
 int
@@ -2516,11 +2518,7 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	/* New run index is ready for write, unlink old file if exists */
 	vy_run_snprint_path(path, sizeof(path), dir,
 			    space_id, iid, run->id, VY_FILE_INDEX);
-	if (unlink(path) < 0 && errno != ENOENT) {
-		diag_set(SystemError, "failed to unlink file '%s'",
-			 path);
-		goto close_err;
-	}
+	xlog_remove_file(path, 0);
 	if (vy_run_write_index(run, dir, space_id, iid) != 0)
 		goto close_err;
 	return 0;
@@ -2548,7 +2546,7 @@ static int
 try_rmdir(const char *path)
 {
 	int rc = 0;
-	if (coio_rmdir(path) < 0) {
+	if (rmdir(path) < 0) {
 		if (errno != ENOENT) {
 			if (errno != ENOTEMPTY)
 				say_syserror("error while removing %s", path);
@@ -2560,10 +2558,14 @@ try_rmdir(const char *path)
 	return rc;
 }
 
-int
-vy_run_remove_files(const char *dir, uint32_t space_id,
-		    uint32_t iid, int64_t run_id)
+static ssize_t
+vy_run_remove_files_f(va_list ap)
 {
+	const char *dir = va_arg(ap, typeof(dir));
+	uint32_t space_id = va_arg(ap, typeof(space_id));
+	uint32_t iid = va_arg(ap, typeof(iid));
+	int64_t run_id = va_arg(ap, typeof(run_id));
+
 	ERROR_INJECT(ERRINJ_VY_GC,
 		     {say_error("error injection: vinyl run %lld not deleted",
 				(long long)run_id); return -1;});
@@ -2572,13 +2574,8 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
 	for (int type = 0; type < vy_file_MAX; type++) {
 		vy_run_snprint_path(path, sizeof(path), dir,
 				    space_id, iid, run_id, type);
-		if (coio_unlink(path) < 0) {
-			if (errno != ENOENT) {
-				say_syserror("error while removing %s", path);
-				ret = -1;
-			}
-		} else
-			say_info("removed %s", path);
+		if (!xlog_remove_file(path, XLOG_RM_VERBOSE))
+			ret = -1;
 	}
 	/* Remove the root directory if it's empty. */
 	vy_lsm_snprint_path(path, sizeof(path), dir, space_id, iid);
@@ -2587,6 +2584,13 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
 	vy_space_snprint_path(path, sizeof(path), dir, space_id);
 	try_rmdir(path);
 	return ret;
+}
+
+int
+vy_run_remove_files(const char *dir, uint32_t space_id,
+		    uint32_t iid, int64_t run_id)
+{
+	return coio_call(vy_run_remove_files_f, dir, space_id, iid, run_id);
 }
 
 /**
@@ -2641,11 +2645,10 @@ vy_slice_stream_search(struct vy_stmt_stream *virt_stream)
 		return -1;
 
 	bool unused;
-	stream->pos_in_page = vy_page_find_key(stream->page,
-					       stream->slice->begin,
-					       stream->cmp_def,
-					       stream->format,
-					       ITER_GE, &unused);
+	if (vy_page_find_key(stream->page, stream->slice->begin,
+			     stream->cmp_def, stream->format, ITER_GE,
+			     &stream->pos_in_page, &unused) != 0)
+		return -1;
 
 	if (stream->pos_in_page == stream->page->row_count) {
 		/* The first tuple is in the beginning of the next page */
@@ -2669,11 +2672,12 @@ vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 {
 	assert(virt_stream->iface->next == vy_slice_stream_next);
 	struct vy_slice_stream *stream = (struct vy_slice_stream *)virt_stream;
-	*ret = vy_entry_none();
 
 	/* If the slice is ended, return EOF */
-	if (stream->page_no > stream->slice->last_page_no)
+	if (stream->page_no > stream->slice->last_page_no) {
+		*ret = vy_entry_none();
 		return 0;
+	}
 
 	/* If current page is not already read, read it */
 	if (stream->page == NULL && vy_slice_stream_read_page(stream) != 0)
@@ -2690,6 +2694,7 @@ vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 	    stream->page_no >= stream->slice->last_page_no &&
 	    vy_entry_compare(entry, stream->slice->end, stream->cmp_def) >= 0) {
 		tuple_unref(entry.stmt);
+		*ret = vy_entry_none();
 		return 0;
 	}
 

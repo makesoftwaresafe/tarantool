@@ -47,29 +47,28 @@ g.test_atomic_options = function()
             {box.txn_isolation_level.READ_COMMITTED, {'table'}, 1, 2})
 
         -- Different invalid options
-        t.assert_error_msg_equals("Illegal parameters, unexpected option 'aa'",
+        t.assert_error_msg_equals("unexpected option 'aa'",
             box.atomic, {aa = 'bb'}, f)
 
-        t.assert_error_msg_equals("Illegal parameters, unexpected option 'aa'",
+        t.assert_error_msg_equals("unexpected option 'aa'",
             box.atomic, {txn_isolation = 0, aa = 'bb'}, f)
 
         t.assert_error_msg_equals(
-            "Illegal parameters, " ..
             "txn_isolation must be one of box.txn_isolation_level " ..
             "(keys or values)",
             box.atomic, {txn_isolation = 'wtf'}, f)
 
-        t.assert_error_msg_contains(
-            "attempt to call a nil value",
+        t.assert_error_msg_equals(
+            "Usage: box.atomic([opts, ]tx-function[, function-arguments]",
             box.atomic, {})
 
         -- Different invalid function objects
-        t.assert_error_msg_contains(
-            "attempt to call a table value",
+        t.assert_error_msg_equals(
+            "Usage: box.atomic([opts, ]tx-function[, function-arguments]",
             box.atomic, {}, {})
 
-        t.assert_error_msg_contains(
-            "attempt to call a nil value",
-            box.atomic, {})
+        t.assert_error_msg_equals(
+            "Usage: box.atomic([opts, ]tx-function[, function-arguments]",
+            box.atomic, {}, 7)
     end)
 end

@@ -1948,19 +1948,22 @@ sk1 = s:create_index('sk1', {parts={{2, 'number', is_nullable=true, exclude_null
 ...
 sk1.parts
 ---
-- - type: number
+- - fieldno: 2
+    sort_order: asc
+    type: number
     exclude_null: true
     is_nullable: true
-    fieldno: 2
 ...
 sk2 = s:create_index('sk2', {parts={{2, 'number', is_nullable=true, exclude_null=false}}})
 ---
 ...
 sk2.parts
 ---
-- - type: number
+- - fieldno: 2
+    sort_order: asc
+    type: number
+    exclude_null: false
     is_nullable: true
-    fieldno: 2
 ...
 s:insert{1, 1}
 ---
@@ -2018,8 +2021,7 @@ pk = s:create_index('primary', {parts={1, 'number'}})
 ...
 sk1 = s:create_index('sk1', {parts={{2, 'number', is_nullable=false, exclude_null=true}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: exclude_null=true and is_nullable=false
-    are incompatible'
+- error: 'options.parts[1]: exclude_null=true and is_nullable=false are incompatible'
 ...
 sk1 = s:create_index('sk1', {parts={{2, 'number', exclude_null=true}}})
 ---
@@ -2100,10 +2102,11 @@ sk1 = s:create_index('sk1', {parts={{2, 'number', exclude_null=true}}})
 ...
 sk1.parts
 ---
-- - type: number
+- - fieldno: 2
+    sort_order: asc
+    type: number
     exclude_null: true
     is_nullable: true
-    fieldno: 2
 ...
 s:select{}
 ---
@@ -2123,9 +2126,11 @@ sk1:alter({parts={{2, 'number', is_nullable=true, exclude_null=false}}})
 ...
 sk1.parts
 ---
-- - type: number
+- - fieldno: 2
+    sort_order: asc
+    type: number
+    exclude_null: false
     is_nullable: true
-    fieldno: 2
 ...
 sk1:select{}
 ---
@@ -2140,10 +2145,11 @@ sk1:alter({parts={{2, 'number', exclude_null=true}}})
 ...
 sk1.parts
 ---
-- - type: number
+- - fieldno: 2
+    sort_order: asc
+    type: number
     exclude_null: true
     is_nullable: true
-    fieldno: 2
 ...
 sk1:select{}
 ---
@@ -2153,15 +2159,15 @@ sk1:select{}
 -- Alter to the wrong format
 sk1:alter({parts={{2, 'number', is_nullable=false, exclude_null=true}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: exclude_null=true and is_nullable=false
-    are incompatible'
+- error: 'options.parts[1]: exclude_null=true and is_nullable=false are incompatible'
 ...
 sk1.parts
 ---
-- - type: number
+- - fieldno: 2
+    sort_order: asc
+    type: number
     exclude_null: true
     is_nullable: true
-    fieldno: 2
 ...
 -- Check that delete doesn't crash on sk1
 s:insert{5, box.NULL}
@@ -2454,9 +2460,11 @@ sk = s:create_index('sk', {parts = {2, is_nullable=true}})
 ...
 sk.parts
 ---
-- - type: scalar
+- - fieldno: 2
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: true
-    fieldno: 2
 ...
 sk:drop()
 ---
@@ -2466,10 +2474,12 @@ sk = s:create_index('sk', {parts = {2, is_nullable=true, collation='unicode'}})
 ...
 sk.parts
 ---
-- - type: scalar
-    is_nullable: true
+- - fieldno: 2
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     collation: unicode
-    fieldno: 2
+    is_nullable: true
 ...
 sk:drop()
 ---
@@ -2479,24 +2489,28 @@ sk = s:create_index('sk', {parts = {2, type='string', is_nullable=true, collatio
 ...
 sk.parts
 ---
-- - type: string
-    is_nullable: true
+- - fieldno: 2
+    sort_order: asc
+    type: string
+    exclude_null: false
     collation: unicode
-    fieldno: 2
+    is_nullable: true
 ...
 sk:drop()
 ---
 ...
 sk = s:create_index('sk', {parts = {2, is_nullable=true, 3}})
 ---
-- error: 'Illegal parameters, options.parts: unexpected option(s)'
+- error: 'options.parts: unexpected option(s)'
 ...
 sk.parts
 ---
-- - type: string
-    is_nullable: true
+- - fieldno: 2
+    sort_order: asc
+    type: string
+    exclude_null: false
     collation: unicode
-    fieldno: 2
+    is_nullable: true
 ...
 sk:drop()
 ---
@@ -2506,12 +2520,16 @@ sk = s:create_index('sk', {parts = {2, 3}})
 ...
 sk.parts
 ---
-- - type: scalar
+- - fieldno: 2
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: false
-    fieldno: 2
-  - type: scalar
+  - fieldno: 3
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: false
-    fieldno: 3
 ...
 sk:drop()
 ---
@@ -2521,15 +2539,21 @@ sk = s:create_index('sk', {parts = {2, 3, 4}})
 ...
 sk.parts
 ---
-- - type: scalar
+- - fieldno: 2
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: false
-    fieldno: 2
-  - type: scalar
+  - fieldno: 3
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: false
-    fieldno: 3
-  - type: scalar
+  - fieldno: 4
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: false
-    fieldno: 4
 ...
 sk:drop()
 ---
@@ -2539,12 +2563,16 @@ sk = s:create_index('sk', {parts = {{2, 'int'}, {3, 'string'}}})
 ...
 sk.parts
 ---
-- - type: integer
+- - fieldno: 2
+    sort_order: asc
+    type: integer
+    exclude_null: false
     is_nullable: false
-    fieldno: 2
-  - type: string
+  - fieldno: 3
+    sort_order: asc
+    type: string
+    exclude_null: false
     is_nullable: false
-    fieldno: 3
 ...
 sk:drop()
 ---
@@ -2554,13 +2582,17 @@ sk = s:create_index('sk', {parts = {{2, is_nullable=true}, {3, collation='unicod
 ...
 sk.parts
 ---
-- - type: scalar
+- - fieldno: 2
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: true
-    fieldno: 2
-  - type: scalar
-    is_nullable: false
+  - fieldno: 3
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     collation: unicode
-    fieldno: 3
+    is_nullable: false
 ...
 sk:drop()
 ---

@@ -28,7 +28,6 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-#include "unit.h"
 #include "exception.h"
 #include "fiber.h"
 #include "memory.h"
@@ -42,6 +41,9 @@
 
 #include "box/error.h"
 #include "box/mp_error.h"
+
+#define UNIT_TAP_COMPATIBLE 1
+#include "unit.h"
 
 enum {
 	MP_ERROR_STACK = 0x00
@@ -88,6 +90,8 @@ const char *standard_errors[] = {
 	"CryptoError",
 	"SSLError",
 	"FileFormatError",
+	"EncodeError",
+	"DecodeError",
 };
 
 enum {
@@ -380,6 +384,7 @@ test_fail_not_enough_fields()
 	uint32_t len = data - buffer;
 	const char *pos = buffer;
 	struct error *unpacked = error_unpack(&pos, len);
+	error_ref(unpacked);
 
 	isnt(unpacked, NULL, "check lack of fields");
 	is(strcmp(error_get_str(unpacked, "object_type"), err.ad_object_type),
@@ -387,6 +392,7 @@ test_fail_not_enough_fields()
 	is(strcmp(error_get_str(unpacked, "access_type"), err.ad_access_type),
 	   0, "access type");
 	is(error_get_str(unpacked, "object_name"), NULL, "object name");
+	error_unref(unpacked);
 	check_plan();
 	footer();
 }
@@ -461,7 +467,7 @@ static void
 test_payload(void)
 {
 	header();
-	plan(11);
+	plan(13);
 	char buffer[2048];
 	memset(buffer, 0, sizeof(buffer));
 
@@ -479,6 +485,9 @@ test_payload(void)
 	struct tt_uuid uuid;
 	tt_uuid_create(&uuid);
 	error_set_uuid(e, "key6", &uuid);
+	char mp[128];
+	size_t mp_size = mp_format(mp, lengthof(mp), "[%d, %s]", 7, "bye");
+	error_set_mp(e, "key7", mp, mp_size);
 
 	mp_encode_error(buffer, e);
 	error_unref(e);
@@ -507,6 +516,11 @@ test_payload(void)
 	struct tt_uuid val_uuid;
 	ok(error_get_uuid(e, "key6", &val_uuid) &&
 	   tt_uuid_is_equal(&uuid, &val_uuid), "key uuid");
+	uint32_t val_mp_size;
+	const char *val_mp = error_get_mp(e, "key7", &val_mp_size);
+	ok(val_mp_size == mp_size, "key msgpack size");
+	ok(val_mp != NULL &&
+	   memcmp(val_mp, mp, mp_size) == 0, "key msgpack data");
 
 	error_unref(e);
 
@@ -629,7 +643,10 @@ test_mp_print(void)
 				"\"file\": \"file1\", "
 				"\"message\": \"Unknown error\", "
 				"\"errno\": 0, "
-				"\"code\": 0"
+				"\"code\": 0, "
+				"\"fields\": {"
+					"\"name\": \"UNKNOWN\""
+				"}"
 			"}, "
 			"{"
 				"\"type\": \"CustomError\", "
@@ -654,7 +671,8 @@ test_mp_print(void)
 				"\"fields\": {"
 					"\"object_type\": \"field2\", "
 					"\"object_name\": \"field3\", "
-					"\"access_type\": \"field1\""
+					"\"access_type\": \"field1\", "
+					"\"user\": \"field4\""
 				"}"
 			"}"
 		"]"
@@ -694,7 +712,8 @@ test_mp_print(void)
 				"\"file\": \"file1\", "
 				"\"message\": \"Unknown error\", "
 				"\"errno\": 0, "
-				"\"code\": 0"
+				"\"code\": 0, "
+				"\"fields\": {...}"
 			"}, "
 			"{"
 				"\"type\": \"CustomError\", "

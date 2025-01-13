@@ -42,15 +42,15 @@ test_basic(void)
 	entry = vy_mem_insert_template(mem, &stmts[3]);
 	ok(vy_entry_is_equal(vy_mem_older_lsn(mem, entry), older),
 	   "vy_mem_rollback 1");
-	vy_mem_rollback_stmt(mem, older);
+	vy_mem_rollback_stmt(mem, older, &dummy_count);
 	ok(vy_entry_is_equal(vy_mem_older_lsn(mem, entry), olderolder),
 	   "vy_mem_rollback 2");
 
 	/* Check version  */
 	entry = vy_mem_insert_template(mem, &stmts[4]);
-	is(mem->version, 8, "vy_mem->version")
+	is(mem->version, 8, "vy_mem->version");
 	vy_mem_commit_stmt(mem, entry);
-	is(mem->version, 9, "vy_mem->version")
+	is(mem->version, 9, "vy_mem->version");
 
 	/* Clean up */
 	vy_mem_delete(mem);

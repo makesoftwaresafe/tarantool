@@ -354,16 +354,8 @@ sqlInsert(Parse * pParse,	/* Parser context */
 			pColumn->a[i].idx = -1;
 		}
 		for (i = 0; i < pColumn->nId; i++) {
-			for (j = 0; j < (int) space_def->field_count; j++) {
-				if (strcmp(pColumn->a[i].zName,
-					   space_def->fields[j].name) == 0) {
-					pColumn->a[i].idx = j;
-					if (i != j)
-						bIdListInOrder = 0;
-					break;
-				}
-			}
-			if (j >= (int) space_def->field_count) {
+			uint32_t id = sql_fieldno_by_id(space, &pColumn->a[i]);
+			if (id == UINT32_MAX) {
 				diag_set(ClientError,
 					 ER_NO_SUCH_FIELD_NAME_IN_SPACE,
 					 pColumn->a[i].zName,
@@ -371,7 +363,10 @@ sqlInsert(Parse * pParse,	/* Parser context */
 				pParse->is_aborted = true;
 				goto insert_cleanup;
 			}
-			if (bit_test(used_columns, j)) {
+			pColumn->a[i].idx = id;
+			if ((uint32_t)i != id)
+				bIdListInOrder = 0;
+			if (bit_test(used_columns, id)) {
 				const char *err = "table id list: duplicate "\
 						  "column name %s";
 				diag_set(ClientError, ER_SQL_PARSER_GENERIC,
@@ -379,7 +374,7 @@ sqlInsert(Parse * pParse,	/* Parser context */
 				pParse->is_aborted = true;
 				goto insert_cleanup;
 			}
-			bit_set(used_columns, j);
+			bit_set(used_columns, id);
 		}
 	}
 
@@ -565,19 +560,11 @@ sqlInsert(Parse * pParse,	/* Parser context */
 			}
 			if ((!useTempTable && !pList)
 			    || (pColumn && j >= pColumn->nId)) {
-				if (i == (int) autoinc_fieldno) {
-					sqlVdbeAddOp2(v, OP_Integer, -1,
-							  regCols + i + 1);
-				} else {
-					struct tuple_field *field =
-						tuple_format_field(
-							space->format, i);
-					struct Expr *dflt =
-						field->default_value_expr;
-					sqlExprCode(pParse,
-							dflt,
-							regCols + i + 1);
-				}
+				int reg = regCols + i + 1;
+				if (i == (int)autoinc_fieldno)
+					sqlVdbeAddOp2(v, OP_Integer, -1, reg);
+				else
+					sqlVdbeAddOp2(v, OP_Null, 0, reg);
 			} else if (useTempTable) {
 				sqlVdbeAddOp3(v, OP_Column, srcTab, j,
 						  regCols + i + 1);
@@ -629,16 +616,7 @@ sqlInsert(Parse * pParse,	/* Parser context */
 			}
 			if (j < 0 || nColumn == 0
 			    || (pColumn && j >= pColumn->nId)) {
-				if (i == (int) autoinc_fieldno) {
-					sqlVdbeAddOp2(v, OP_Null, 0, iRegStore);
-					continue;
-				}
-				struct tuple_field *field =
-					tuple_format_field(space->format, i);
-				struct Expr *dflt = field->default_value_expr;
-				sqlExprCodeFactorable(pParse,
-							  dflt,
-							  iRegStore);
+				sqlVdbeAddOp2(v, OP_Null, 0, iRegStore);
 			} else if (useTempTable) {
 				if (i == (int) autoinc_fieldno) {
 					int regTmp = ++pParse->nMem;
@@ -805,24 +783,23 @@ vdbe_emit_constraint_checks(struct Parse *parse_context, struct space *space,
 			on_conflict != ON_CONFLICT_ACTION_DEFAULT ?
 			on_conflict : def->fields[i].nullable_action;
 		/* ABORT is a default error action. */
-		if (on_conflict_nullable == ON_CONFLICT_ACTION_DEFAULT)
+		if (on_conflict_nullable == ON_CONFLICT_ACTION_DEFAULT ||
+		    on_conflict_nullable == ON_CONFLICT_ACTION_REPLACE)
 			on_conflict_nullable = ON_CONFLICT_ACTION_ABORT;
-		struct Expr *dflt = space_column_default_expr(def->id, i);
-		if (on_conflict_nullable == ON_CONFLICT_ACTION_REPLACE &&
-		    dflt == NULL)
-			on_conflict_nullable = ON_CONFLICT_ACTION_ABORT;
+		/* If default it set it will be inserted instead of NULL. */
+		if (on_conflict_nullable == ON_CONFLICT_ACTION_ABORT &&
+		    def->fields[i].default_value != NULL)
+			on_conflict_nullable = ON_CONFLICT_ACTION_NONE;
 		int addr;
 		switch (on_conflict_nullable) {
 		case ON_CONFLICT_ACTION_ABORT:
 		case ON_CONFLICT_ACTION_ROLLBACK:
 		case ON_CONFLICT_ACTION_FAIL:
-			err = tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-					 tt_sprintf("NOT NULL constraint "\
-						    "failed: %s.%s", def->name,
-						    def->fields[i].name));
+			err = tt_sprintf("NOT NULL constraint failed: %s.%s",
+					 def->name, def->fields[i].name);
 			addr = sqlVdbeAddOp1(v, OP_NotNull, new_tuple_reg + i);
-			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, err,
-				      P4_STATIC);
+			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0,
+				      sql_xstrdup(err), P4_DYNAMIC);
 			sqlVdbeAddOp2(v, OP_Halt, -1, on_conflict_nullable);
 			sqlVdbeJumpHere(v, addr);
 			break;
@@ -830,14 +807,8 @@ vdbe_emit_constraint_checks(struct Parse *parse_context, struct space *space,
 			sqlVdbeAddOp2(v, OP_IsNull, new_tuple_reg + i,
 					  ignore_label);
 			break;
-		case ON_CONFLICT_ACTION_REPLACE:
-			addr = sqlVdbeAddOp1(v, OP_NotNull,
-						  new_tuple_reg + i);
-			sqlExprCode(parse_context, dflt, new_tuple_reg + i);
-			sqlVdbeJumpHere(v, addr);
-			break;
 		default:
-			unreachable();
+			assert(on_conflict_nullable == ON_CONFLICT_ACTION_NONE);
 		}
 	}
 	sql_emit_table_types(v, space->def, new_tuple_reg);
@@ -1071,7 +1042,7 @@ xferOptimization(Parse * pParse,	/* Parser context */
 	 * we have to check the semantics.
 	 */
 	pItem = pSelect->pSrc->a;
-	struct space *src = space_by_name0(pItem->zName);
+	const struct space *src = sql_space_by_src(pItem);
 	/* FROM clause does not contain a real table. */
 	if (src == NULL)
 		return 0;
@@ -1100,18 +1071,6 @@ xferOptimization(Parse * pParse,	/* Parser context */
 		if (!dest->def->fields[i].is_nullable &&
 		    src->def->fields[i].is_nullable)
 			return 0;
-		/* Default values for second and subsequent columns need to match. */
-		if (i > 0) {
-			char *src_expr_str = src->def->fields[i].default_value;
-			char *dest_expr_str =
-				dest->def->fields[i].default_value;
-			if ((dest_expr_str == NULL) != (src_expr_str == NULL) ||
-			    (dest_expr_str &&
-			     strcmp(src_expr_str, dest_expr_str) != 0)
-			    ) {
-				return 0;	/* Default values must be the same for all columns */
-			}
-		}
 	}
 
 	for (uint32_t i = 0; i < dest->index_count; ++i) {

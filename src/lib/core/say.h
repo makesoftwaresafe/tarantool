@@ -413,12 +413,30 @@ _say_strerror(int errnum);
 				      format, ##__VA_ARGS__)
 /** \endcond public */
 
-#define panic_status(status, ...)	({ say(S_FATAL, NULL, __VA_ARGS__); exit(status); })
+#define panic_status(status, ...) ({\
+	say(S_FATAL, NULL, __VA_ARGS__); \
+	lsan_turn_off(); \
+	exit(status); \
+})
 #define panic(...)			panic_status(EXIT_FAILURE, __VA_ARGS__)
 #define panic_syserror(...)		({ \
 	say(S_FATAL, tt_strerror(errno), __VA_ARGS__); \
 	exit(EXIT_FAILURE); \
 })
+
+/**
+ * Log a message once.
+ */
+#define say_once(level, error, format, ...) ({				\
+	static bool done = false;					\
+	if (!done) {							\
+		say(level, error, format, ##__VA_ARGS__);		\
+		done = true;						\
+	}								\
+})
+
+#define say_warn_once(format, ...) \
+	say_once(S_WARN, NULL, format, ##__VA_ARGS__)
 
 enum {
 	/* 10 messages per 5 seconds. */
@@ -435,8 +453,8 @@ enum {
 	int suppressed = 0;						\
 	bool ret = ratelimit_check((rl), ev_monotonic_now(loop()),	\
 				   &suppressed);			\
-	if ((level) >= S_WARN && suppressed > 0)			\
-		say_warn("%d messages suppressed", suppressed);		\
+	if (suppressed > 0)			\
+		say(level, NULL, "%d messages suppressed", suppressed);	\
 	ret;								\
 })
 

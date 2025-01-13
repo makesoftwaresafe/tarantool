@@ -3,6 +3,8 @@ local t = require('luatest')
 
 local g = t.group()
 
+local is_enterprise = t.tarantool.is_enterprise_package()
+
 g.before_all(function(cg)
     cg.server = server:new{
         alias   = 'dflt',
@@ -64,6 +66,7 @@ local reference_table = {
         BIND_METADATA = 0x33,
         BIND_COUNT = 0x34,
         POSITION = 0x35,
+        ARROW = 0x36,
         SQL_TEXT = 0x40,
         SQL_BIND = 0x41,
         SQL_INFO = 0x42,
@@ -84,6 +87,11 @@ local reference_table = {
         INSTANCE_NAME = 0x5d,
         SPACE_NAME = 0x5e,
         INDEX_NAME = 0x5f,
+        TUPLE_FORMATS = 0x60,
+        IS_SYNC = 0x61,
+        IS_CHECKPOINT_JOIN = 0x62,
+        CHECKPOINT_VCLOCK = 0x63,
+        CHECKPOINT_LSN = 0x64,
     },
 
     -- `iproto_metadata_key` enumeration.
@@ -107,6 +115,7 @@ local reference_table = {
         CAN_LEAD = 0x07,
         BOOTSTRAP_LEADER_UUID = 0x08,
         REGISTERED_REPLICA_UUIDS = 0x09,
+        INSTANCE_NAME = 0x0a,
     },
 
     -- `iproto_type` enumeration.
@@ -128,6 +137,7 @@ local reference_table = {
         BEGIN = 14,
         COMMIT = 15,
         ROLLBACK = 16,
+        INSERT_ARROW = 17,
         RAFT = 30,
         RAFT_PROMOTE = 31,
         RAFT_DEMOTE = 32,
@@ -146,6 +156,7 @@ local reference_table = {
         WATCH = 74,
         UNWATCH = 75,
         EVENT = 76,
+        WATCH_ONCE = 77,
         CHUNK = 128,
         TYPE_ERROR = bit.lshift(1, 15),
         UNKNOWN = -1,
@@ -162,7 +173,7 @@ local reference_table = {
     },
 
     -- `IPROTO_CURRENT_VERSION` constant
-    protocol_version = 5,
+    protocol_version = 10,
 
     -- `feature_id` enumeration
     protocol_features = {
@@ -172,6 +183,13 @@ local reference_table = {
         watchers = true,
         pagination = true,
         space_and_index_names = true,
+        watch_once = true,
+        dml_tuple_extension = true,
+        call_ret_tuple_extension = true,
+        call_arg_tuple_extension = true,
+        fetch_snapshot_cursor = is_enterprise and true or nil,
+        is_sync = true,
+        insert_arrow = true,
     },
     feature = {
         streams = 0,
@@ -180,18 +198,21 @@ local reference_table = {
         watchers = 3,
         pagination = 4,
         space_and_index_names = 5,
+        watch_once = 6,
+        dml_tuple_extension = 7,
+        call_ret_tuple_extension = 8,
+        call_arg_tuple_extension = 9,
+        fetch_snapshot_cursor = 10,
+        is_sync = 11,
+        insert_arrow = 12,
     },
 }
 
 -- Checks that IPROTO constants and features are exported correctly.
 g.test_iproto_constants_and_features_export = function(cg)
     cg.server:exec(function(reference_table)
-        for k, v in pairs(box.iproto) do
-            local v_type = type(v)
-            if v_type ~= 'function' and v_type ~= 'thread' and
-               v_type ~= 'userdata' then
-                t.assert_equals(v, reference_table[k])
-            end
+        for k, v in pairs(reference_table) do
+            t.assert_equals(box.iproto[k], v)
         end
     end, {reference_table})
 end

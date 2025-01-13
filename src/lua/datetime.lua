@@ -7,7 +7,7 @@ local tz = require('timezones')
     values, where `dt` is a number of dates since Rata Die date (0001-01-01).
 
     `c-dt` uses 32-bit integer number to store `dt` values, so range of
-    suported dates is limited to dates from -5879610-06-22 (INT32_MIN) to
+    supported dates is limited to dates from -5879610-06-22 (INT32_MIN) to
     +5879611-07-11 (INT32_MAX).
 
     For better compactness of our typical data in MessagePack stream we shift
@@ -69,8 +69,7 @@ size_t tnt_datetime_to_string(const struct datetime * date, char *buf,
 size_t tnt_datetime_strftime(const struct datetime *date, char *buf,
                              uint32_t len, const char *fmt);
 ssize_t tnt_datetime_parse_full(struct datetime *date, const char *str,
-                                size_t len, const char *tzsuffix,
-                                int32_t offset);
+                                size_t len);
 ssize_t tnt_datetime_parse_tz(const char *str, size_t len, time_t base,
                               int16_t *tzoffset, int16_t *tzindex);
 size_t tnt_datetime_strptime(struct datetime *date, const char *buf,
@@ -253,7 +252,7 @@ local function check_str_or_nil(s, message)
 end
 
 -- range may be of a form of pair {from, to} or
--- tuple {fom, to, -1 in extra}
+-- tuple {from, to, -1 in extra}
 -- -1 is a special value (so far) used for days only
 local function check_range(v, from, to, txt, extra)
     if type(v) ~= 'number' then
@@ -294,7 +293,7 @@ local function checked_max_value(v, max, txt, def)
         error(('numeric value expected, but received %s'):
               format(type(v)), 2)
     end
-    if v > -max and v < max then
+    if v >= -max and v <= max then
         return v
     end
     error(('value %s of %s is out of allowed range [%s, %s]'):
@@ -304,6 +303,9 @@ end
 local function bool2int(b)
     return b and 1 or 0
 end
+
+-- Forward declaration.
+local datetime_set
 
 local adjust_xlat = {
     none = builtin.DT_LIMIT,
@@ -453,10 +455,7 @@ local function datetime_isdst(obj)
     return builtin.tnt_datetime_isdst(obj)
 end
 
---[[
-    Parse timezone name similar way as datetime_parse_full parse
-    full literal.
-]]
+-- Parse timezone name.
 local function parse_tzname(base_epoch, tzname)
     check_str(tzname, 'parse_tzname()')
     local ptzindex = date_int16_stash_take()
@@ -504,6 +503,7 @@ end
 
 local function get_timezone(offset, msg)
     if type(offset) == 'number' then
+        check_integer(offset, 'tzoffset')
         return offset
     elseif type(offset) == 'string' then
         return parse_tzoffset(offset)
@@ -527,31 +527,37 @@ local function datetime_new(obj)
     local y = obj.year
     if y ~= nil then
         check_range(y, MIN_DATE_YEAR, MAX_DATE_YEAR, 'year')
+        check_integer(y, 'year')
         ymd = true
     end
     local M = obj.month
     if M ~= nil then
         check_range(M, 1, 12, 'month')
+        check_integer(M, 'month')
         ymd = true
     end
     local d = obj.day
     if d ~= nil then
         check_range(d, 1, 31, 'day', -1)
+        check_integer(d, 'day')
         ymd = true
     end
     local h = obj.hour
     if h ~= nil then
         check_range(h, 0, 23, 'hour')
+        check_integer(h, 'hour')
         hms = true
     end
     local m = obj.min
     if m ~= nil then
         check_range(m, 0, 59, 'min')
+        check_integer(m, 'min')
         hms = true
     end
     local s = obj.sec
     if s ~= nil then
         check_range(s, 0, 60, 'sec')
+        check_integer(s, 'sec')
         hms = true
     end
 
@@ -565,12 +571,15 @@ local function datetime_new(obj)
         end
         if usec ~= nil then
             check_range(usec, 0, 1e6, 'usec')
+            check_integer(usec, 'usec')
             nsec = usec * 1e3
         elseif msec ~= nil then
             check_range(msec, 0, 1e3, 'msec')
+            check_integer(msec, 'msec')
             nsec = msec * 1e6
         else
             check_range(nsec, 0, 1e9, 'nsec')
+            check_integer(nsec, 'nsec')
         end
     else
         nsec = 0
@@ -862,10 +871,10 @@ end
        date [T] time [ ] time_zone
     Returns constructed datetime object and length of accepted string.
 ]]
-local function datetime_parse_full(str, tzname, offset)
+local function datetime_parse_full(str)
     check_str(str, 'datetime.parse()')
     local date = ffi.new(datetime_t)
-    local len = builtin.tnt_datetime_parse_full(date, str, #str, tzname, offset)
+    local len = builtin.tnt_datetime_parse_full(date, str, #str)
     if len > 0 then
         return date, tonumber(len)
     elseif len == -builtin.TZ_NYI then
@@ -904,9 +913,8 @@ local function datetime_parse_from(str, obj)
     end
     check_str_or_nil(fmt, 'datetime.parse()')
 
-    local offset = 0
     if tzoffset ~= nil then
-        offset = get_timezone(tzoffset, 'tzoffset')
+        local offset = get_timezone(tzoffset, 'tzoffset')
         check_range(offset, -720, 840, 'tzoffset')
     end
 
@@ -914,12 +922,24 @@ local function datetime_parse_from(str, obj)
         check_str(tzname, 'datetime.parse()')
     end
 
-    if not fmt or fmt == '' or fmt == 'iso8601' or fmt == 'rfc3339' then
-        -- Effect of .tz overrides .tzoffset
-        return datetime_parse_full(str, tzname, offset)
-    else
-        return datetime_parse_format(str, fmt)
+    if tzoffset and tzname then
+        error("ambiguous timezone: both tzoffset and tz are specified")
     end
+
+    local date, len
+    if not fmt or fmt == '' or fmt == 'iso8601' or fmt == 'rfc3339' then
+        date, len = datetime_parse_full(str)
+    else
+        date, len = datetime_parse_format(str, fmt)
+    end
+
+    -- Override timezone, if it was not specified in a parsed
+    -- string.
+    if date.tz == '' and date.tzoffset == 0 then
+        datetime_set(date, { tzoffset = tzoffset, tz = tzname })
+    end
+
+    return date, len
 end
 
 --[[
@@ -973,6 +993,8 @@ local function datetime_totable(self)
         isdst = datetime_isdst(self),
         nsec = self.nsec,
         tzoffset = self.tzoffset,
+        tz = self.tz,
+        timestamp = self.timestamp,
     }
 end
 
@@ -1002,7 +1024,7 @@ local function datetime_hms_update(self, h, m, s)
     self.epoch = secs_day + h * 3600 + m * 60 + s
 end
 
-local function datetime_set(self, obj)
+function datetime_set(self, obj)
     check_date(self, 'datetime.set()')
     check_table(obj, "datetime.set()")
 
@@ -1019,16 +1041,19 @@ local function datetime_set(self, obj)
     local y = obj.year
     if y ~= nil then
         check_range(y, MIN_DATE_YEAR, MAX_DATE_YEAR, 'year')
+        check_integer(y, 'year')
         ymd = true
     end
     local M = obj.month
     if M ~= nil then
         check_range(M, 1, 12, 'month')
+        check_integer(M, 'month')
         ymd = true
     end
     local d = obj.day
     if d ~= nil then
         check_range(d, 1, 31, 'day', -1)
+        check_integer(d, 'day')
         ymd = true
     end
 
@@ -1040,16 +1065,19 @@ local function datetime_set(self, obj)
     local h = obj.hour
     if h ~= nil then
         check_range(h, 0, 23, 'hour')
+        check_integer(h, 'hour')
         hms = true
     end
     local m = obj.min
     if m ~= nil then
         check_range(m, 0, 59, 'min')
+        check_integer(m, 'min')
         hms = true
     end
     local sec = obj.sec
     if sec ~= nil then
         check_range(sec, 0, 60, 'sec')
+        check_integer(sec, 'sec')
         hms = true
     end
 
@@ -1063,12 +1091,15 @@ local function datetime_set(self, obj)
         end
         if usec ~= nil then
             check_range(usec, 0, 1e6, 'usec')
+            check_integer(usec, 'usec')
             self.nsec = usec * 1e3
         elseif msec ~= nil then
             check_range(msec, 0, 1e3, 'msec')
+            check_integer(msec, 'msec')
             self.nsec = msec * 1e6
         elseif nsec ~= nil then
             check_range(nsec, 0, 1e9, 'nsec')
+            check_integer(nsec, 'nsec')
             self.nsec = nsec
         end
     end
@@ -1303,6 +1334,7 @@ ffi.metatype(interval_t, {
 
 local interval_mt = {
     new     = interval_new,
+    is_interval = is_interval,
 }
 
 return setmetatable(

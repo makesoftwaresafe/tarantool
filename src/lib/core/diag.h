@@ -95,10 +95,14 @@ struct error {
 	struct error_payload payload;
 	/** Line number. */
 	unsigned line;
-	/* Source file name. */
+	/** Source file name. */
 	char file[DIAG_FILENAME_MAX];
-	/* Error description. */
-	char errmsg[DIAG_ERRMSG_MAX];
+	/**
+	 * Error description. Points to the static buffer `errmsg_buf' if the
+	 * message fits into it, or to the dynamic buffer otherwise.
+	 */
+	char *errmsg;
+	char errmsg_buf[DIAG_ERRMSG_MAX];
 	/**
 	 * Link to the cause and effect of given error. The cause
 	 * creates the effect:
@@ -194,6 +198,18 @@ static inline void
 error_set_uuid(struct error *e, const char *name, const struct tt_uuid *value)
 {
 	error_payload_set_uuid(&e->payload, name, value);
+}
+
+static inline const char *
+error_get_mp(const struct error *e, const char *name, uint32_t *size)
+{
+	return error_payload_get_mp(&e->payload, name, size);
+}
+
+static inline void
+error_set_mp(struct error *e, const char *name, const char *src, uint32_t size)
+{
+	error_payload_set_mp(&e->payload, name, src, size);
 }
 
 static inline void
@@ -423,6 +439,12 @@ struct error *
 BuildCryptoError(const char *file, unsigned line, const char *format, ...);
 struct error *
 BuildRaftError(const char *file, unsigned line, const char *format, ...);
+struct error *
+BuildEncodeError(const char *file, unsigned line, const char *format,
+		 const char *details);
+struct error *
+BuildDecodeError(const char *file, unsigned line, const char *format,
+		 const char *details);
 
 /**
  * Allocate and create new FileFormatError. In case of OOM return OutOfMemory.

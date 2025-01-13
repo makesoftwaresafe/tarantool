@@ -40,7 +40,7 @@ extern "C" {
  * A public trigger fired on Raft state change, i.e. on a broadcast.
  * It's allowed to yield inside it, and it's run asynchronously.
  */
-extern struct rlist box_raft_on_broadcast;
+extern struct event *box_raft_on_election_event;
 
 enum election_mode {
 	ELECTION_MODE_INVALID = -1,
@@ -152,8 +152,21 @@ box_raft_set_election_fencing_mode(enum election_fencing_mode mode);
 void
 box_raft_election_fencing_pause(void);
 
+/**
+ * Resign RAFT leadership and freeze limbo regardless of
+ * box_election_fencing_mode. It waits until the elections
+ * begin. After the death-timeout expires, it starts a new
+ * round of elections.
+ */
+void
+box_raft_leader_step_off(void);
+
 void
 box_raft_init(void);
+
+/** Stop internal fibers. */
+void
+box_raft_shutdown(void);
 
 void
 box_raft_free(void);

@@ -22,6 +22,15 @@ static struct mh_strnptr_t *spaces_by_name;
  */
 uint32_t space_cache_version;
 
+/**
+ * Value of space_cache_version at the time of the last space lookup,
+ * see space_by_id_fast().
+ */
+uint32_t prev_space_cache_version;
+
+/** Last looked up space, see space_by_id_fast(). */
+struct space *prev_space;
+
 const char *space_cache_holder_type_strs[SPACE_HOLDER_MAX] = {
 	"foreign key",
 };
@@ -36,6 +45,12 @@ space_cache_init(void)
 void
 space_cache_destroy(void)
 {
+	mh_int_t i;
+	mh_foreach(spaces, i) {
+		struct space *space = mh_i32ptr_node(spaces, i)->val;
+		/** Spaces can be interconnected through constraints. */
+		space_cleanup_constraints(space);
+	}
 	while (mh_size(spaces) > 0) {
 		mh_int_t i = mh_first(spaces);
 
@@ -48,9 +63,8 @@ space_cache_destroy(void)
 	mh_strnptr_delete(spaces_by_name);
 }
 
-/** Return space by its number */
 struct space *
-space_by_id(uint32_t id)
+space_by_id_slow(uint32_t id)
 {
 	mh_int_t space = mh_i32ptr_find(spaces, id, NULL);
 	if (space == mh_end(spaces))
@@ -249,4 +263,13 @@ space_cache_is_pinned(struct space *space, enum space_cache_holder_type *type)
 		}
 	}
 	return false;
+}
+
+#undef space_by_id
+
+/** Define the space_by_id() symbol for FFI. */
+struct space *
+space_by_id(uint32_t id)
+{
+	return space_by_id_fast(id);
 }

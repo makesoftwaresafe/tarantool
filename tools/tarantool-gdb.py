@@ -3,8 +3,7 @@ GDB extension for Tarantool post-mortem analysis.
 To use, just put 'source <path-to-this-file>' in gdb.
 """
 
-import gdb.printing
-import gdb.types
+import gdb
 import argparse
 import base64
 import logging
@@ -24,7 +23,7 @@ logger = logging.getLogger('gdb.tarantool')
 logger.setLevel(logging.WARNING)
 
 def dump_type(type):
-    return 'tag={} code={}'.format(type.tag, type.code)
+    return 'tag={} code={} sizeof={}'.format(type.tag, type.code, type.sizeof)
 
 def equal_types(type1, type2):
     return type1.code == type2.code and type1.tag == type2.tag
@@ -382,9 +381,18 @@ class MsgPack(object):
                 cls.next_slowpath(data, k)
                 return
 
-    def to_string_data(cls, data, depth):
+    @classmethod
+    def to_string_data(cls, data, depth, expected_type=None):
         s = str()
         mp_type = cls.typeof(data)
+        if expected_type is not None and mp_type != expected_type:
+            gdb.write('Invalid msgpack: unexpected type {actual_type} at pos {data_pos} (expected {expected_type})\n'.format(
+                actual_type = mp_type,
+                data_pos = data.pos,
+                expected_type = expected_type,
+            ))
+            cls.next(data)
+            return '!error'
 
         if mp_type == cls.MP_NIL:
             cls.decode_nil(data)
@@ -492,6 +500,7 @@ class TtMsgPack(MsgPack):
     MP_ERROR = find_value('MP_ERROR')
     MP_COMPRESSION = find_value('MP_COMPRESSION')
     MP_INTERVAL = find_value('MP_INTERVAL')
+    MP_TUPLE = find_value('MP_TUPLE')
 
     UUID_PACKED_LEN = find_value('UUID_PACKED_LEN')
 
@@ -535,8 +544,6 @@ class TtMsgPack(MsgPack):
             clock_seq_low = data.read_u8(),
             node = [ data.read_u8() for _ in range(0, 6) ],
         ))
-        if not uuid.is_valid():
-            return uuid, "uuid_unpack: invalid uuid"
         return uuid, None
 
     @classmethod
@@ -733,6 +740,12 @@ class TtMsgPack(MsgPack):
         return str(itv)
 
     @classmethod
+    def to_string_tuple(cls, data, depth):
+        format_id = cls.to_string_data(data, depth, cls.MP_UINT)
+        payload = cls.to_string_data(data, depth, cls.MP_ARRAY)
+        return 'tuple(format_id={}):{}'.format(format_id, payload)
+
+    @classmethod
     def to_string_ext(cls, data, depth, ext_len, ext_type): # msgpack_snprint_ext
         pos = data.pos
 
@@ -748,6 +761,8 @@ class TtMsgPack(MsgPack):
             s = cls.to_string_compression(data, ext_len)
         elif ext_type == cls.MP_INTERVAL:
             s = cls.to_string_interval(data, ext_len)
+        elif ext_type == cls.MP_TUPLE:
+            s = cls.to_string_tuple(data, depth)
         else:
             return super(TtMsgPack, cls).to_string_ext(data, depth, ext_len, ext_type)
 
@@ -980,12 +995,6 @@ if find_type('struct tt_uuid') is not None:
     class Uuid:
         def __init__(self, val):
             self.val = val
-
-        def is_valid(self): # tt_uuid_validate
-            n = self.val['clock_seq_hi_and_reserved']
-            if (n & 0x80) != 0x00 and (n & 0xc0) != 0x80 and (n & 0xe0) != 0xc0:
-                return False
-            return True
 
         def __str__(self): # tt_uuid_to_string
             return '{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}'.format(
@@ -1663,6 +1672,7 @@ class RlistLut(ListLut):
         ('session_on_connect', 'trigger::link'),
         ('session_on_disconnect', 'trigger::link'),
         ('shutdown_list', 'session::in_shutdown_list'),
+        ('txns', 'txn::in_txns'),
     )
     _containers = (
         ('alter_space::ops', 'AlterSpaceOp::link'),
@@ -1718,7 +1728,6 @@ class RlistLut(ListLut):
         ('tx_manager::read_view_txs', 'txn::in_read_view_txs'),
         ('tx_manager::all_stories', 'memtx_story::in_all_stories'),
         ('tx_manager::traverse_all_stories', 'memtx_story::in_all_stories'), # struct rlist*
-        ('tx_manager::all_txs', 'txn::in_all_txs'),
         ('txn::conflict_list', 'tx_conflict_tracker::in_conflict_list'),
         ('txn::conflicted_by_list', 'tx_conflict_tracker::in_conflicted_by_list'),
         ('txn::gap_list', 'gap_item::in_gap_list'),
@@ -1749,7 +1758,6 @@ class RlistLut(ListLut):
         ('vy_recovery::lsms', 'vy_lsm_recovery_info::in_recovery'),
         ('vy_tx::on_destroy', 'trigger::link'),
         ('vy_tx_manager::read_views', 'vy_read_view::in_read_views'),
-        ('vy_tx_manager::writers', 'vy_tx::in_writers'),
         ('vy_write_iterator::src_list', 'vy_write_src::in_src_list'),
         ('wal_writer::watchers', 'wal_watcher::next'),
         ('watchable::pending_watchers', 'watcher::in_idle_or_pending'),
@@ -2154,13 +2162,13 @@ from_tt_list
         def create_predicate(gdb_condition, entry_info):
             substitutions = (
                 ('$index', lambda item: str(item[0])),
-                ('$item', lambda item: '(({}*){})'.format(
+                ('$item', lambda item: '(({}*){:#x})'.format(
                                 lst.item_gdb_type.tag,
                                 int_from_address(item[1])
                             )),
-                ('$entry', lambda item: '(({}*){})'.format(
+                ('$entry', lambda item: '(({}*){:#x})'.format(
                                 entry_info.container_type.tag,
-                                int_from_address(item[1])
+                                int_from_address(entry_info.container_from_field(item[1]))
                             )),
             )
             substitutions = filter(lambda s: gdb_condition.find(s[0]) != -1, substitutions)
@@ -2555,3 +2563,261 @@ Examples (repeat the command until the list is exhausted):
             TtListPrinter.reset_config()
 
 TtListWalk()
+
+
+def cord():
+    return gdb.parse_and_eval('cord_ptr')
+
+def fiber():
+    return cord()['fiber']
+
+
+class Cord(object):
+    __main_cord_fibers = gdb.parse_and_eval('main_cord.alive')
+    __list_entry_info = RlistLut.lookup_entry_info(__main_cord_fibers.address)
+
+    def __init__(self):
+        self.__cord_ptr = cord()
+
+    def fibers(self):
+        fibers = self.__cord_ptr['alive']
+        fibers = Rlist(fibers.address)
+        fibers = map(lambda x: self.__class__.__list_entry_info.container_from_field(x), fibers)
+        return itertools.chain(fibers, [self.__cord_ptr['sched'].address])
+
+    def fiber(self, fid):
+        return next((f for f in self.fibers() if f['fid'] == fid), None)
+
+
+try:
+    import gdb.unwinder
+    support_unwinders = True
+
+except ImportError as e:
+    support_unwinders = False
+    msg_cant_explore_fiber_stack = "Exploring stack of non-current fiber is not supported with this version of GDB."
+    gdb.write("WARNING: " + msg_cant_explore_fiber_stack + '\n')
+
+
+if support_unwinders:
+
+    class FiberUnwinderFrameFilter(object):
+        def __init__(self):
+            self.name = "TtFiberUnwinderFrameFilter"
+            self.priority = 100
+            self.enabled = True
+            self.skip_frame_sp = None
+            gdb.current_progspace().frame_filters[self.name] = self
+
+        def filter(self, frame_iter):
+            if self.skip_frame_sp is None:
+                return frame_iter
+            reg, val = self.skip_frame_sp
+            return filter(lambda f: f.inferior_frame().read_register(reg) != val, frame_iter)
+
+
+    class FrameId(object):
+        def __init__(self, sp, pc):
+            self.sp = sp
+            self.pc = pc
+
+    class FiberUnwinder(gdb.unwinder.Unwinder):
+        __instance = None
+
+        @classmethod
+        def instance(cls):
+            if cls.__instance is None:
+                cls.__instance = cls()
+            return cls.__instance
+
+        def __init__(self):
+            super(FiberUnwinder, self).__init__('TtFiberUnwinder')
+            self.reset_fiber()
+            self.__frame_filter = None
+
+            # Initialize architecture specific parameters of coro context
+            arch = gdb.selected_inferior().architecture().name().lower()
+            if arch.find('x86-64') != -1:
+                self.__coro_ctx_regs = [
+                    'r15',
+                    'r14',
+                    'r13',
+                    'r12',
+                    'rbx',
+                    'rbp',
+                    'rip',
+                ]
+                self.__ctx_offs_lr = self.__coro_ctx_regs.index('rip')
+                self.__reg_pc = 'rip'
+                self.__reg_sp = 'rsp'
+
+            elif arch.find('aarch64') != -1:
+                self.__coro_ctx_regs = [
+                    'x19', 'x20',
+                    'x21', 'x22',
+                    'x23', 'x24',
+                    'x25', 'x26',
+                    'x27', 'x28',
+                    'x29', 'x30',
+                    'd8',  'd9',
+                    'd10', 'd11',
+                    'd12', 'd13',
+                    'd14', 'd15',
+                ]
+                self.__ctx_offs_lr = self.__coro_ctx_regs.index('x30')
+                self.__reg_pc = 'pc'
+                self.__reg_sp = 'sp'
+
+            else:
+                raise gdb.GdbError("FiberUnwinder: architecture '{}' is not supported".format(arch))
+
+            if support_unwinders:
+                gdb.unwinder.register_unwinder(gdb.current_progspace(), self, True)
+
+        def fiber(self):
+            return self.__fiber if self.__cord == cord() else fiber()
+
+        def set_fiber(self, f):
+            self.__fiber = f
+            self.__cord = cord()
+
+        def reset_fiber(self):
+            self.set_fiber(fiber())
+
+        def __call__(self, pending_frame):
+            # Reset fiber if the unwinder is called due to thread (and hence cord) switching
+            if self.__cord != cord():
+                self.reset_fiber()
+
+            # Make sure unwinder frame filter is initialized
+            if self.__frame_filter is None:
+                self.__frame_filter = FiberUnwinderFrameFilter()
+
+            # For the currently running fiber use the default unwinder and don't filter frames
+            if self.fiber() == fiber():
+                self.__frame_filter.skip_frame_sp = None
+                return None
+
+            orig_sp = pending_frame.read_register(self.__reg_sp)
+            orig_pc = pending_frame.read_register(self.__reg_pc)
+
+            # Register 'sp' is used to identify that the outermost frame of the fiber has been
+            # injected already. After that proceed with the default unwinder.
+            reg_sp_exp = '${}'.format(self.__reg_sp)
+            if orig_sp != gdb.parse_and_eval(reg_sp_exp):
+                return None
+
+            # Frame matching actual stack pointer should be skipped as it refers to
+            # the running fiber
+            self.__frame_filter.skip_frame_sp = (self.__reg_sp, orig_sp)
+
+            # Get fiber stack
+            sp = self.fiber()['ctx']['sp']
+
+            # Create UnwindInfo. Usually the frame is identified by the stack
+            # pointer and the program counter.
+            unwind_info = pending_frame.create_unwind_info(FrameId(sp, orig_pc))
+
+            # Find the values of the registers in the caller's frame and
+            # save them in the result:
+            pc = (sp + self.__ctx_offs_lr).dereference()
+            for reg in self.__coro_ctx_regs:
+                unwind_info.add_saved_register(reg, sp.dereference())
+                sp += 1
+            unwind_info.add_saved_register(self.__reg_pc, pc)
+            unwind_info.add_saved_register(self.__reg_sp, sp)
+
+            # Return the result:
+            return unwind_info
+
+
+class FibersInfo(gdb.Command):
+    """Display currently known tarantool fibers of the current cord.
+Usage: info tt-fibers [ID]...
+If ID is given, it is a space-separated list of IDs of fibers to display.
+Otherwise, all fibers of the current cord are displayed."""
+
+    def __init__(self):
+        super(FibersInfo, self).__init__("info tt-fibers", gdb.COMMAND_STATUS)
+
+    def invoke(self, arg, from_tty):
+        # Prepare sequence of fibers
+        fibers = Cord().fibers()
+        ids = arg.split()
+        if len(ids) > 0:
+            ids = set(map(lambda x: int(x), ids))
+            fibers = filter(lambda f: int(f['fid']) in ids, fibers)
+
+        fiber_cur = fiber()
+        fiber_to_unwind = FiberUnwinder.instance().fiber() if support_unwinders else fiber_cur
+        gdb.write('{marker_cur} {id:6} {target:8} {name:32} {marker_unwind} {stack:18} {func}\n'.format(
+            marker_cur=' ',
+            marker_unwind=' ',
+            id='Id',
+            target='Target',
+            name='Name',
+            stack='Stack',
+            func='Function',
+        ))
+        for f in fibers:
+            gdb.write('{marker_cur} {id:6} {target:8} {name:32} {marker_unwind} {stack:18} {func}\n'.format(
+                marker_cur='*' if f == fiber_cur else ' ',
+                marker_unwind='*' if f == fiber_to_unwind else ' ',
+                id=str(f['fid']),
+                target='TtFiber',
+                name='"' + f['name'].string() + '"',
+                stack=str(f['ctx']['sp']),
+                func=f['f'],
+            ))
+
+FibersInfo()
+
+
+class Fiber(gdb.Command):
+    """tt-fiber [FIBER_ID]
+Use this command to select fiber which stack need to be explored.
+FIBER_ID must be currently known, if omitted displays current fiber info.
+
+Please, be aware that the outermost frame (level #0) is filtered out for
+any fiber other than the one that is currently running, so backtrace in
+this case starts with level #1 frame. It's because GDB always starts frame
+sequence with a frame that matches actual value of the stack pointer register,
+but this frame only makes sense for the currently running fiber.
+
+Please, note that this command does NOT change currently running fiber,
+it just selects stack to explore w/o changing any register/data."""
+
+    def __init__(self):
+        super(Fiber, self).__init__("tt-fiber", gdb.COMMAND_RUNNING)
+
+    def invoke(self, arg, from_tty):
+        if not support_unwinders:
+            raise gdb.GdbError(msg_cant_explore_fiber_stack)
+
+        if not arg:
+            f = FiberUnwinder.instance().fiber()
+            gdb.write('Current fiber is {id} "{name}" {func}\n'.format(
+                id=f['fid'],
+                name=f['name'].string(),
+                func=f['f'],
+            ))
+            return
+
+        argv = gdb.string_to_argv(arg)
+        try:
+            fid = int(argv[0])
+        except Exception as e:
+            gdb.write('Invalid fiber ID: {}\n'.format(argv[0]))
+            return
+
+        f = Cord().fiber(fid)
+        if f is None:
+            gdb.write("Unknown fiber {}.\n".format(argv[0]))
+            return
+
+        FiberUnwinder.instance().set_fiber(f)
+        gdb.invalidate_cached_frames()
+
+        gdb.execute('frame {}'.format(0 if f == fiber() else 1))
+
+Fiber()

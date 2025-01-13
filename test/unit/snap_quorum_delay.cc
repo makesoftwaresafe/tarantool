@@ -78,7 +78,6 @@ enum process_type {
  * (to push a transaction to the limbo and simulate confirm).
  */
 const int fake_lsn = 1;
-extern "C" int instance_id;
 const int relay_id = 2;
 
 int
@@ -107,8 +106,8 @@ txn_process_func(va_list ap)
 	 * Instead, we push the transaction to the limbo manually
 	 * and call txn_commit (or another) later.
 	 */
-	struct txn_limbo_entry *entry = txn_limbo_append(&txn_limbo,
-							 instance_id, txn);
+	struct txn_limbo_entry *entry = txn_limbo_append(
+		&txn_limbo, instance_id, txn, 0);
 	/*
 	 * The trigger is used to verify that the transaction has been
 	 * completed.

@@ -7,6 +7,7 @@
 
 #include <assert.h>
 #include "assoc.h"
+#include "func.h"
 
 /** ID -> func dictionary. */
 static struct mh_i32ptr_t *funcs;
@@ -16,6 +17,8 @@ static struct mh_strnptr_t *funcs_by_name;
 const char *func_cache_holder_type_strs[FUNC_HOLDER_MAX] = {
 	[FUNC_HOLDER_CONSTRAINT] = "constraint",
 	[FUNC_HOLDER_SPACE_UPGRADE] = "space upgrade",
+	[FUNC_HOLDER_FIELD_DEFAULT] = "field default value",
+	[FUNC_HOLDER_TRIGGER] = "trigger",
 };
 
 void
@@ -65,7 +68,7 @@ func_cache_delete(uint32_t fid)
 	mh_i32ptr_del(funcs, k, NULL);
 	k = mh_strnptr_find_str(funcs_by_name, func->def->name,
 				strlen(func->def->name));
-	if (k != mh_end(funcs))
+	if (k != mh_end(funcs_by_name))
 		mh_strnptr_del(funcs_by_name, k, NULL);
 }
 

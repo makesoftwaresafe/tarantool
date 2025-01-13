@@ -282,6 +282,8 @@ static const struct index_vtab session_settings_index_vtab = {
 	/* .get = */ session_settings_index_get,
 	/* .replace = */ generic_index_replace,
 	/* .create_iterator = */ session_settings_index_create_iterator,
+	/* .create_iterator_with_offset = */
+	generic_index_create_iterator_with_offset,
 	/* .create_read_view = */ generic_index_create_read_view,
 	/* .stat = */ generic_index_stat,
 	/* .compact = */ generic_index_compact,
@@ -342,14 +344,8 @@ session_settings_space_execute_update(struct space *space, struct txn *txn,
 
 	const char *new_key, *key = request->key;
 	uint32_t new_size, new_key_len, key_len = mp_decode_array(&key);
-	if (key_len == 0) {
-		diag_set(ClientError, ER_EXACT_MATCH, 1, 0);
+	if (exact_key_validate(pk_def, key, key_len) != 0)
 		return -1;
-	}
-	if (key_len > 1 || mp_typeof(*key) != MP_STR) {
-		diag_set(ClientError, ER_KEY_PART_TYPE, 0, "string");
-		return -1;
-	}
 	key = mp_decode_str(&key, &key_len);
 	key = tt_cstr(key, key_len);
 	sid = session_setting_find(key);
@@ -362,8 +358,10 @@ session_settings_space_execute_update(struct space *space, struct txn *txn,
 				       old_data, old_data_end, format,
 				       &new_size, request->index_base,
 				       &column_mask);
-	if (new_data == NULL)
+	if (new_data == NULL) {
+		error_set_index(diag_last_error(diag_get()), pk_def);
 		goto finish;
+	}
 	*result = box_tuple_new(format, new_data, new_data + new_size);
 	if (*result == NULL)
 		goto finish;
@@ -374,8 +372,13 @@ session_settings_space_execute_update(struct space *space, struct txn *txn,
 				       column_mask)) {
 		if (key_len != new_key_len ||
 		    memcmp(key, new_key, key_len) != 0) {
+			struct tuple *old_tuple =
+				tuple_new(format, old_data, old_data_end);
 			diag_set(ClientError, ER_CANT_UPDATE_PRIMARY_KEY,
-				 space_name(space));
+				 space_name(space), space_id(space),
+				 old_tuple, *result,
+				 NULL);
+			tuple_delete(old_tuple);
 			goto finish;
 		}
 	}
@@ -409,17 +412,9 @@ session_settings_space_create_index(struct space *space, struct index_def *def)
 		return NULL;
 	}
 
-	struct session_settings_index *index =
-		(struct session_settings_index *)calloc(1, sizeof(*index));
-	if (index == NULL) {
-		diag_set(OutOfMemory, sizeof(*index), "calloc", "index");
-		return NULL;
-	}
-	if (index_create(&index->base, space->engine,
-			 &session_settings_index_vtab, def) != 0) {
-		free(index);
-		return NULL;
-	}
+	struct session_settings_index *index = xcalloc(1, sizeof(*index));
+	index_create(&index->base, space->engine, &session_settings_index_vtab,
+		     def);
 
 	index->format = space->format;
 	return &index->base;
@@ -432,6 +427,7 @@ const struct space_vtab session_settings_space_vtab = {
 	/* .execute_delete = */ session_settings_space_execute_delete,
 	/* .execute_update = */ session_settings_space_execute_update,
 	/* .execute_upsert = */ session_settings_space_execute_upsert,
+	/* .execute_insert_arrow = */ generic_space_execute_insert_arrow,
 	/* .ephemeral_replace = */ generic_space_ephemeral_replace,
 	/* .ephemeral_delete = */ generic_space_ephemeral_delete,
 	/* .ephemeral_rowid_next = */ generic_space_ephemeral_rowid_next,
@@ -445,6 +441,7 @@ const struct space_vtab session_settings_space_vtab = {
 	/* .build_index = */ generic_space_build_index,
 	/* .swap_index = */ generic_space_swap_index,
 	/* .prepare_alter = */ generic_space_prepare_alter,
+	/* .finish_alter = */ generic_space_finish_alter,
 	/* .prepare_upgrade = */ generic_space_prepare_upgrade,
 	/* .invalidate = */ generic_space_invalidate,
 };
