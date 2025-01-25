@@ -35,13 +35,14 @@ struct space_read_view {
 	/** Space name. */
 	char *name;
 	/**
-	 * Tuple field definition array used by this space. Allocated only if
+	 * Tuple format data used by this space. Allocated only if
 	 * read_view_opts::enable_field_names is set, otherwise set to NULL.
-	 * Used for creation of space_read_view::format.
+	 * Used for creation of space_read_view::format and
+	 * box_raw_read_view_space::fields.
 	 */
-	struct field_def *fields;
-	/** Number of entries in the fields array. */
-	uint32_t field_count;
+	char *format_data;
+	/** Length of tuple format data. */
+	size_t format_data_len;
 	/**
 	 * Runtime tuple format needed to access tuple field names by name.
 	 * Referenced (ref counter incremented).
@@ -162,10 +163,10 @@ struct read_view_opts {
 	 */
 	bool enable_space_upgrade;
 	/**
-	 * Temporary spaces aren't included into this read view unless this
+	 * Data-temporary spaces aren't included into this read view unless this
 	 * flag is set.
 	 */
-	bool enable_temporary_spaces;
+	bool enable_data_temporary_spaces;
 	/**
 	 * Memtx-specific. Disables decompression of tuples fetched from
 	 * the read view. Setting this flag makes the raw read view methods

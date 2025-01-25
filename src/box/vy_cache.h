@@ -119,6 +119,8 @@ struct vy_cache_env {
 	struct rlist cache_lru;
 	/** Common mempool for vy_cache_node struct */
 	struct mempool cache_node_mempool;
+	/** Common matras extent allocator. */
+	struct matras_allocator allocator;
 	/** Size of memory occupied by cached tuples */
 	size_t mem_used;
 	/** Max memory size that can be used for cache */
@@ -232,6 +234,14 @@ vy_cache_get(struct vy_cache *cache, struct vy_entry key);
 void
 vy_cache_on_write(struct vy_cache *cache, struct vy_entry entry,
 		  struct vy_entry *deleted);
+
+/**
+ * Invalidate cache on statement rollback.
+ * @param cache - pointer to tuple cache.
+ * @param entry - rolled back statement.
+ */
+void
+vy_cache_on_rollback(struct vy_cache *cache, struct vy_entry entry);
 
 
 /**

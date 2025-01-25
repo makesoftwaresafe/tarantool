@@ -1,15 +1,13 @@
-# Enable systemd for on RHEL >= 7 and Fedora >= 15
-%if (0%{?fedora} >= 15 || 0%{?rhel} >= 7)
-%bcond_without systemd
-%else
-%bcond_with systemd
-%endif
-
 # XXX: There is an old CMake (2.8.12) provided by cmake package in
 # main CentOS 7 repositories. At the same time, there is a newer
 # package cmake3 providing CMake 3+ from EPEL repository. So, one
 # need to use cmake3 package to build Tarantool on old systems.
 %define use_cmake3 0%{?rhel} == 7
+
+%define _cmake_build_type "%{getenv:CMAKE_BUILD_TYPE}"
+%if %{_cmake_build_type} == ""
+%define _cmake_build_type RelWithDebInfo
+%endif
 
 # Get ${GC64} env variable which can keep the value of 'true' or 'false' to
 # enable or disable luajit gc64.
@@ -49,32 +47,6 @@ Requires(pre): %{_sbindir}/groupadd
 BuildRequires: zlib-devel
 Requires: zlib
 
-%if %{with systemd}
-Requires(post): systemd
-Requires(preun): systemd
-Requires(postun): systemd
-BuildRequires: systemd
-%else
-Requires(post): chkconfig
-Requires(post): initscripts
-Requires(preun): chkconfig
-Requires(preun): initscripts
-%endif
-
-# Enable backtraces everywhere, except ancient GCC versions, which
-# lack compiler features required for backtrace.
-%define __cc "%{getenv:CC}"
-%if %{__cc} == ""
-%define __cc "cc"
-%endif
-%if "%(printf '%%s\n' "5.3.0" "$(%{__cc} -dumpfullversion -dumpversion)" | sort -V | head -n1)" == "5.3.0"
-%bcond_without backtrace
-%else
-%bcond_with backtrace
-%endif
-%undefine __cc
-
-%if %{with backtrace}
 #
 # Disable stripping of /usr/bin/tarantool to allow the debug symbols
 # in runtime. Tarantool uses the debug symbols to display fiber's stack
@@ -84,7 +56,6 @@ Requires(preun): initscripts
 %global debug_package %{nil}
 %global __os_install_post /usr/lib/rpm/brp-compress %{nil}
 %global __strip /bin/true
-%endif
 
 # Set dependences for tests.
 BuildRequires: python3
@@ -174,19 +145,9 @@ C and Lua/C modules.
 %cmake \
 %endif
        -B . \
-         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+         -DCMAKE_BUILD_TYPE=%{_cmake_build_type} \
          -DCMAKE_INSTALL_LOCALSTATEDIR:PATH=%{_localstatedir} \
          -DCMAKE_INSTALL_SYSCONFDIR:PATH=%{_sysconfdir} \
-%if %{with backtrace}
-         -DENABLE_BACKTRACE:BOOL=ON \
-%else
-         -DENABLE_BACKTRACE:BOOL=OFF \
-%endif
-%if %{with systemd}
-         -DWITH_SYSTEMD:BOOL=ON \
-         -DSYSTEMD_UNIT_DIR:PATH=%{_unitdir} \
-         -DSYSTEMD_TMPFILES_DIR:PATH=%{_tmpfilesdir} \
-%endif
 %if 0%{?fedora} >= 33
          -DENABLE_LTO=ON \
 %endif
@@ -212,59 +173,12 @@ make test-force
 /usr/sbin/useradd -M %{?rhel:-N} -g tarantool -r -d /var/lib/tarantool -s /sbin/nologin\
     -c "Tarantool Server" tarantool > /dev/null 2>&1 || :
 
-%post
-%if %{with systemd}
-%tmpfiles_create tarantool.conf
-%systemd_post tarantool@.service
-%else
-chkconfig --add tarantool || :
-%endif
-
-%preun
-%if %{with systemd}
-%systemd_preun tarantool@.service
-%else
-if [ $1 -eq 0 ] ; then # uninstall
-    service tarantool stop || :
-    chkconfig --del tarantool || :
-fi
-%endif
-
-%postun
-%if %{with systemd}
-%systemd_postun_with_restart tarantool@.service
-%endif
-
 %files
 %{_bindir}/tarantool
 %{_mandir}/man1/tarantool.1*
 %doc README.md
 %{!?_licensedir:%global license %doc}
 %license LICENSE AUTHORS
-
-%{_bindir}/tarantoolctl
-%{_mandir}/man1/tarantoolctl.1*
-%config(noreplace) %{_sysconfdir}/sysconfig/tarantool
-%dir %{_sysconfdir}/tarantool
-%dir %{_sysconfdir}/tarantool/instances.available
-%config(noreplace) %{_sysconfdir}/tarantool/instances.available/example.lua
-# Use 0750 for database files
-%attr(0750,tarantool,tarantool) %dir %{_localstatedir}/lib/tarantool/
-%attr(0750,tarantool,tarantool) %dir %{_localstatedir}/log/tarantool/
-%config(noreplace) %{_sysconfdir}/logrotate.d/tarantool
-# tarantool package should own module directories
-%dir %{_libdir}/tarantool
-%dir %{_datadir}/tarantool
-%{_datadir}/tarantool/luarocks
-
-%if %{with systemd}
-%{_unitdir}/tarantool@.service
-%{_tmpfilesdir}/tarantool.conf
-%else
-%{_sysconfdir}/init.d/tarantool
-%dir %{_sysconfdir}/tarantool/instances.enabled
-%attr(-,tarantool,tarantool) %dir %{_localstatedir}/run/tarantool/
-%endif
 
 %files devel
 %dir %{_includedir}/tarantool

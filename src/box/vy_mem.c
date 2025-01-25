@@ -71,9 +71,10 @@ vy_mem_env_destroy(struct vy_mem_env *env)
 /** {{{ vy_mem */
 
 static void *
-vy_mem_tree_extent_alloc(void *ctx)
+vy_mem_tree_extent_alloc(struct matras_allocator *allocator)
 {
-	struct vy_mem *mem = (struct vy_mem *) ctx;
+	struct vy_mem *mem = container_of(allocator, struct vy_mem,
+					  matras_allocator);
 	struct vy_mem_env *env = mem->env;
 	void *ret = lsregion_aligned_alloc(&env->allocator,
 					   VY_MEM_TREE_EXTENT_SIZE,
@@ -89,10 +90,10 @@ vy_mem_tree_extent_alloc(void *ctx)
 }
 
 static void
-vy_mem_tree_extent_free(void *ctx, void *p)
+vy_mem_tree_extent_free(struct matras_allocator *allocator, void *p)
 {
 	/* Can't free part of region allocated memory. */
-	(void)ctx;
+	(void)allocator;
 	(void)p;
 }
 
@@ -114,9 +115,12 @@ vy_mem_new(struct vy_mem_env *env, struct key_def *cmp_def,
 	index->space_cache_version = space_cache_version;
 	index->format = format;
 	tuple_format_ref(format);
+	matras_allocator_create(&index->matras_allocator,
+				VY_MEM_TREE_EXTENT_SIZE,
+				vy_mem_tree_extent_alloc,
+				vy_mem_tree_extent_free);
 	vy_mem_tree_create(&index->tree, cmp_def,
-			   vy_mem_tree_extent_alloc,
-			   vy_mem_tree_extent_free, index, NULL);
+			   &index->matras_allocator, NULL);
 	rlist_create(&index->in_sealed);
 	fiber_cond_create(&index->pin_cond);
 	return index;
@@ -126,6 +130,13 @@ void
 vy_mem_delete(struct vy_mem *index)
 {
 	index->env->tree_extent_size -= index->tree_extent_size;
+	/*
+	 * It would be expected to destroy the index->matras_allocator and
+	 * the index->tree here, but they simply free allocated and reserved
+	 * memory blocks, and the lsregion used for allocation of the memory
+	 * does not support freeing arbitrary blocks, so they're effectively
+	 * no-ops. Let's omit them.
+	 */
 	tuple_format_unref(index->format);
 	fiber_cond_destroy(&index->pin_cond);
 	TRASH(index);
@@ -153,7 +164,8 @@ vy_mem_older_lsn(struct vy_mem *mem, struct vy_entry entry)
 }
 
 int
-vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry)
+vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry,
+		     struct vy_stmt_counter *count)
 {
 	assert(vy_stmt_type(entry.stmt) == IPROTO_UPSERT);
 	/* Check if the statement can be inserted in the vy_mem. */
@@ -169,9 +181,12 @@ vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry)
 	assert(! vy_mem_tree_iterator_is_invalid(&inserted));
 	assert(vy_entry_is_equal(entry,
 		*vy_mem_tree_iterator_get_elem(&mem->tree, &inserted)));
-	if (replaced.stmt == NULL)
+	if (replaced.stmt == NULL) {
 		mem->count.rows++;
+		count->rows++;
+	}
 	mem->count.bytes += size;
+	count->bytes += size;
 	/*
 	 * All iterators begin to see the new statement, and
 	 * will be aborted in case of rollback.
@@ -213,7 +228,8 @@ vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry)
 }
 
 int
-vy_mem_insert(struct vy_mem *mem, struct vy_entry entry)
+vy_mem_insert(struct vy_mem *mem, struct vy_entry entry,
+	      struct vy_stmt_counter *count)
 {
 	assert(vy_stmt_type(entry.stmt) != IPROTO_UPSERT);
 	/* Check if the statement can be inserted in the vy_mem. */
@@ -225,9 +241,12 @@ vy_mem_insert(struct vy_mem *mem, struct vy_entry entry)
 	struct vy_entry replaced = vy_entry_none();
 	if (vy_mem_tree_insert(&mem->tree, entry, &replaced, NULL))
 		return -1;
-	if (replaced.stmt == NULL)
+	if (replaced.stmt == NULL) {
 		mem->count.rows++;
+		count->rows++;
+	}
 	mem->count.bytes += size;
+	count->bytes += size;
 	/*
 	 * All iterators begin to see the new statement, and
 	 * will be aborted in case of rollback.
@@ -259,16 +278,25 @@ vy_mem_commit_stmt(struct vy_mem *mem, struct vy_entry entry)
 }
 
 void
-vy_mem_rollback_stmt(struct vy_mem *mem, struct vy_entry entry)
+vy_mem_rollback_stmt(struct vy_mem *mem, struct vy_entry entry,
+		     struct vy_stmt_counter *count)
 {
-	/* This is the statement we've inserted before. */
+	/* The statement must be from a lsregion. */
 	assert(!vy_stmt_is_refable(entry.stmt));
-	int rc = vy_mem_tree_delete(&mem->tree, entry);
-	assert(rc == 0);
-	(void) rc;
-	/* We can't free memory in case of rollback. */
-	mem->count.rows--;
-	mem->version++;
+	/*
+	 * The statement isn't present in the memory tree if it was replaced by
+	 * vy_mem_insert(). In this case we must not decrement the row count.
+	 *
+	 * Either way, we don't subtract the statement size because lsregion
+	 * doesn't support freeing memory.
+	 */
+	struct vy_entry deleted = vy_entry_none();
+	VERIFY(vy_mem_tree_delete(&mem->tree, entry, &deleted) == 0);
+	if (deleted.stmt != NULL) {
+		mem->version++;
+		mem->count.rows--;
+		count->rows--;
+	}
 }
 
 /* }}} vy_mem */

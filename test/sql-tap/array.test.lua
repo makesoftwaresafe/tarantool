@@ -1,8 +1,8 @@
 #!/usr/bin/env tarantool
 local test = require("sqltester")
-test:plan(117)
+test:plan(115)
 
-box.schema.func.create('A1', {
+box.schema.func.create('a1', {
     language = 'Lua',
     body = 'function(a) return {a} end',
     returns = 'array',
@@ -10,7 +10,7 @@ box.schema.func.create('A1', {
     exports = {'LUA', 'SQL'}
 });
 
-box.schema.func.create('A2', {
+box.schema.func.create('a2', {
     language = 'Lua',
     body = 'function(a, b) return {a, b} end',
     returns = 'array',
@@ -18,7 +18,7 @@ box.schema.func.create('A2', {
     exports = {'LUA', 'SQL'}
 });
 
-box.schema.func.create('A3', {
+box.schema.func.create('a3', {
     language = 'Lua',
     body = 'function(a, b, c) return {a, b, c} end',
     returns = 'array',
@@ -34,7 +34,7 @@ test:do_execsql_test(
     ]], {
     })
 
-box.space.T:insert({0, {1, 2, 3, 4}})
+box.space.t:insert({0, {1, 2, 3, 4}})
 
 -- Make sure it is possible to select from ARRAY field.
 test:do_execsql_test(
@@ -984,7 +984,8 @@ test:do_execsql_test(
     [[
         SELECT [a, g, t, n, f, i, b, v, s, d, u] FROM t1 WHERE id = 1;
     ]], {
-        {{1}, 1, '1', 1, 1, 1, true, '1', 1, require('decimal').new(1),
+        {{1}, 1, '1', 1, 1, 1, true, require('varbinary').new('1'), 1,
+         require('decimal').new(1),
          require('uuid').fromstr('11111111-1111-1111-1111-111111111111')}
     })
 
@@ -993,7 +994,8 @@ test:do_execsql_test(
     [[
         SELECT [1, true, 1.5e0, ['asd', x'32'], 1234.0];
     ]], {
-        {1, true, 1.5, {'asd', '2'}, require('decimal').new(1234)}
+        {1, true, 1.5, {'asd', require('varbinary').new('2')},
+         require('decimal').new(1234)}
     })
 
 test:do_execsql_test(
@@ -1018,33 +1020,10 @@ test:do_execsql_test(
 test:do_execsql_test(
     "array-13.5",
     [[
-        SELECT typeof([1]);
+        SELECT TYPEOF([1]);
     ]], {
         "array"
     })
-
--- Make sure that ARRAY values can be used as bound variable.
-test:do_test(
-    "builtins-14.1",
-    function()
-        local res = box.execute([[SELECT #a;]], {{['#a'] = {1, 2, 3}}})
-        return {res.rows[1][1]}
-    end, {
-        {1, 2, 3}
-    })
-
-local remote = require('net.box')
-box.cfg{listen = os.getenv('LISTEN')}
-local cn = remote.connect(box.cfg.listen)
-test:do_test(
-    "builtins-14.2",
-    function()
-        local res = cn:execute([[SELECT #a;]], {{['#a'] = {1, 2, 3}}})
-        return {res.rows[1][1]}
-    end, {
-        {1, 2, 3}
-    })
-cn:close()
 
 box.execute([[DROP TABLE t1;]])
 box.execute([[DROP TABLE t;]])

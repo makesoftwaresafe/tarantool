@@ -187,7 +187,7 @@ box.cfg{vinyl_timeout = 0.001}
 s = box.schema.space.create('test', {engine = 'vinyl'})
 _ = s:create_index('i1', {parts = {1, 'unsigned'}})
 _ = s:create_index('i2', {parts = {2, 'unsigned'}})
-box.error.injection.set('ERRINJ_VY_DUMP_DELAY', true)
+box.error.injection.set('ERRINJ_VY_RUN_WRITE_STMT_TIMEOUT', 0.1)
 for i = 1, 1000 do s:replace{i, i} end
 _ = fiber.create(function() box.snapshot() end)
 fiber.sleep(0.01)
@@ -241,23 +241,25 @@ i2 = s:create_index('sk', {parts = {2, 'uint'}, bloom_fpr = 0.5})
 for i = 1,10 do s:replace{i, i, 0} end
 
 test_run:cmd("setopt delimiter ';'")
-function worker()
+f = fiber.new(function()
     for i = 11,20,2 do
         s:upsert({i, i}, {{'=', 3, 1}})
-        errinj.set("ERRINJ_VY_POINT_ITER_WAIT", true)
+        errinj.set("ERRINJ_VY_POINT_LOOKUP_DELAY", true)
         i1:select{i}
         s:upsert({i + 1 ,i + 1}, {{'=', 3, 1}})
-        errinj.set("ERRINJ_VY_POINT_ITER_WAIT", true)
+        errinj.set("ERRINJ_VY_POINT_LOOKUP_DELAY", true)
         i2:select{i + 1}
     end
-end
+end);
+f:set_joinable(true);
+ok, err = nil;
+repeat
+    box.snapshot()
+    errinj.set("ERRINJ_VY_POINT_LOOKUP_DELAY", false)
+    ok, err = f:join(0.01)
+until ok;
 test_run:cmd("setopt delimiter ''");
-
-f = fiber.create(worker)
-
-while f:status() ~= 'dead' do box.snapshot() fiber.sleep(0.01) end
-
-errinj.set("ERRINJ_VY_POINT_ITER_WAIT", false)
+err -- nil
 s:drop()
 
 -- vinyl: vy_cache_add: Assertion `0' failed
@@ -290,21 +292,21 @@ s:drop()
 -- after the secondary index scan, but before a primary index
 -- lookup. It is ok, and the test checks this.
 --
-s = box.schema.create_space('test', {engine = 'vinyl'})
+s = box.schema.create_space('test', {engine = 'vinyl', defer_deletes = true})
 pk = s:create_index('pk')
-sk = s:create_index('sk', {parts = {{2, 'unsigned'}}})
+sk = s:create_index('sk', {unique = false, parts = {{2, 'unsigned'}}})
 s:replace{1, 1}
 s:replace{3, 3}
 box.snapshot()
 ret = nil
 function do_read() ret = sk:select({2}, {iterator = 'GE'}) end
-errinj.set("ERRINJ_VY_DELAY_PK_LOOKUP", true)
+errinj.set("ERRINJ_VY_POINT_LOOKUP_DELAY", true)
 _ = fiber.create(do_read)
 test_run:wait_cond(function() return sk:stat().disk.iterator.get.rows > 0 end, 60)
 pk:stat().disk.iterator.get.rows -- 0
 sk:stat().disk.iterator.get.rows -- 1
 s:replace{2, 2}
-errinj.set("ERRINJ_VY_DELAY_PK_LOOKUP", false)
+errinj.set("ERRINJ_VY_POINT_LOOKUP_DELAY", false)
 test_run:wait_cond(function() return pk:stat().get.rows > 0 end, 60)
 pk:stat().get.rows -- 1
 sk:stat().get.rows -- 1
@@ -312,9 +314,8 @@ ret
 s:drop()
 
 --
--- gh-3412 - assertion failure at exit in case:
--- * there is a fiber waiting for quota
--- * there is a pending vylog write
+-- gh-3412 - assertion failure at exit in case there is a fiber waiting for
+-- quota
 --
 test_run:cmd("create server low_quota with script='vinyl/low_quota.lua'")
 test_run:cmd("start server low_quota with args='1048576'")
@@ -322,12 +323,6 @@ test_run:cmd('switch low_quota')
 _ = box.schema.space.create('test', {engine = 'vinyl'})
 _ = box.space.test:create_index('pk')
 box.error.injection.set('ERRINJ_VY_RUN_WRITE_STMT_TIMEOUT', 0.01)
-fiber = require('fiber')
-pad = string.rep('x', 100 * 1024)
-_ = fiber.create(function() for i = 1, 11 do box.space.test:replace{i, pad} end end)
-repeat fiber.sleep(0.001) until box.cfg.vinyl_memory - box.stat.vinyl().memory.level0 < pad:len()
-test_run:cmd("restart server low_quota with args='1048576'")
-box.error.injection.set('ERRINJ_VY_LOG_FLUSH_DELAY', true)
 fiber = require('fiber')
 pad = string.rep('x', 100 * 1024)
 _ = fiber.create(function() for i = 1, 11 do box.space.test:replace{i, pad} end end)
@@ -414,23 +409,16 @@ box.schema.user.revoke('guest', 'replication')
 s:drop()
 
 --
--- Check that tarantool stops immediately even if a vinyl worker
--- thread is blocked (see gh-3225).
+-- Check that tarantool stops immediately if large snapshot write
+-- is in progress.
 --
 s = box.schema.space.create('test', {engine = 'vinyl'})
 _ = s:create_index('pk')
-s:replace{1, 1}
-box.snapshot()
-
-errinj.set('ERRINJ_VY_READ_PAGE_TIMEOUT', 9000)
-_ = fiber.create(function() s:get(1) end)
-
-s:replace{1, 2}
-
-errinj.set('ERRINJ_VY_RUN_WRITE_STMT_TIMEOUT', 9000)
+for i = 1, 10000 do s:replace({i}) end
+errinj.set('ERRINJ_VY_RUN_WRITE_STMT_TIMEOUT', 0.01)
 _ = fiber.create(function() box.snapshot() end)
 
-test_run:cmd("restart server default")
+test_run:cmd("restart server default") -- don't stuck
 box.space.test:drop()
 
 --

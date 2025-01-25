@@ -64,7 +64,12 @@ struct key_part_def {
 	bool is_nullable;
 	/** Action to perform if NULL constraint failed. */
 	enum on_conflict_action nullable_action;
-	/** Part sort order. */
+	/**
+	 * Part sort order. key_part_def can have "undef" sort order, but when
+	 * key_part is created, the "undef" sort order is translated to "asc",
+	 * so, unlike key_part_def, only "asc" and "desc" values are possible
+	 * in the key_part.
+	 */
 	enum sort_order sort_order;
 	/**
 	 * JSON path to indexed data, relative to the field number,
@@ -212,6 +217,8 @@ struct key_def {
 	bool is_multikey;
 	/** True if it is a functional index key definition. */
 	bool for_func_index;
+	/** True if it is unordered index key definition. */
+	bool is_unordered;
 	/**
 	 * True, if some key parts can be absent in a tuple. These
 	 * fields assumed to be MP_NIL.
@@ -307,6 +314,7 @@ typedef struct key_def box_key_def_t;
 enum {
 	BOX_KEY_PART_DEF_IS_NULLABLE = 1 << 0,
 	BOX_KEY_PART_DEF_EXCLUDE_NULL = 1 << 1,
+	BOX_KEY_PART_DEF_SORT_ORDER_DESC = 1 << 2,
 };
 
 /**
@@ -430,10 +438,11 @@ box_key_def_new(uint32_t *fields, uint32_t *types, uint32_t part_count);
  *
  * Default flag values are the following:
  *
- *  | Flag                          | Default value |
- *  | ----------------------------- | ------------- |
- *  | BOX_KEY_PART_DEF_IS_NULLABLE  | 0 (unset)     |
- *  | BOX_KEY_PART_DEF_EXCLUDE_NULL | 0 (unset)     |
+ *  | Flag                             | Default value |
+ *  | -------------------------------- | ------------- |
+ *  | BOX_KEY_PART_DEF_IS_NULLABLE     | 0 (unset)     |
+ *  | BOX_KEY_PART_DEF_EXCLUDE_NULL    | 0 (unset)     |
+ *  | BOX_KEY_PART_DEF_SORT_ORDER_DESC | 0 (unset)     |
  *
  * Default values of fields and flags are permitted to be changed
  * in future tarantool versions. However we should be VERY
@@ -651,20 +660,24 @@ key_def_sizeof(uint32_t part_count, uint32_t path_pool_size)
 	       path_pool_size;
 }
 
+enum key_def_new_flags {
+	KEY_DEF_FOR_FUNC_INDEX = 1 << 0,
+	KEY_DEF_UNORDERED = 1 << 1,
+};
+
 /**
  * Allocate a new key_def with the given part count
  * and initialize its parts.
  */
 struct key_def *
 key_def_new(const struct key_part_def *parts, uint32_t part_count,
-	    bool for_func_index);
+	    unsigned flags);
 
 /**
  * Dump part definitions of the given key def.
  * The region is used for allocating JSON paths, if any.
- * Return -1 on memory allocation error, 0 on success.
  */
-int
+void
 key_def_dump_parts(const struct key_def *def, struct key_part_def *parts,
 		   struct region *region);
 
@@ -716,7 +729,9 @@ key_def_decode_parts(struct key_part_def *parts, uint32_t part_count,
 		     uint32_t field_count, struct region *region);
 
 /**
- * Returns the part in index_def->parts for the specified fieldno.
+ * Returns the first part in index_def->parts for the specified fieldno.
+ * The part is returned regardless of whether it is indexed by JSON path or not.
+ *
  * If fieldno is not in index_def->parts returns NULL.
  */
 const struct key_part *
@@ -818,6 +833,22 @@ key_def_has_collation(const struct key_def *key_def)
 }
 
 /**
+ * Return true if any part of @a key_def is descending.
+ * @param key_def key_def
+ * @retval true if the key_def has descending parts
+ * @retval false otherwise
+ */
+static inline bool
+key_def_has_desc_parts(struct key_def *key_def)
+{
+	for (uint32_t part_id = 0; part_id < key_def->part_count; part_id++) {
+		if (key_def->parts[part_id].sort_order == SORT_ORDER_DESC)
+			return true;
+	}
+	return false;
+}
+
+/**
  * Return the first field type which can't be compared if @a key_def
  * has such. Otherwise return field_type_MAX value.
  */
@@ -852,6 +883,16 @@ key_part_validate(enum field_type key_type, const char *key,
 		diag_set(ClientError, ER_KEY_PART_TYPE, field_no,
 			 field_type_strs[key_type]);
 		return -1;
+	}
+	if (field_type_is_fixed_int(key_type)) {
+		char mp_min[16], mp_max[16];
+		if (!field_mp_is_in_fixed_int_range(
+				key_type, key, mp_min, mp_max, NULL)) {
+			diag_set(ClientError, ER_KEY_PART_VALUE_OUT_OF_RANGE,
+				 field_no, field_type_strs[key_type], key,
+				 mp_min, mp_max);
+			return -1;
+		}
 	}
 	return 0;
 }
@@ -1071,6 +1112,7 @@ tuple_compare_with_key(struct tuple *tuple, hint_t tuple_hint,
 
 /**
  * Compute hash of a tuple field.
+ * @param type - type of the field key part
  * @param ph1 - pointer to running hash
  * @param pcarry - pointer to carry
  * @param field - pointer to field data
@@ -1082,7 +1124,7 @@ tuple_compare_with_key(struct tuple *tuple, hint_t tuple_hint,
  */
 uint32_t
 tuple_hash_field(uint32_t *ph1, uint32_t *pcarry, const char **field,
-		 struct coll *coll);
+		 enum field_type type, struct coll *coll);
 
 /**
  * Compute hash of a key part.

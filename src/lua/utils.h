@@ -54,6 +54,8 @@ extern "C" {
 #include <lj_meta.h>
 
 #include "lua/error.h"
+#include "error.h"
+#include "diag.h"
 
 struct lua_State;
 struct ibuf;
@@ -72,10 +74,33 @@ extern struct lua_State *tarantool_L;
 
 extern uint32_t CTID_CHAR_PTR;
 extern uint32_t CTID_CONST_CHAR_PTR;
+/** Type ID of struct varbinary. */
+extern uint32_t CTID_VARBINARY;
 extern uint32_t CTID_UUID;
 extern uint32_t CTID_DATETIME;
 /** Type ID of struct interval. */
 extern uint32_t CTID_INTERVAL;
+
+/**
+ * Creates a new Lua state with a custom allocator function.
+ * Guarantees the state is not NULL. It panics if lua_State can't
+ * be allocated.
+ */
+struct lua_State *
+luaT_newstate(void);
+
+/**
+ * Pushes a new varbinary object with the given content to the Lua stack.
+ */
+void
+luaT_pushvarbinary(struct lua_State *L, const char *data, uint32_t len);
+
+/**
+ * If the value stored in the Lua stack at the given index is a varbinary
+ * object, returns its content, otherwise returns NULL.
+ */
+const char *
+luaT_tovarbinary(struct lua_State *L, int index, uint32_t *len);
 
 /**
  * Push vclock to the Lua stack as a plain Lua table.
@@ -200,6 +225,13 @@ luaL_checkcdata(struct lua_State *L, int idx, uint32_t *ctypeid);
  */
 LUA_API void
 luaL_setcdatagc(struct lua_State *L, int idx);
+
+/**
+ * @brief Return size of currently allocated memory.
+ * @param L Lua State
+ */
+size_t
+luaL_getgctotal(struct lua_State *L);
 
 /**
 * @brief Return CTypeID (FFI) of given СDATA type
@@ -329,6 +361,28 @@ luaT_newmodule(struct lua_State *L, const char *modname,
 int
 luaT_setmodule(struct lua_State *L, const char *modname);
 
+/**
+ * Extract a string from the Lua stack.
+ *
+ * Return (const char *) for a string, otherwise return NULL.
+ *
+ * Unlike luaL_tolstring() it accepts only a string and does not
+ * accept a number.
+ */
+const char *
+luaL_tolstring_strict(struct lua_State *L, int idx, size_t *len_ptr);
+
+/**
+ * Extract an integer number from the Lua stack.
+ *
+ * Return true for an integer number and store its value in @a value.
+ *
+ * Unlike lua_tointeger() it accepts only an integer number and
+ * does not accept a string.
+ */
+bool
+luaL_tointeger_strict(struct lua_State *L, int idx, int *value);
+
 /** \cond public */
 
 /**
@@ -435,6 +489,22 @@ luaL_iscallable(lua_State *L, int idx);
 LUA_API box_ibuf_t *
 luaT_toibuf(struct lua_State *L, int idx);
 
+/**
+ * Push ffi's NULL (cdata<void *>: NULL) onto the stack.
+ * Can be used as replacement of nil in Lua tables.
+ * @param L stack
+ */
+LUA_API void
+luaL_pushnull(struct lua_State *L);
+
+/**
+ * Return true if the value at Lua stack is ffi's NULL (cdata<void *>: NULL).
+ * @param L stack
+ * @param idx stack index
+ */
+LUA_API bool
+luaL_isnull(struct lua_State *L, int idx);
+
 /** \endcond public */
 
 /**
@@ -443,34 +513,6 @@ luaT_toibuf(struct lua_State *L, int idx);
  */
 int
 luaT_toerror(lua_State *L);
-
-/**
- * Push ffi's NULL (cdata<void *>: NULL) onto the stack.
- * Can be used as replacement of nil in Lua tables.
- * @param L stack
- */
-static inline void
-luaL_pushnull(struct lua_State *L)
-{
-	lua_rawgeti(L, LUA_REGISTRYINDEX, luaL_nil_ref);
-}
-
-/**
- * Return true if the value at Lua stack is ffi's NULL
- * (cdata<void *>: NULL).
- * @param L stack
- * @param idx stack index
- */
-static inline bool
-luaL_isnull(struct lua_State *L, int idx)
-{
-	if (lua_type(L, idx) == LUA_TCDATA) {
-		uint32_t ctypeid;
-		void *cdata = luaL_tocpointer(L, idx, &ctypeid);
-		return ctypeid == CTID_P_VOID && *(void **)cdata == NULL;
-	}
-	return false;
-}
 
 /**
  * @brief Creates a new Lua coroutine in a protected frame. If
@@ -492,6 +534,13 @@ luaT_newthread(struct lua_State *L);
 int
 luaL_checkconstchar(struct lua_State *L, int idx, const char **res,
 		    uint32_t *cdata_type_p);
+
+/**
+ * Whether the object at the given valid index is in the table at
+ * the given valid index.
+ */
+bool
+luaT_hasfield(struct lua_State *L, int obj_index, int table_index);
 
 /* {{{ Helper functions to interact with a Lua iterator from C */
 
@@ -532,6 +581,38 @@ void luaL_iterator_delete(struct luaL_iterator *it);
 
 int
 tarantool_lua_utils_init(struct lua_State *L);
+
+/** Same as luaL_checkstring but raises box error. **/
+const char *
+luaT_checkstring(struct lua_State *L, int index);
+
+/** Same as luaL_checklstring but raises box error. **/
+const char *
+luaT_checklstring(struct lua_State *L, int index, size_t *len);
+
+/** Same as luaL_checkint but raises box error. **/
+int
+luaT_checkint(struct lua_State *L, int index);
+
+/** Same as luaL_checknumber but raises box error. **/
+double
+luaT_checknumber(struct lua_State *L, int index);
+
+/** Same as luaL_checkudata but raises box error. **/
+void *
+luaT_checkudata(struct lua_State *L, int index, const char *name);
+
+/** Same as luaL_checktype but raises box error. **/
+void
+luaT_checktype(struct lua_State *L, int index, int expected);
+
+/** Same as luaL_checkint64 but raises box error. **/
+int64_t
+luaT_checkint64(struct lua_State *L, int idx);
+
+/** Same as luaL_optint but raises box error. **/
+int
+luaT_optint(struct lua_State *L, int index, int deflt);
 
 #if defined(__cplusplus)
 } /* extern "C" */

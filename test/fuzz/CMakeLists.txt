@@ -6,6 +6,8 @@ include_directories(${PROJECT_SOURCE_DIR}/src/box)
 # A special target with fuzzer and sanitizer flags.
 add_library(fuzzer_config INTERFACE)
 
+set(TEST_SUITE_NAME "fuzzing-c")
+
 target_compile_options(
     fuzzer_config
     INTERFACE
@@ -21,6 +23,10 @@ target_compile_options(
         ${CXXFLAGS}
         >
 )
+
+# `-stdlib=libstdc++` is required by ICU on OSS Fuzz.
+# `-lc++` is used by Centipede, so `-lc++` needs to come after
+# centipede's lib.
 target_link_libraries(
     fuzzer_config
     INTERFACE
@@ -30,14 +36,35 @@ target_link_libraries(
         -fprofile-instr-generate
         -fcoverage-mapping
         -g
+        -stdlib=libstdc++
         >
         $<$<BOOL:${OSS_FUZZ}>:
         $ENV{LIB_FUZZING_ENGINE}
+        -lc++
+        -stdlib=libstdc++
         >
 )
 
 set(FUZZ_TEST_TARGETS "")
 
+set(DEFAULT_RUNS_NUMBER 10)
+
+list(APPEND LIBFUZZER_OPTS
+  -mutate_depth=20
+  -print_final_stats=1
+  -print_pcs=1
+  -reduce_inputs=1
+  -reload=1
+  -report_slow_units=5
+  -seed=${RANDOM_SEED}
+  -use_value_profile=1
+  -workers=${CMAKE_BUILD_PARALLEL_LEVEL}
+  # Shell parameter expansion,
+  # https://www.gnu.org/software/bash/manual/html_node/Shell-Parameter-Expansion.html
+  -runs=\${RUNS:-${DEFAULT_RUNS_NUMBER}}
+)
+
+message(STATUS "Add test suite ${TEST_SUITE_NAME}")
 function(create_fuzz_test)
   cmake_parse_arguments(
     FUZZ
@@ -46,11 +73,35 @@ function(create_fuzz_test)
     "SOURCES;LIBRARIES"
     ${ARGN}
   )
-  message(STATUS "Creating fuzz test ${FUZZ_PREFIX}_fuzzer")
   add_executable(${FUZZ_PREFIX}_fuzzer ${FUZZ_SOURCES})
+  # XXX: The call produces both test and target
+  # <${FUZZ_PREFIX}-deps> as a side effect.
+  _add_test_suite_target(${FUZZ_PREFIX}
+    LABELS "${TEST_SUITE_NAME};fuzzing;"
+    DEPENDS ${FUZZ_LIBRARIES} ${FUZZ_PREFIX}_fuzzer
+  )
   # Use PUBLIC to force 'fuzzer_config' for all dependent targets.
   target_link_libraries(${FUZZ_PREFIX}_fuzzer PUBLIC ${FUZZ_LIBRARIES})
   set(FUZZ_TEST_TARGETS ${FUZZ_TEST_TARGETS} ${FUZZ_PREFIX}_fuzzer PARENT_SCOPE)
+  set(LIBFUZZER_OPTS_EFFECTIVE ${LIBFUZZER_OPTS})
+  set(dict_path ${PROJECT_SOURCE_DIR}/test/static/${FUZZ_PREFIX}.dict)
+  if(EXISTS ${dict_path})
+    list(APPEND LIBFUZZER_OPTS_EFFECTIVE "-dict=${dict_path}")
+  endif()
+  set(corpus_path ${PROJECT_SOURCE_DIR}/test/static/corpus/${FUZZ_PREFIX})
+  if(EXISTS ${corpus_path})
+    list(APPEND LIBFUZZER_OPTS_EFFECTIVE "${corpus_path}")
+  endif()
+  set(test_title test/fuzz/${FUZZ_PREFIX}_test)
+  add_test(NAME ${test_title}
+           COMMAND $<TARGET_FILE:${FUZZ_PREFIX}_fuzzer>
+                   -artifact_prefix=${FUZZ_PREFIX}_
+                   ${LIBFUZZER_OPTS_EFFECTIVE}
+  )
+  set_tests_properties(${test_title} PROPERTIES
+    LABELS "${TEST_SUITE_NAME};fuzzing;"
+    DEPENDS ${FUZZ_PREFIX}-deps
+  )
 endfunction()
 
 create_fuzz_test(PREFIX csv
@@ -93,14 +144,65 @@ create_fuzz_test(PREFIX mp_datetime
                  LIBRARIES core fuzzer_config
 )
 
+create_fuzz_test(PREFIX vclock_from_string
+                 SOURCES vclock_from_string_fuzzer.c
+                 LIBRARIES vclock fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_greeting_decode
+                 SOURCES xrow_greeting_decode_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_decode_id
+                 SOURCES xrow_decode_id_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_decode_auth
+                 SOURCES xrow_decode_auth_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_decode_begin
+                 SOURCES xrow_decode_begin_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_decode_call
+                 SOURCES xrow_decode_call_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_decode_dml
+                 SOURCES xrow_decode_dml_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_decode_raft
+                 SOURCES xrow_decode_raft_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_decode_sql
+                 SOURCES xrow_decode_sql_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_decode_watch
+                 SOURCES xrow_decode_watch_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_header_decode
+                 SOURCES xrow_header_decode_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+create_fuzz_test(PREFIX xrow_decode_error
+                 SOURCES xrow_decode_error_fuzzer.c
+                 LIBRARIES xrow fuzzer_config)
+
+# Blocked by https://github.com/tarantool/tarantool/issues/8948.
+if (NOT ENABLE_UB_SANITIZER)
+  create_fuzz_test(PREFIX decimal_to_int64
+                   SOURCES decimal_to_int64_fuzzer.c
+                   LIBRARIES core fuzzer_config)
+endif ()
+
 include(ProtobufMutator)
 
-# UndefinedBehaviorSanitizer is not supported in LuaJIT.
-# See https://github.com/tarantool/tarantool/issues/8473
-if (NOT ENABLE_UB_SANITIZER)
-    add_subdirectory(luaL_loadbuffer)
-    add_subdirectory(sql_fuzzer)
-endif()
+add_subdirectory(luaL_loadbuffer)
+add_subdirectory(sql_fuzzer)
 
 add_custom_target(fuzzers
                   DEPENDS ${FUZZ_TEST_TARGETS}

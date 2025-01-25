@@ -35,6 +35,7 @@
 #include "lua/serializer.h"
 #include "lua/backtrace.h"
 #include "tt_static.h"
+#include "tnt_thread.h"
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -88,14 +89,12 @@ luaL_testcancel(struct lua_State *L)
 static const char *fiberlib_name = "fiber";
 
 /**
- * Trigger invoked when the fiber has stopped execution of its
- * current request. Only purpose - delete storage.lua.fid_ref and
- * storage.lua.storage_ref keeping a reference of Lua
- * fiber and fiber.storage objects. Unlike Lua stack,
- * Lua fiber storage may be created not only for fibers born from
- * Lua land. For example, an IProto request may execute a Lua
- * function, which can create the storage. Trigger guarantees,
- * that even for non-Lua fibers the Lua storage is destroyed.
+ * Trigger invoked when the fiber is stopped. Only purpose - delete
+ * storage.lua.storage_ref keeping a reference of Lua fiber.storage object.
+ * Unlike Lua stack, Lua fiber storage may be created not only for fibers born
+ * from Lua land. For example, an IProto request may execute a Lua function,
+ * which can create the storage. Trigger guarantees, that even for non-Lua
+ * fibers the Lua storage is destroyed.
  */
 static int
 lbox_fiber_on_stop(struct trigger *trigger, void *event)
@@ -103,6 +102,16 @@ lbox_fiber_on_stop(struct trigger *trigger, void *event)
 	struct fiber *f = event;
 	luaL_unref(tarantool_L, LUA_REGISTRYINDEX, f->storage.lua.storage_ref);
 	f->storage.lua.storage_ref = FIBER_LUA_NOREF;
+	trigger_clear(trigger);
+	free(trigger);
+	return 0;
+}
+
+/** Cleanup Lua fiber data when fiber is destroyed. */
+static int
+lbox_fiber_on_destroy(struct trigger *trigger, void *event)
+{
+	struct fiber *f = event;
 	luaL_unref(tarantool_L, LUA_REGISTRYINDEX, f->storage.lua.fid_ref);
 	f->storage.lua.fid_ref = FIBER_LUA_NOREF;
 	trigger_clear(trigger);
@@ -118,13 +127,10 @@ lbox_pushfiber(struct lua_State *L, struct fiber *f)
 {
 	int fid_ref = f->storage.lua.fid_ref;
 	if (fid_ref == FIBER_LUA_NOREF) {
-		struct trigger *t = malloc(sizeof(*t));
-		if (t == NULL) {
-			diag_set(OutOfMemory, sizeof(*t), "malloc", "t");
-			luaT_error(L);
-		}
-		trigger_create(t, lbox_fiber_on_stop, NULL, (trigger_f0)free);
-		trigger_add(&f->on_stop, t);
+		struct trigger *on_destroy = xmalloc(sizeof(*on_destroy));
+		trigger_create(on_destroy, lbox_fiber_on_destroy, NULL,
+			       (trigger_f0)free);
+		trigger_add(&f->on_destroy, on_destroy);
 
 		uint64_t fid = f->fid;
 		/* create a new userdata */
@@ -138,6 +144,16 @@ lbox_pushfiber(struct lua_State *L, struct fiber *f)
 	lua_rawgeti(L, LUA_REGISTRYINDEX, fid_ref);
 }
 
+/**
+ * Returns fiber id for the fiber located at the given `index` on the Lua stack.
+ */
+static uint64_t
+lbox_checkfiberid(struct lua_State *L, int index)
+{
+	uint64_t *fid = luaT_checkudata(L, index, fiberlib_name);
+	return *fid;
+}
+
 static struct fiber *
 lbox_checkfiber(struct lua_State *L, int index)
 {
@@ -145,11 +161,13 @@ lbox_checkfiber(struct lua_State *L, int index)
 	if (lua_type(L, index) == LUA_TNUMBER) {
 		fid = luaL_touint64(L, index);
 	} else {
-		fid = *(uint64_t *)luaL_checkudata(L, index, fiberlib_name);
+		fid = lbox_checkfiberid(L, index);
 	}
 	struct fiber *f = fiber_find(fid);
-	if (f == NULL)
-		luaL_error(L, "the fiber is dead");
+	if (f == NULL) {
+		diag_set(IllegalParams, "the fiber is dead");
+		luaT_error(L);
+	}
 	return f;
 }
 
@@ -160,7 +178,7 @@ lbox_fiber_id(struct lua_State *L)
 	if (lua_gettop(L)  == 0)
 		fid = fiber()->fid;
 	else
-		fid = *(uint64_t *)luaL_checkudata(L, 1, fiberlib_name);
+		fid = lbox_checkfiberid(L, 1);
 	luaL_pushuint64(L, fid);
 	return 1;
 }
@@ -296,8 +314,10 @@ static int
 lbox_fiber_top(struct lua_State *L)
 {
 	if (!fiber_top_is_enabled()) {
-		luaL_error(L, "fiber.top() is disabled. Enable it with"
-			      " fiber.top_enable() first");
+		diag_set(IllegalParams,
+			 "fiber.top() is disabled. Enable it with"
+			 " fiber.top_enable() first");
+		luaT_error(L);
 	}
 	lua_newtable(L);
 	lua_pushliteral(L, "cpu_misses");
@@ -327,6 +347,22 @@ lbox_fiber_top_disable(struct lua_State *L)
 	(void) L;
 	fiber_top_disable();
 	return 0;
+}
+
+static int
+lbox_fiber_tx_user_pool_size(struct lua_State *L)
+{
+	int old_size = tnt_thread_get_tx_user_pool_size();
+	if (lua_gettop(L) != 0) {
+		int new_size = lua_tointeger(L, -1);
+		if (new_size <= 0) {
+			diag_set(IllegalParams, "size must be > 0");
+			luaT_error(L);
+		}
+		tnt_thread_set_tx_user_pool_size(new_size);
+	}
+	lua_pushinteger(L, old_size);
+	return 1;
 }
 
 #ifdef ENABLE_BACKTRACE
@@ -477,10 +513,11 @@ fiber_create(struct lua_State *L)
 static int
 lbox_fiber_create(struct lua_State *L)
 {
-	if (lua_gettop(L) < 1 || !lua_isfunction(L, 1))
-		luaL_error(L, "fiber.create(function, ...): bad arguments");
-	if (fiber_checkstack())
-		luaL_error(L, "fiber.create(): out of fiber stack");
+	if (lua_gettop(L) < 1 || !lua_isfunction(L, 1)) {
+		diag_set(IllegalParams,
+			 "fiber.create(function, ...): bad arguments");
+		luaT_error(L);
+	}
 	struct fiber *f = fiber_create(L);
 	fiber_start(f);
 	return 1;
@@ -492,10 +529,11 @@ lbox_fiber_create(struct lua_State *L)
 static int
 lbox_fiber_new(struct lua_State *L)
 {
-	if (lua_gettop(L) < 1 || !lua_isfunction(L, 1))
-		luaL_error(L, "fiber.new(function, ...): bad arguments");
-	if (fiber_checkstack())
-		luaL_error(L, "fiber.new(): out of fiber stack");
+	if (lua_gettop(L) < 1 || !lua_isfunction(L, 1)) {
+		diag_set(IllegalParams,
+			 "fiber.new(function, ...): bad arguments");
+		luaT_error(L);
+	}
 
 	struct fiber *f = fiber_create(L);
 	fiber_wakeup(f);
@@ -506,8 +544,8 @@ static struct fiber *
 lbox_get_fiber(struct lua_State *L)
 {
 	if (lua_gettop(L) != 0) {
-		uint64_t *fid = luaL_checkudata(L, 1, fiberlib_name);
-		return fiber_find(*fid);
+		uint64_t fid = lbox_checkfiberid(L, 1);
+		return fiber_find(fid);
 	} else {
 		return fiber();
 	}
@@ -550,8 +588,10 @@ static int
 lbox_fiber_object_info(struct lua_State *L)
 {
 	struct fiber *f = lbox_get_fiber(L);
-	if (f == NULL)
-		luaL_error(L, "the fiber is dead");
+	if (f == NULL) {
+		diag_set(IllegalParams, "the fiber is dead");
+		luaT_error(L);
+	}
 #ifdef ENABLE_BACKTRACE
 	bool do_backtrace = lbox_do_backtrace(L, 2);
 	if (do_backtrace) {
@@ -571,7 +611,8 @@ lbox_fiber_csw(struct lua_State *L)
 {
 	struct fiber *f = lbox_get_fiber(L);
 	if (f == NULL) {
-		luaL_error(L, "the fiber is dead");
+		diag_set(IllegalParams, "the fiber is dead");
+		luaT_error(L);
 	} else {
 		lua_pushinteger(L, f->csw);
 	}
@@ -606,7 +647,7 @@ lbox_fiber_name(struct lua_State *L)
 	}
 	if (top == name_index || top == opts_index) {
 		/* Set name. */
-		const char *name = luaL_checkstring(L, name_index);
+		const char *name = luaT_checkstring(L, name_index);
 		int name_size = strlen(name) + 1;
 		if (top == opts_index && lua_istable(L, opts_index)) {
 			lua_getfield(L, opts_index, "truncate");
@@ -616,8 +657,10 @@ lbox_fiber_name(struct lua_State *L)
 				name_size = FIBER_NAME_MAX;
 			lua_pop(L, 1);
 		}
-		if (name_size > FIBER_NAME_MAX)
-			luaL_error(L, "Fiber name is too long");
+		if (name_size > FIBER_NAME_MAX) {
+			diag_set(IllegalParams, "Fiber name is too long");
+			luaT_error(L);
+		}
 		fiber_set_name(f, name);
 		return 0;
 	} else {
@@ -632,6 +675,14 @@ lbox_fiber_storage(struct lua_State *L)
 	struct fiber *f = lbox_checkfiber(L, 1);
 	int storage_ref = f->storage.lua.storage_ref;
 	if (storage_ref == FIBER_LUA_NOREF) {
+		if (f->flags & FIBER_IS_DEAD) {
+			diag_set(IllegalParams, "the fiber is dead");
+			luaT_error(L);
+		}
+		struct trigger *on_stop = xmalloc(sizeof(*on_stop));
+		trigger_create(on_stop, lbox_fiber_on_stop, NULL,
+			       (trigger_f0)free);
+		trigger_add(&f->on_stop, on_stop);
 		lua_newtable(L); /* create local storage on demand */
 		storage_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 		f->storage.lua.storage_ref = storage_ref;
@@ -664,8 +715,10 @@ lbox_fiber_index(struct lua_State *L)
 static int
 lbox_fiber_sleep(struct lua_State *L)
 {
-	if (! lua_isnumber(L, 1) || lua_gettop(L) != 1)
-		luaL_error(L, "fiber.sleep(delay): bad arguments");
+	if (!lua_isnumber(L, 1) || lua_gettop(L) != 1) {
+		diag_set(IllegalParams, "Usage: fiber.sleep(delay)");
+		luaT_error(L);
+	}
 	double delay = lua_tonumber(L, 1);
 	fiber_sleep(delay);
 	luaL_testcancel(L);
@@ -690,8 +743,10 @@ lbox_fiber_self(struct lua_State *L)
 static int
 lbox_fiber_find(struct lua_State *L)
 {
-	if (lua_gettop(L) != 1)
-		luaL_error(L, "fiber.find(id): bad arguments");
+	if (lua_gettop(L) != 1) {
+		diag_set(IllegalParams, "Usage: fiber.find(id)");
+		luaT_error(L);
+	}
 	uint64_t fid = luaL_touint64(L, -1);
 	struct fiber *f = fiber_find(fid);
 	if (f)
@@ -726,12 +781,16 @@ lbox_fiber_cancel(struct lua_State *L)
 static int
 lbox_fiber_serialize(struct lua_State *L)
 {
-	struct fiber *f = lbox_checkfiber(L, 1);
+	uint64_t fid = lbox_checkfiberid(L, 1);
+	struct fiber *f = fiber_find(fid);
+
 	lua_createtable(L, 0, 1);
-	luaL_pushuint64(L, f->fid);
+	luaL_pushuint64(L, fid);
 	lua_setfield(L, -2, "id");
-	lua_pushstring(L, fiber_name(f));
-	lua_setfield(L, -2, "name");
+	if (f != NULL) {
+		lua_pushstring(L, fiber_name(f));
+		lua_setfield(L, -2, "name");
+	}
 	lbox_fiber_status(L);
 	lua_setfield(L, -2, "status");
 	return 1;
@@ -740,10 +799,12 @@ lbox_fiber_serialize(struct lua_State *L)
 static int
 lbox_fiber_tostring(struct lua_State *L)
 {
-	char buf[32];
-	struct fiber *f = lbox_checkfiber(L, 1);
-	snprintf(buf, sizeof(buf), "fiber: %llu",
-		 (long long)f->fid);
+	char buf[35];
+	uint64_t fid = lbox_checkfiberid(L, 1);
+	bool is_dead = fiber_find(fid) == NULL;
+
+	snprintf(buf, sizeof(buf), "fiber: %llu%s", (long long)fid,
+		 is_dead ? " (dead)" : "");
 	lua_pushstring(L, buf);
 	return 1;
 }
@@ -756,8 +817,10 @@ lbox_fiber_tostring(struct lua_State *L)
 static int
 lbox_fiber_testcancel(struct lua_State *L)
 {
-	if (lua_gettop(L) != 0)
-		luaL_error(L, "fiber.testcancel(): bad arguments");
+	if (lua_gettop(L) != 0) {
+		diag_set(IllegalParams, "fiber.testcancel(): bad arguments");
+		luaT_error(L);
+	}
 	luaL_testcancel(L);
 	return 0;
 }
@@ -780,13 +843,21 @@ lbox_fiber_join(struct lua_State *L)
 	int num_ret = 0;
 	int coro_ref = 0;
 
-	if (!(fiber->flags & FIBER_IS_JOINABLE))
-		luaL_error(L, "the fiber is not joinable");
+	if (!(fiber->flags & FIBER_IS_JOINABLE)) {
+		diag_set(IllegalParams, "the fiber is not joinable");
+		luaT_error(L);
+	}
+	if (fid == fiber()->fid) {
+		diag_set(IllegalParams, "cannot join itself");
+		luaT_error(L);
+	}
 	double timeout = TIMEOUT_INFINITY;
 	if (!lua_isnoneornil(L, 2)) {
 		if (!lua_isnumber(L, 2) ||
 		    (timeout = lua_tonumber(L, 2)) < .0) {
-			luaL_error(L, "fiber:join(timeout): bad arguments");
+			diag_set(IllegalParams,
+				 "fiber:join(timeout): bad arguments");
+			luaT_error(L);
 		}
 	}
 	double deadline = fiber_clock() + timeout;
@@ -806,8 +877,10 @@ lbox_fiber_join(struct lua_State *L)
 		}
 		fiber = fiber_find(fid);
 		if (fiber == NULL) {
-			luaL_error(L, "the fiber is already joined "
-				      "by concurrent fiber:join()");
+			diag_set(IllegalParams,
+				 "the fiber is already joined "
+				 "by concurrent fiber:join()");
+			luaT_error(L);
 		}
 	}
 
@@ -846,7 +919,9 @@ lbox_fiber_set_joinable(struct lua_State *L)
 {
 
 	if (lua_gettop(L) != 2) {
-		luaL_error(L, "fiber.set_joinable(id, yesno): bad arguments");
+		diag_set(IllegalParams,
+			 "fiber.set_joinable(id, yesno): bad arguments");
+		luaT_error(L);
 	}
 	struct fiber *fiber = lbox_checkfiber(L, 1);
 	bool yesno = lua_toboolean(L, 2);
@@ -864,6 +939,34 @@ lbox_fiber_stall(struct lua_State *L)
 {
 	(void) L;
 	fiber_yield();
+	luaL_testcancel(L);
+	return 0;
+}
+
+/** Make fiber system. Takes the fiber as a single argument. */
+static int
+lbox_fiber_set_system(struct lua_State *L)
+{
+	if (lua_gettop(L) != 1) {
+		diag_set(IllegalParams, "fiber.set_system(id): bad arguments");
+		luaT_error(L);
+	}
+	struct fiber *fiber = lbox_checkfiber(L, 1);
+	fiber_set_system(fiber, true);
+	return 0;
+}
+
+/** Turn managed shutdown for fiber. Takes the fiber as single argument. */
+static int
+lbox_fiber_set_managed_shutdown(struct lua_State *L)
+{
+	if (lua_gettop(L) != 1) {
+		diag_set(IllegalParams,
+			 "fiber.set_managed_shutdown(id): bad arguments");
+		luaT_error(L);
+	}
+	struct fiber *fiber = lbox_checkfiber(L, 1);
+	fiber_set_managed_shutdown(fiber);
 	return 0;
 }
 
@@ -887,12 +990,16 @@ lbox_fiber_slice_parse(struct lua_State *L, int idx)
 		slice.err = lua_tonumber(L, idx);
 	} else {
 err:
-		luaL_error(L, "slice must be a number or a table "
-			   "{warn = <number>, err = <number>}");
+		diag_set(IllegalParams,
+			 "slice must be a number or a table "
+			 "{warn = <number>, err = <number>}");
+		luaT_error(L);
 		unreachable();
 	}
-	if (!fiber_slice_is_valid(slice))
-		luaL_error(L, "slice value must be >= 0");
+	if (!fiber_slice_is_valid(slice)) {
+		diag_set(IllegalParams, "slice value must be >= 0");
+		luaT_error(L);
+	}
 	return slice;
 }
 
@@ -901,7 +1008,9 @@ static int
 lbox_fiber_set_slice(struct lua_State *L)
 {
 	if (lua_gettop(L) != 1) {
-		luaL_error(L, "fiber.set_slice(slice): bad arguments");
+		diag_set(IllegalParams,
+			 "fiber.set_slice(slice): bad arguments");
+		luaT_error(L);
 	}
 	struct fiber_slice slice = lbox_fiber_slice_parse(L, 1);
 	fiber_set_slice(slice);
@@ -913,7 +1022,9 @@ static int
 lbox_fiber_extend_slice(struct lua_State *L)
 {
 	if (lua_gettop(L) != 1) {
-		luaL_error(L, "fiber.extend_slice(slice): bad arguments");
+		diag_set(IllegalParams,
+			 "fiber.extend_slice(slice): bad arguments");
+		luaT_error(L);
 	}
 	struct fiber_slice slice = lbox_fiber_slice_parse(L, 1);
 	fiber_extend_slice(slice);
@@ -926,8 +1037,10 @@ lbox_fiber_extend_slice(struct lua_State *L)
 static int
 lbox_check_slice(struct lua_State *L)
 {
-	if (lua_gettop(L) != 0)
-		luaL_error(L, "fiber.check_slice(): bad arguments");
+	if (lua_gettop(L) != 0) {
+		diag_set(IllegalParams, "fiber.check_slice(): bad arguments");
+		luaT_error(L);
+	}
 	if (fiber_check_slice() != 0)
 		luaT_error(L);
 	return 0;
@@ -938,8 +1051,9 @@ static int
 lbox_fiber_set_max_slice(struct lua_State *L)
 {
 	if (lua_gettop(L) != 1 && lua_gettop(L) != 2) {
-		luaL_error(L, "fiber.set_max_slice([id,] slice): "
-			      "bad arguments");
+		diag_set(IllegalParams,
+			 "fiber.set_max_slice([id,] slice): bad arguments");
+		luaT_error(L);
 	}
 	int slice_index = lua_gettop(L);
 	struct fiber_slice slice = lbox_fiber_slice_parse(L, slice_index);
@@ -975,6 +1089,7 @@ static const struct luaL_Reg fiberlib[] = {
 	{"top", lbox_fiber_top},
 	{"top_enable", lbox_fiber_top_enable},
 	{"top_disable", lbox_fiber_top_disable},
+	{"tx_user_pool_size", lbox_fiber_tx_user_pool_size},
 #ifdef ENABLE_BACKTRACE
 	{"parent_backtrace_enable", lbox_fiber_parent_backtrace_enable},
 	{"parent_backtrace_disable", lbox_fiber_parent_backtrace_disable},
@@ -1002,6 +1117,8 @@ static const struct luaL_Reg fiberlib[] = {
 	{"extend_slice", lbox_fiber_extend_slice},
 	/* Internal functions, to hide in fiber.lua. */
 	{"stall", lbox_fiber_stall},
+	{"set_system", lbox_fiber_set_system},
+	{"set_managed_shutdown", lbox_fiber_set_managed_shutdown},
 	{NULL, NULL}
 };
 

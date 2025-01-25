@@ -396,9 +396,9 @@ box.schema.func.drop(name)
 -- very large space id, no crash occurs.
 LISTEN = require('uri').parse(box.cfg.listen)
 c = net.connect(LISTEN.host, LISTEN.service)
-c:_request(net._method.select, nil, nil, nil, 1, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
-c:_request(net._method.select, nil, nil, nil, 65537, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
-c:_request(net._method.select, nil, nil, nil, 4294967295, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
+c:_request('SELECT', nil, nil, nil, 1, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
+c:_request('SELECT', nil, nil, nil, 65537, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
+c:_request('SELECT', nil, nil, nil, 4294967295, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
 c:close()
 
 session = box.session
@@ -588,6 +588,7 @@ box.schema.func.create('test_func')
 box.session.su("admin")
 box.schema.user.grant("tester", "read", "space", "_user")
 box.schema.user.grant("tester", "read", "space", "_func")
+box.schema.user.grant("tester", "read", "space", "_truncate")
 -- failed create
 box.session.su("tester")
 box.schema.space.create("test_space")
@@ -864,12 +865,12 @@ box.schema.user.grant('guest', 'read,write,execute', 'universe')
 
 -- Expected behavior of grant() error shouldn't change otherwise.
 sp = box.schema.create_space('not_universe')
-box.schema.user.grant('guest', 'read,write,execute', 'space', 'not_universe')
-box.schema.user.grant('guest', 'read,write,execute', 'space', 'not_universe')
+box.schema.user.grant('guest', 'read,write', 'space', 'not_universe')
+box.schema.user.grant('guest', 'read,write', 'space', 'not_universe')
 
 -- Clean up.
 box.schema.user.revoke('guest', 'read,write,execute', 'universe')
-box.schema.user.revoke('guest', 'read,write,execute', 'space', 'not_universe')
+box.schema.user.revoke('guest', 'read,write', 'space', 'not_universe')
 sp:drop()
 
 --

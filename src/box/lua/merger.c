@@ -115,8 +115,8 @@ decode_header(struct ibuf *buf, size_t *len_p)
 static void
 encode_header(struct ibuf *output_buffer, uint32_t result_len)
 {
-	ibuf_reserve(output_buffer, mp_sizeof_array(result_len));
-	output_buffer->wpos = mp_encode_array(output_buffer->wpos, result_len);
+	void *wpos = xibuf_alloc(output_buffer, mp_sizeof_array(result_len));
+	mp_encode_array(wpos, result_len);
 }
 
 /**
@@ -596,10 +596,26 @@ luaL_merge_source_buffer_next(struct merge_source *base,
 		return -1;
 	}
 	--source->remaining_tuple_count;
-	source->buf->rpos = (char *) tuple_end;
 	if (format == NULL)
 		format = tuple_format_runtime;
+	/*
+	 * If we encounter an MP_TUPLE, skip the extension header and the tuple
+	 * format identifier.
+	 */
+	if (mp_typeof(*tuple_beg) == MP_EXT) {
+		int8_t type;
+		mp_decode_extl(&tuple_beg, &type);
+		if (type != MP_TUPLE) {
+			diag_set(IllegalParams,
+				 "Unexpected MsgPack extension type "
+				 "(should be MP_TUPLE)");
+			return -1;
+		}
+		/* Skip the tuple format identifier. */
+		mp_decode_uint(&tuple_beg);
+	}
 	struct tuple *tuple = tuple_new(format, tuple_beg, tuple_end);
+	ibuf_consume_before(source->buf, tuple_end);
 	if (tuple == NULL)
 		return -1;
 
@@ -1140,9 +1156,8 @@ encode_result_buffer(struct lua_State *L, struct merge_source *source,
 	       merge_source_next(source, NULL, &tuple)) == 0 &&
 	       tuple != NULL) {
 		uint32_t bsize = tuple_bsize(tuple);
-		ibuf_reserve(output_buffer, bsize);
-		memcpy(output_buffer->wpos, tuple_data(tuple), bsize);
-		output_buffer->wpos += bsize;
+		void *wpos = xibuf_alloc(output_buffer, bsize);
+		memcpy(wpos, tuple_data(tuple), bsize);
 		result_len_offset += bsize;
 		++result_len;
 

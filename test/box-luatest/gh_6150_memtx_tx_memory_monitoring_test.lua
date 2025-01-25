@@ -5,18 +5,18 @@ local g = t.group()
 
 -- Sizes of objects from transaction manager.
 -- Please update them, if you changed the relevant structures.
-local SIZE_OF_STMT = 136
+local SIZE_OF_STMT = 144
 -- Size of story with one link (for spaces with 1 index).
 local SIZE_OF_STORY = 144
 -- Size of tuple with 2 number fields
 local SIZE_OF_TUPLE = 9
 -- Size of xrow for tuples with 2 number fields
-local SIZE_OF_XROW = 147
+local SIZE_OF_XROW = 163
 -- Tracker can allocate additional memory, be careful!
-local SIZE_OF_READ_TRACKER = 56
-local SIZE_OF_CONFLICT_TRACKER = 48
+local SIZE_OF_READ_TRACKER = 48
 local SIZE_OF_POINT_TRACKER = 88
-local SIZE_OF_GAP_TRACKER = 80
+local SIZE_OF_INPLACE_GAP_TRACKER = 48
+local SIZE_OF_NEARBY_GAP_TRACKER = 88
 
 local current_stat = {}
 
@@ -328,7 +328,7 @@ g.test_tracker = function()
     g.server:eval('tx1 = txn_proxy.new()')
     g.server:eval('tx1:begin()')
     g.server:eval('tx1("s:select{2}")')
-    local trackers_used = 2 * SIZE_OF_GAP_TRACKER + SIZE_OF_READ_TRACKER
+    local trackers_used = 2 * SIZE_OF_NEARBY_GAP_TRACKER + SIZE_OF_READ_TRACKER
     local diff = {
         ["mvcc"] = {
             ["trackers"] = {
@@ -359,13 +359,57 @@ g.test_conflict = function()
     g.server:eval('tx1 = txn_proxy.new()')
     g.server:eval('tx2 = txn_proxy.new()')
     g.server:eval('box.internal.memtx_tx_gc(10)')
-    t.assert(table_values_are_zeros(g.server:eval('return box.stat.memtx.tx()')))
+    local stat = g.server:eval('return box.stat.memtx.tx()')
+    t.assert(table_values_are_zeros(stat))
+
+    -- Test that monitoring shows hole point tracker.
     g.server:eval('tx1:begin()')
     g.server:eval('tx2:begin()')
     g.server:eval('tx1("s:get(1)")')
+    g.server:eval("box.internal.memtx_tx_gc(10)")
+    local trackers_used = SIZE_OF_POINT_TRACKER
+    local diff = {
+        ["txn"] = {
+            ["statements"] = {
+                ["max"] = 0,
+                ["avg"] = 0,
+                ["total"] = 0,
+            },
+            ["system"] = {
+                ["max"] = 0,
+                ["avg"] = 0,
+                ["total"] = 0,
+            },
+        },
+        ["mvcc"] = {
+            ["trackers"] = {
+                ["max"] = trackers_used,
+                ["avg"] = math.floor(trackers_used / 2),
+                ["total"] = trackers_used,
+            },
+            ["conflicts"] = {
+                ["max"] = 0,
+                ["avg"] = 0,
+                ["total"] = 0,
+            },
+            ["tuples"] = {
+                ["used"] = {
+                    ["stories"] = {
+                        ["total"] = 0,
+                        ["count"] = 0,
+                    },
+                },
+            },
+        },
+    }
+    tx_gc(g.server, 10, diff)
+
+    -- Test that hole point tracker was replaced by gap read tracker.
     g.server:eval('tx2("s:replace{1, 2}")')
     g.server:eval("box.internal.memtx_tx_gc(10)")
-    local trackers_used = SIZE_OF_CONFLICT_TRACKER + SIZE_OF_POINT_TRACKER
+    -- Note that we have subtract the previous value of trackers_used
+    -- because point trackers are freed and we need negative diff for them.
+    trackers_used = SIZE_OF_INPLACE_GAP_TRACKER - trackers_used
     local diff = {
         ["txn"] = {
             ["statements"] = {

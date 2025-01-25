@@ -43,7 +43,7 @@ enum test_buffer_status {
 	TEST_BUFFER_STATUS_COUNT
 };
 
-const char *info_msg = "prbuf(size=%lu, payload=%lu, iterations=%lu) %s";
+const char *info_msg = "prbuf(size=%lu, payload=%lu, iterations=%zu) %s";
 
 const char *test_buffer_status_strs[TEST_BUFFER_STATUS_COUNT] = {
 	"has been validated",
@@ -229,8 +229,9 @@ test_buffer_foreach_copy_number(uint32_t buffer_size,
 	for (size_t i = 0; i < lengthof(copy_number_arr); ++i) {
 		rc = test_buffer(buffer_size, payload, payload_size,
 				 copy_number_arr[i]);
-		is(rc, 0, info_msg, buffer_size, payload_size,
-		   copy_number_arr[i], test_buffer_status_strs[rc]);
+		is(rc, 0, info_msg, (unsigned long)buffer_size,
+		   (unsigned long)payload_size, copy_number_arr[i],
+		   test_buffer_status_strs[rc]);
 	}
 }
 
@@ -468,7 +469,7 @@ test_buffer_prepared_large(void)
 	fill_buffer(&buf, payload_small, payload_size, entry_count);
 	int entry_count_after = count_records(mem, buffer_size);
 	ok(entry_count_after == entry_count, "entry count after is %d",
-	   entry_count_after)
+	   entry_count_after);
 
 	footer();
 	check_plan();
@@ -602,6 +603,7 @@ test_max_record_size(void)
 	ok(entry.size == 0, "entry size is %zd", entry.size);
 	ok(entry.ptr == NULL, "NULL is expected");
 	close(fd);
+	prbuf_reader_destroy(&reader);
 
 	p = prbuf_prepare(&buf, max_size + 1);
 	ok(p == NULL, "NULL is expected");

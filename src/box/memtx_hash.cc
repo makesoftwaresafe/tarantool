@@ -109,7 +109,8 @@ hash_iterator_ge_base(struct iterator *ptr, struct tuple **ret)
 {
 	assert(ptr->free == hash_iterator_free);
 	struct hash_iterator *it = (struct hash_iterator *) ptr;
-	struct memtx_hash_index *index = (struct memtx_hash_index *)ptr->index;
+	struct memtx_hash_index *index = (struct memtx_hash_index *)
+		index_weak_ref_get_index_checked(&ptr->index_ref);
 	struct tuple **res = light_index_iterator_get_and_next(&index->hash_table,
 							       &it->iterator);
 	*ret = res != NULL ? *res : NULL;
@@ -121,7 +122,8 @@ hash_iterator_gt_base(struct iterator *ptr, struct tuple **ret)
 {
 	assert(ptr->free == hash_iterator_free);
 	struct hash_iterator *it = (struct hash_iterator *) ptr;
-	struct memtx_hash_index *index = (struct memtx_hash_index *)ptr->index;
+	struct memtx_hash_index *index = (struct memtx_hash_index *)
+		index_weak_ref_get_index_checked(&ptr->index_ref);
 	struct tuple **res = light_index_iterator_get_and_next(&index->hash_table,
 							       &it->iterator);
 	if (res != NULL)
@@ -136,8 +138,9 @@ static int									\
 name(struct iterator *iterator, struct tuple **ret)				\
 {										\
 	struct txn *txn = in_txn();						\
-	struct space *space = space_by_id(iterator->space_id);			\
-	struct index *idx = iterator->index;					\
+	struct space *space;							\
+	struct index *index;							\
+	index_weak_ref_get_checked(&iterator->index_ref, &space, &index);	\
 	bool is_first = true;							\
 	do {									\
 		int rc;								\
@@ -150,7 +153,7 @@ name(struct iterator *iterator, struct tuple **ret)				\
 		if (rc != 0 || *ret == NULL)					\
 			return rc;						\
 		is_first = false;						\
-		*ret = memtx_tx_tuple_clarify(txn, space, *ret, idx, 0);	\
+		*ret = memtx_tx_tuple_clarify(txn, space, *ret, index, 0);	\
 /********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND START*********/\
 		memtx_tx_story_gc();						\
 /********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND START*********/\
@@ -173,8 +176,10 @@ hash_iterator_eq(struct iterator *it, struct tuple **ret)
 	if (*ret == NULL)
 		return 0;
 	struct txn *txn = in_txn();
-	struct space *sp = space_by_id(it->space_id);
-	*ret = memtx_tx_tuple_clarify(txn, sp, *ret, it->index, 0);
+	struct space *space;
+	struct index *index;
+	index_weak_ref_get_checked(&it->index_ref, &space, &index);
+	*ret = memtx_tx_tuple_clarify(txn, space, *ret, index, 0);
 /********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND START*********/
 	memtx_tx_story_gc();
 /*********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND END**********/
@@ -271,6 +276,7 @@ memtx_hash_index_size(struct index *base)
 {
 	struct memtx_hash_index *index = (struct memtx_hash_index *)base;
 	struct space *space = space_by_id(base->def->space_id);
+	memtx_tx_story_gc();
 	/* Substract invisible count. */
 	return light_index_count(&index->hash_table) -
 	       memtx_tx_index_invisible_count(in_txn(), space, base);
@@ -311,7 +317,7 @@ memtx_hash_index_random(struct index *base, uint32_t rnd, struct tuple **result)
 		memtx_tx_story_gc();
 /*********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND END**********/
 	} while (*result == NULL);
-	return memtx_prepare_result_tuple(result);
+	return memtx_prepare_result_tuple(space, result);
 }
 
 static ssize_t
@@ -371,38 +377,24 @@ memtx_hash_index_replace(struct index *base, struct tuple *old_tuple,
 		if (pos == light_index_end)
 			pos = light_index_insert(hash_table, h, new_tuple);
 
-		ERROR_INJECT(ERRINJ_INDEX_ALLOC,
-		{
+		ERROR_INJECT(ERRINJ_HASH_INDEX_REPLACE, {
 			light_index_delete(hash_table, pos);
 			pos = light_index_end;
 		});
 
 		if (pos == light_index_end) {
-			diag_set(OutOfMemory,
-				 (ssize_t)light_index_count(hash_table),
+			diag_set(OutOfMemory, MEMTX_EXTENT_SIZE,
 				 "hash_table", "key");
 			return -1;
 		}
-		uint32_t errcode = replace_check_dup(old_tuple,
-						     dup_tuple, mode);
-		if (errcode) {
+		if (index_check_dup(base, old_tuple, new_tuple,
+				    dup_tuple, mode) != 0) {
 			light_index_delete(hash_table, pos);
 			if (dup_tuple) {
 				uint32_t pos = light_index_insert(hash_table, h, dup_tuple);
 				if (pos == light_index_end) {
 					panic("Failed to allocate memory in "
 					      "recover of int hash_table");
-				}
-			}
-			struct space *sp = space_cache_find(base->def->space_id);
-			if (sp != NULL) {
-				if (errcode == ER_TUPLE_FOUND){
-					diag_set(ClientError, errcode,  base->def->name,
-						 space_name(sp), tuple_str(dup_tuple),
-						 tuple_str(new_tuple));
-				} else {
-					diag_set(ClientError, errcode,
-						 space_name(sp));
 				}
 			}
 			return -1;
@@ -449,7 +441,8 @@ memtx_hash_index_create_iterator(struct index *base, enum iterator_type type,
 	it->pool = &memtx->iterator_pool;
 	it->base.free = hash_iterator_free;
 	light_index_iterator_begin(&index->hash_table, &it->iterator);
-
+	struct space *space = index_weak_ref_get_space_checked(
+		&it->base.index_ref);
 	switch (type) {
 	case ITER_GT: {
 		static bool warn_once = false;
@@ -471,9 +464,7 @@ memtx_hash_index_create_iterator(struct index *base, enum iterator_type type,
 		}
 		/* This iterator needs to be supported as a legacy. */
 /********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND START*********/
-		memtx_tx_track_full_scan(in_txn(),
-					 space_by_id(it->base.space_id),
-					 &index->base);
+		memtx_tx_track_full_scan(in_txn(), space, &index->base);
 /*********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND END**********/
 		break;
 	}
@@ -481,9 +472,7 @@ memtx_hash_index_create_iterator(struct index *base, enum iterator_type type,
 		light_index_iterator_begin(&index->hash_table, &it->iterator);
 		it->base.next_internal = hash_iterator_ge;
 /********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND START*********/
-		memtx_tx_track_full_scan(in_txn(),
-					 space_by_id(it->base.space_id),
-					 &index->base);
+		memtx_tx_track_full_scan(in_txn(), space, &index->base);
 /*********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND END**********/
 		break;
 	case ITER_EQ:
@@ -493,8 +482,7 @@ memtx_hash_index_create_iterator(struct index *base, enum iterator_type type,
 		it->base.next_internal = hash_iterator_eq;
 		if (it->iterator.slotpos == light_index_end)
 /********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND START*********/
-			memtx_tx_track_point(in_txn(),
-					     space_by_id(it->base.space_id),
+			memtx_tx_track_point(in_txn(), space,
 					     &index->base, key);
 /*********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND END**********/
 		break;
@@ -629,6 +617,7 @@ hash_read_view_create_iterator(struct index_read_view *base,
 	struct hash_read_view_iterator *it =
 		(struct hash_read_view_iterator *)iterator;
 	it->base.index = base;
+	it->base.destroy = generic_index_read_view_iterator_destroy;
 	it->base.next_raw = exhausted_index_read_view_iterator_next_raw;
 	it->base.position = generic_index_read_view_iterator_position;
 	light_index_view_iterator_begin(&rv->view, &it->iterator);
@@ -641,18 +630,19 @@ memtx_hash_index_create_read_view(struct index *base)
 {
 	static const struct index_read_view_vtab vtab = {
 		.free = hash_read_view_free,
+		.count = generic_index_read_view_count,
 		.get_raw = hash_read_view_get_raw,
 		.create_iterator = hash_read_view_create_iterator,
+		.create_iterator_with_offset =
+			generic_index_read_view_create_iterator_with_offset,
 	};
 	struct memtx_hash_index *index = (struct memtx_hash_index *)base;
 	struct hash_read_view *rv =
 		(struct hash_read_view *)xmalloc(sizeof(*rv));
-	if (index_read_view_create(&rv->base, &vtab, base->def) != 0) {
-		free(rv);
-		return NULL;
-	}
-	struct space *space = space_cache_find(base->def->space_id);
-	memtx_tx_snapshot_cleaner_create(&rv->cleaner, space);
+	index_read_view_create(&rv->base, &vtab, base->def);
+	struct space *space = space_by_id(base->def->space_id);
+	assert(space != NULL);
+	memtx_tx_snapshot_cleaner_create(&rv->cleaner, space, base);
 	rv->index = index;
 	index_ref(base);
 	light_index_view_create(&rv->view, &index->hash_table);
@@ -680,6 +670,8 @@ static const struct index_vtab memtx_hash_index_vtab = {
 	/* .get = */ memtx_index_get,
 	/* .replace = */ memtx_hash_index_replace,
 	/* .create_iterator = */ memtx_hash_index_create_iterator,
+	/* .create_iterator_with_offset = */
+	generic_index_create_iterator_with_offset,
 	/* .create_read_view = */ memtx_hash_index_create_read_view,
 	/* .stat = */ generic_index_stat,
 	/* .compact = */ generic_index_compact,
@@ -694,21 +686,12 @@ struct index *
 memtx_hash_index_new(struct memtx_engine *memtx, struct index_def *def)
 {
 	struct memtx_hash_index *index =
-		(struct memtx_hash_index *)calloc(1, sizeof(*index));
-	if (index == NULL) {
-		diag_set(OutOfMemory, sizeof(*index),
-			 "malloc", "struct memtx_hash_index");
-		return NULL;
-	}
-	if (index_create(&index->base, (struct engine *)memtx,
-			 &memtx_hash_index_vtab, def) != 0) {
-		free(index);
-		return NULL;
-	}
+		(struct memtx_hash_index *)xcalloc(1, sizeof(*index));
+	index_create(&index->base, (struct engine *)memtx,
+		     &memtx_hash_index_vtab, def);
 
 	light_index_create(&index->hash_table, index->base.def->key_def,
-			   MEMTX_EXTENT_SIZE, memtx_index_extent_alloc,
-			   memtx_index_extent_free, memtx,
+			   &memtx->index_extent_allocator,
 			   &memtx->index_extent_stats);
 	return &index->base;
 }

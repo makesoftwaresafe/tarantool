@@ -104,6 +104,8 @@ cfg_filter(box.cfg)
     - 16320
   - - replication_anon
     - false
+  - - replication_anon_ttl
+    - 3600
   - - replication_connect_timeout
     - 30
   - - replication_skip_conflict
@@ -112,6 +114,8 @@ cfg_filter(box.cfg)
     - 10
   - - replication_sync_timeout
     - <hidden>
+  - - replication_synchro_queue_max_size
+    - 16777216
   - - replication_synchro_quorum
     - N / 2 + 1
   - - replication_synchro_timeout
@@ -158,8 +162,6 @@ cfg_filter(box.cfg)
     - 60
   - - vinyl_write_threads
     - 4
-  - - wal_cleanup_delay
-    - 14400
   - - wal_dir
     - <hidden>
   - - wal_dir_rescan_delay

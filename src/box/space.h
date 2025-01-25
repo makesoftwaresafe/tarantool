@@ -39,6 +39,9 @@
 #include "error.h"
 #include "diag.h"
 #include "iproto_constants.h"
+#include "core/event.h"
+#include "txn_event_trigger.h"
+#include "arrow/abi.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -52,7 +55,6 @@ struct request;
 struct port;
 struct tuple;
 struct tuple_format;
-struct constraint_id;
 struct space_upgrade;
 struct space_wal_ext;
 
@@ -69,6 +71,9 @@ struct space_vtab {
 	int (*execute_update)(struct space *, struct txn *,
 			      struct request *, struct tuple **result);
 	int (*execute_upsert)(struct space *, struct txn *, struct request *);
+	int (*execute_insert_arrow)(struct space *space, struct txn *txn,
+				    struct ArrowArray *array,
+				    struct ArrowSchema *schema);
 
 	int (*ephemeral_replace)(struct space *, const char *, const char *);
 
@@ -144,6 +149,12 @@ struct space_vtab {
 	 */
 	int (*prepare_alter)(struct space *old_space,
 			     struct space *new_space);
+	/**
+	 * Notify the engine after altering a space and before replacing
+	 * old_space with new_space in the space cache.
+	 */
+	void (*finish_alter)(struct space *old_space,
+			     struct space *new_space);
 	/** Prepares a space for online upgrade on alter. */
 	int (*prepare_upgrade)(struct space *old_space,
 			       struct space *new_space);
@@ -157,6 +168,17 @@ struct space_vtab {
 	void (*invalidate)(struct space *space);
 };
 
+/**
+ * Every event associated with a particular space is divided into two parts:
+ * event, bound to the space by name, and event, bound by id.
+ */
+struct space_event {
+	/** Event, bound by id. */
+	struct event *by_id;
+	/** Event, bound by name. */
+	struct event *by_name;
+};
+
 struct space {
 	/** Virtual function table. */
 	const struct space_vtab *vtab;
@@ -168,6 +190,12 @@ struct space {
 	struct rlist before_replace;
 	/** Triggers fired after space_replace() -- see txn_commit_stmt(). */
 	struct rlist on_replace;
+	/** User-defined before_replace triggers. */
+	struct space_event before_replace_event;
+	/** User-defined on_replace triggers. */
+	struct space_event on_replace_event;
+	/** User-defined transactional event triggers. */
+	struct space_event txn_events[txn_event_id_MAX];
 	/** SQL Trigger list. */
 	struct sql_trigger *sql_triggers;
 	/**
@@ -194,6 +222,11 @@ struct space {
 	char *sequence_path;
 	/** Enable/disable triggers. */
 	bool run_triggers;
+	/**
+	 * When the flag is set, the space executes recovery triggers
+	 * (e.g. before_recovery_replace instead of before_replace).
+	 */
+	bool run_recovery_triggers;
 	/** This space has foreign key constraints in its format. */
 	bool has_foreign_keys;
 	/**
@@ -220,10 +253,6 @@ struct space {
 	 * fields is guaranteed by another unique index.
 	 */
 	void *check_unique_constraint_map;
-	/**
-	 * Hash table with constraint identifiers hashed by name.
-	 */
-	struct mh_strnptr_t *constraint_ids;
 	/** List of space holders. This member is a property of space cache. */
 	struct rlist space_cache_pin_list;
 	/**
@@ -248,6 +277,25 @@ struct space {
 	 * (i.e. if not NULL WAL entries may contain extra fields).
 	 */
 	struct space_wal_ext *wal_ext;
+	/**
+	 * List of collation identifier holders.
+	 * Linked by `coll_id_cache_holder::in_space`.
+	 */
+	struct rlist coll_id_holders;
+	/**
+	 * A reference to the lua table representing this space. Only used
+	 * on space drop rollback in order to keep the lua references to
+	 * this object in sync. For more information see #9120.
+	 */
+	int lua_ref;
+	/** The effective state of this space. */
+	struct {
+		/**
+		 * The effective state of synchronous replication for this
+		 * space.
+		 */
+		bool is_sync;
+	} state;
 };
 
 /** Space alter statement. */
@@ -261,6 +309,12 @@ struct space_alter_stmt {
 };
 
 /**
+ * Remove all temporary triggers from all associated events.
+ */
+void
+space_remove_temporary_triggers(struct space *space);
+
+/**
  * Detach constraints from space. They can be reattached or deleted then.
  */
 void
@@ -271,6 +325,31 @@ space_detach_constraints(struct space *space);
  */
 void
 space_reattach_constraints(struct space *space);
+
+/**
+ * Pin in cache the collation identifiers that are referenced by space format
+ * and/or indexes, so that they can't be deleted.
+ */
+void
+space_pin_collations(struct space *space);
+
+/**
+ * Unpin collation identifiers.
+ */
+void
+space_unpin_collations(struct space *space);
+
+/**
+ * Pin functional default field values in cache, so that they can't be deleted.
+ */
+void
+space_pin_defaults(struct space *space);
+
+/**
+ * Unpin functional default field values.
+ */
+void
+space_unpin_defaults(struct space *space);
 
 /** Initialize a base space instance. */
 int
@@ -302,6 +381,14 @@ space_on_initial_recovery_complete(struct space *space, void *nothing);
 int
 space_on_final_recovery_complete(struct space *space, void *nothing);
 
+/**
+ * Finish space initialization after finishing bootstrap.
+ * See the comment to space_on_initial_recovery_complete() for
+ * the function semantics and rationale.
+ */
+int
+space_on_bootstrap_complete(struct space *space, void *nothing);
+
 /** Get space ordinal number. */
 static inline uint32_t
 space_id(const struct space *space)
@@ -316,18 +403,25 @@ space_name(const struct space *space)
 	return space->def->name;
 }
 
+/** Return true if space is data-temporary. */
+static inline bool
+space_is_data_temporary(const struct space *space)
+{
+	return space_opts_is_data_temporary(&space->def->opts);
+}
+
 /** Return true if space is temporary. */
 static inline bool
 space_is_temporary(const struct space *space)
 {
-	return space->def->opts.is_temporary;
+	return space_opts_is_temporary(&space->def->opts);
 }
 
 /** Return true if space is synchronous. */
 static inline bool
 space_is_sync(const struct space *space)
 {
-	return space->def->opts.is_sync;
+	return space->state.is_sync;
 }
 
 /** Return replication group id of a space. */
@@ -425,21 +519,6 @@ index_find(struct space *space, uint32_t index_id)
 }
 
 /**
- * Wrapper around index_find() which checks that
- * the found index is unique.
- */
-static inline struct index *
-index_find_unique(struct space *space, uint32_t index_id)
-{
-	struct index *index = index_find(space, index_id);
-	if (index != NULL && !index->def->opts.is_unique) {
-		diag_set(ClientError, ER_MORE_THAN_ONE_TUPLE);
-		return NULL;
-	}
-	return index;
-}
-
-/**
  * Returns number of bytes used in memory by tuples in the space.
  */
 size_t
@@ -450,23 +529,47 @@ struct index_def *
 space_index_def(struct space *space, int n);
 
 /**
- * Get name of the index by its identifier and parent space.
- *
- * @param space Parent space.
- * @param id    Index identifier.
- *
- * @retval not NULL Index name.
- * @retval     NULL No index with the specified identifier.
- */
-const char *
-index_name_by_id(struct space *space, uint32_t id);
-
-/**
  * Check whether or not the current user can be granted
  * the requested access to the space.
  */
 int
 access_check_space(struct space *space, user_access_t access);
+
+/**
+ * Check if the `space_event' has registered triggers.
+ */
+static inline bool
+space_event_has_triggers(struct space_event *space_event)
+{
+	return event_has_triggers(space_event->by_id) ||
+	       event_has_triggers(space_event->by_name);
+}
+
+/**
+ * Check if the space has registered on_replace triggers.
+ */
+static inline bool
+space_has_on_replace_triggers(struct space *space)
+{
+	return !rlist_empty(&space->on_replace) ||
+	       space_event_has_triggers(&space->on_replace_event);
+}
+
+/**
+ * Check if the space has registered before_replace triggers.
+ */
+static inline bool
+space_has_before_replace_triggers(struct space *space)
+{
+	return !rlist_empty(&space->before_replace) ||
+	       space_event_has_triggers(&space->before_replace_event);
+}
+
+/**
+ * Run on_replace triggers registered for a space.
+ */
+int
+space_on_replace(struct space *space, struct txn *txn);
 
 /**
  * Execute a DML request on the given space.
@@ -558,6 +661,13 @@ space_prepare_alter(struct space *old_space, struct space *new_space)
 	return new_space->vtab->prepare_alter(old_space, new_space);
 }
 
+static inline void
+space_finish_alter(struct space *old_space, struct space *new_space)
+{
+	assert(old_space->vtab == new_space->vtab);
+	new_space->vtab->finish_alter(old_space, new_space);
+}
+
 static inline int
 space_prepare_upgrade(struct space *old_space, struct space *new_space)
 {
@@ -625,6 +735,10 @@ space_delete(struct space *space);
 int
 space_foreach(int (*func)(struct space *sp, void *udata), void *udata);
 
+/** Update the state of synchronous replication for system spaces. */
+void
+system_spaces_update_is_sync_state(bool is_sync);
+
 /**
  * Dump space definition (key definitions, key count)
  * for ALTER.
@@ -636,29 +750,25 @@ space_dump_def(const struct space *space, struct rlist *key_list);
 void
 space_fill_index_map(struct space *space);
 
-/** Find a constraint identifier by name. */
-struct constraint_id *
-space_find_constraint_id(struct space *space, const char *name);
+/** Add info about space to the error. */
+static inline void
+error_set_space(struct error *error, struct space_def *def)
+{
+	error_set_str(error, "space", def->name);
+	error_set_uint(error, "space_id", def->id);
+}
 
-/**
- * Add a new constraint id to the space's hash table of all
- * constraints. That is used to prevent existence of constraints
- * with equal names.
- */
+/** Destroy constraints that are defined in @a space format. */
 void
-space_add_constraint_id(struct space *space, struct constraint_id *id);
-
-/**
- * Remove a given name from the hash of all constraint
- * identifiers of the given space.
- */
-struct constraint_id *
-space_pop_constraint_id(struct space *space, const char *name);
+space_cleanup_constraints(struct space *space);
 
 /*
  * Virtual method stubs.
  */
 size_t generic_space_bsize(struct space *);
+int generic_space_execute_insert_arrow(struct space *space, struct txn *txn,
+				       struct ArrowArray *array,
+				       struct ArrowSchema *schema);
 int generic_space_ephemeral_replace(struct space *, const char *, const char *);
 int generic_space_ephemeral_delete(struct space *, const char *);
 int generic_space_ephemeral_rowid_next(struct space *, uint64_t *);
@@ -671,6 +781,7 @@ int generic_space_check_format(struct space *, struct tuple_format *);
 int generic_space_build_index(struct space *, struct index *,
 			      struct tuple_format *, bool);
 int generic_space_prepare_alter(struct space *, struct space *);
+void generic_space_finish_alter(struct space *, struct space *);
 int generic_space_prepare_upgrade(struct space *old_space,
 				  struct space *new_space);
 void generic_space_invalidate(struct space *);
@@ -692,42 +803,6 @@ access_check_space_xc(struct space *space, user_access_t access)
 {
 	if (access_check_space(space, access) != 0)
 		diag_raise();
-}
-
-/**
- * Look up the index by id, and throw an exception if not found.
- */
-static inline struct index *
-index_find_xc(struct space *space, uint32_t index_id)
-{
-	struct index *index = index_find(space, index_id);
-	if (index == NULL)
-		diag_raise();
-	return index;
-}
-
-static inline struct index *
-index_find_unique_xc(struct space *space, uint32_t index_id)
-{
-	struct index *index = index_find_unique(space, index_id);
-	if (index == NULL)
-		diag_raise();
-	return index;
-}
-
-/**
- * Find an index in a system space. Throw an error
- * if we somehow deal with a non-memtx space (it can't
- * be used for system spaces.
- */
-static inline struct index *
-index_find_system_xc(struct space *space, uint32_t index_id)
-{
-	if (! space_is_memtx(space)) {
-		tnt_raise(ClientError, ER_UNSUPPORTED,
-			  space->engine->name, "system data");
-	}
-	return index_find_xc(space, index_id);
 }
 
 static inline void

@@ -4,9 +4,13 @@ local ffi = require('ffi')
 local msgpackffi = require('msgpackffi')
 local fun = require('fun')
 local buffer = require('buffer')
+local compat = require('compat')
+local utils = require('internal.utils')
+
 local internal = box.internal
 local cord_ibuf_take = buffer.internal.cord_ibuf_take
 local cord_ibuf_put = buffer.internal.cord_ibuf_put
+local check_param_table = utils.check_param_table
 
 ffi.cdef[[
 /** \cond public */
@@ -65,6 +69,36 @@ local builtin = ffi.C
 local tuple_t = ffi.typeof('box_tuple_t')
 local const_tuple_ref_t = ffi.typeof('box_tuple_t&')
 
+local NEW_OPTION_TYPES = {
+    format = function(format)
+        if type(format) ~= 'table' and not box.tuple.format.is(format) then
+            return false, "table, box.tuple.format"
+        end
+        return true
+    end
+}
+
+local new_tuple = function(...)
+    if compat.box_tuple_new_vararg:is_old() then
+        return internal.tuple.new{...}
+    end
+    local tuple, options = ...
+    if type(tuple) ~= 'table' and not box.tuple.is(tuple) then
+        tuple = {tuple}
+    end
+    check_param_table(options, NEW_OPTION_TYPES)
+    if options == nil then
+        return internal.tuple.new(tuple)
+    end
+    local format
+    if box.tuple.format.is(options.format) then
+        format = options.format
+    else
+        format = box.tuple.format.new(options.format)
+    end
+    return internal.tuple.new(tuple, format)
+end
+
 local is_tuple = function(tuple)
     return tuple ~= nil and type(tuple) == 'cdata' and ffi.istype(const_tuple_ref_t, tuple)
 end
@@ -73,24 +107,24 @@ local encode_fix = msgpackffi.internal.encode_fix
 local encode_array = msgpackffi.internal.encode_array
 local encode_r = msgpackffi.internal.encode_r
 
-local tuple_encode = function(tmpbuf, obj)
+local tuple_encode = function(tmpbuf, obj, level)
     if obj == nil then
         encode_fix(tmpbuf, 0x90, 0)  -- empty array
     elseif is_tuple(obj) then
-        encode_r(tmpbuf, obj, 1)
+        encode_r(tmpbuf, obj, 1, level and level + 1)
     elseif type(obj) == "table" then
         local obj_size = #obj
         if obj_size == 0 and not rawequal(next(obj), nil) then
             -- dictionary cannot represent a tuple
-            return box.error(box.error.TUPLE_NOT_ARRAY)
+            box.error(box.error.TUPLE_NOT_ARRAY, level and level + 1)
         end
         encode_array(tmpbuf, obj_size)
         for i = 1, obj_size, 1 do
-            encode_r(tmpbuf, obj[i], 1)
+            encode_r(tmpbuf, obj[i], 1, level and level + 1)
         end
     else
         encode_fix(tmpbuf, 0x90, 1)  -- array of one element
-        encode_r(tmpbuf, obj, 1)
+        encode_r(tmpbuf, obj, 1, level and level + 1)
     end
     return tmpbuf.rpos, tmpbuf.wpos
 end
@@ -270,9 +304,7 @@ end
 local function tuple_to_msgpack(buf, tuple)
     assert(ffi.istype(tuple_t, tuple))
     local bsize = builtin.box_tuple_bsize(tuple)
-    buf:reserve(bsize)
-    builtin.box_tuple_to_buf(tuple, buf.wpos, bsize)
-    buf.wpos = buf.wpos + bsize
+    builtin.box_tuple_to_buf(tuple, buf:alloc(bsize), bsize)
 end
 
 local function tuple_bsize(tuple)
@@ -300,7 +332,9 @@ local methods = {
     ["update"]      = tuple_update;
     ["upsert"]      = tuple_upsert;
     ["bsize"]       = tuple_bsize;
+    ["format"]      = box.tuple.format;
     ["tomap"]       = internal.tuple.tuple_to_map;
+    ["info"]        = internal.tuple.info;
 }
 
 -- Aliases for tuple:methods().
@@ -367,6 +401,10 @@ internal.tuple.bless = tuple_bless
 internal.tuple.encode = tuple_encode
 
 -- Public API, additional to implemented in C.
+
+-- new() needs a wrapper in Lua, because format normalization needs to be done
+-- in Lua.
+box.tuple.new = new_tuple
 
 -- is() is implemented in Lua, because then it is
 -- easy to be JITed.

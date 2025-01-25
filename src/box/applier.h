@@ -115,10 +115,7 @@ struct applier_data_msg {
 /** A message sent from tx to applier thread to trigger ACK. */
 struct applier_ack_msg {
 	struct cmsg base;
-	/**
-	 * Last written transaction timestamp.
-	 * Set to replica::applier_txn_last_tm.
-	 */
+	/** Last written transaction timestamp. */
 	double txn_last_tm;
 	/** Last known raft term. */
 	uint64_t term;
@@ -213,6 +210,12 @@ struct applier {
 	struct applier_msg *pending_msgs[3];
 	/** Pending message count. */
 	int pending_msg_cnt;
+	/**
+	 * Last written transaction timestamp. It can be updated by TX thread
+	 * while the ACK msg with its own copy of this timestamp is being used
+	 * by a worker thread.
+	 */
+	double txn_last_tm;
 	/** Message sent to applier thread to trigger ACK. */
 	struct applier_ack_msg ack_msg;
 	struct cmsg_hop ack_route[2];
@@ -297,6 +300,13 @@ applier_start(struct applier *applier);
  */
 void
 applier_stop(struct applier *applier);
+
+/**
+ * Kill a client and optionally set an error for it (can be NULL). The client is
+ * expected to be alive.
+ */
+void
+applier_kill(struct applier *applier, struct error *error);
 
 /**
  * Allocate an instance of applier object, create applier and initialize

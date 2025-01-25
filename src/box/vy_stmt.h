@@ -75,6 +75,13 @@ struct vy_stmt_env {
 	 */
 	size_t max_tuple_size;
 	/**
+	 * Size of memory occupied by all vinyl tuples allocated
+	 * in the main thread. Note, this doesn't include keys,
+	 * which should be fine because keys shouldn't stay in
+	 * memory for long.
+	 */
+	size_t sum_tuple_size;
+	/**
 	 * Tuple format used for creating key statements (e.g.
 	 * statements read from secondary index runs). It doesn't
 	 * impose any restrictions on tuple fields, neither does
@@ -312,6 +319,14 @@ vy_stmt_is_empty_key(struct tuple *stmt)
 {
 	return tuple_field_count(stmt) == 0;
 }
+
+/**
+ * Return true if there cannot be more than one tuple equal to
+ * the given vinyl statement in an index.
+ */
+bool
+vy_stmt_is_exact_key(struct tuple *stmt, struct key_def *cmp_def,
+		     struct key_def *key_def, bool is_unique);
 
 /**
  * Duplicate the statememnt.

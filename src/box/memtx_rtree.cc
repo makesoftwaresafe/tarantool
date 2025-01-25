@@ -52,6 +52,18 @@ struct memtx_rtree_index {
 	struct rtree tree;
 };
 
+enum memtx_rtree_reserve_extents_num {
+	/**
+	 * This number is calculated based on the
+	 * max (realistic) number of insertions
+	 * a deletion from a B-tree or an R-tree
+	 * can lead to, and, as a result, the max
+	 * number of new block allocations.
+	 */
+	RESERVE_EXTENTS_BEFORE_DELETE = 8,
+	RESERVE_EXTENTS_BEFORE_REPLACE = 16
+};
+
 /* {{{ Utilities. *************************************************/
 
 static inline int
@@ -152,14 +164,15 @@ static int
 index_rtree_iterator_next(struct iterator *i, struct tuple **ret)
 {
 	struct index_rtree_iterator *itr = (struct index_rtree_iterator *)i;
+	struct space *space;
+	struct index *index;
+	index_weak_ref_get_checked(&i->index_ref, &space, &index);
 	do {
 		*ret = (struct tuple *) rtree_iterator_next(&itr->impl);
 		if (*ret == NULL)
 			break;
-		struct index *idx = i->index;
 		struct txn *txn = in_txn();
-		struct space *space = space_by_id(i->space_id);
-		*ret = memtx_tx_tuple_clarify(txn, space, *ret, idx, 0);
+		*ret = memtx_tx_tuple_clarify(txn, space, *ret, index, 0);
 /********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND START*********/
 		memtx_tx_story_gc();
 /*********MVCC TRANSACTION MANAGER STORY GARBAGE COLLECTION BOUND END**********/
@@ -197,6 +210,7 @@ memtx_rtree_index_size(struct index *base)
 {
 	struct memtx_rtree_index *index = (struct memtx_rtree_index *)base;
 	struct space *space = space_by_id(base->def->space_id);
+	memtx_tx_story_gc();
 	/* Substract invisible count. */
 	return rtree_number_of_records(&index->tree) -
 	       memtx_tx_index_invisible_count(in_txn(), space, base);
@@ -260,6 +274,17 @@ memtx_rtree_index_replace(struct index *base, struct tuple *old_tuple,
 	(void)mode;
 	struct memtx_rtree_index *index = (struct memtx_rtree_index *)base;
 
+	/*
+	 * There's no allocation failure handling in the tree, so it's required
+	 * to reserve potentially big enough space prior to the operations.
+	 */
+	struct memtx_engine *memtx = (struct memtx_engine *)base->engine;
+	if (matras_allocator_reserve(&memtx->index_extent_allocator,
+				     new_tuple != NULL ?
+				     RESERVE_EXTENTS_BEFORE_REPLACE :
+				     RESERVE_EXTENTS_BEFORE_DELETE) != 0)
+		return -1;
+
 	/* RTREE index doesn't support ordering. */
 	*successor = NULL;
 
@@ -294,7 +319,8 @@ memtx_rtree_index_reserve(struct index *base, uint32_t size_hint)
 		return -1;
 	});
 	struct memtx_engine *memtx = (struct memtx_engine *)base->engine;
-	return memtx_index_extent_reserve(memtx, RESERVE_EXTENTS_BEFORE_REPLACE);
+	return matras_allocator_reserve(&memtx->index_extent_allocator,
+					RESERVE_EXTENTS_BEFORE_REPLACE);
 }
 
 /** Implementation of create_iterator for memtx rtree index. */
@@ -400,6 +426,8 @@ static const struct index_vtab memtx_rtree_index_vtab = {
 	/* .get = */ memtx_index_get,
 	/* .replace = */ memtx_rtree_index_replace,
 	/* .create_iterator = */ memtx_rtree_index_create_iterator,
+	/* .create_iterator_with_offset = */
+	generic_index_create_iterator_with_offset,
 	/* .create_read_view = */ generic_index_create_read_view,
 	/* .stat = */ generic_index_stat,
 	/* .compact = */ generic_index_compact,
@@ -439,21 +467,12 @@ memtx_rtree_index_new(struct memtx_engine *memtx, struct index_def *def)
 	}
 
 	struct memtx_rtree_index *index =
-		(struct memtx_rtree_index *)calloc(1, sizeof(*index));
-	if (index == NULL) {
-		diag_set(OutOfMemory, sizeof(*index),
-			 "malloc", "struct memtx_rtree_index");
-		return NULL;
-	}
-	if (index_create(&index->base, (struct engine *)memtx,
-			 &memtx_rtree_index_vtab, def) != 0) {
-		free(index);
-		return NULL;
-	}
+		(struct memtx_rtree_index *)xcalloc(1, sizeof(*index));
+	index_create(&index->base, (struct engine *)memtx,
+		     &memtx_rtree_index_vtab, def);
 
 	index->dimension = def->opts.dimension;
 	rtree_init(&index->tree, index->dimension, distance_type,
-		   MEMTX_EXTENT_SIZE, memtx_index_extent_alloc,
-		   memtx_index_extent_free, memtx, &memtx->index_extent_stats);
+		   &memtx->index_extent_allocator, &memtx->index_extent_stats);
 	return &index->base;
 }

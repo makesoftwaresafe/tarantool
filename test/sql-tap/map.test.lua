@@ -1,8 +1,8 @@
 #!/usr/bin/env tarantool
 local test = require("sqltester")
-test:plan(112)
+test:plan(110)
 
-box.schema.func.create('M1', {
+box.schema.func.create('m1', {
     language = 'Lua',
     body = 'function(a, b) local m = {[a] = b} '..
            'return setmetatable(m, { __serialize = "map" }) end',
@@ -11,7 +11,7 @@ box.schema.func.create('M1', {
     exports = {'LUA', 'SQL'}
 });
 
-box.schema.func.create('M2', {
+box.schema.func.create('m2', {
     language = 'Lua',
     body = 'function(a, b, c, d) local m = {[a] = b, [c] = d} '..
            'return setmetatable(m, { __serialize = "map" }) end',
@@ -20,7 +20,7 @@ box.schema.func.create('M2', {
     exports = {'LUA', 'SQL'}
 });
 
-box.schema.func.create('M3', {
+box.schema.func.create('m3', {
     language = 'Lua',
     body = 'function(a, b, c, d, e, f) local m = {[a] = b, [c] = d, [e] = f} '..
            'return setmetatable(m, { __serialize = "map" }) end',
@@ -37,7 +37,7 @@ test:do_execsql_test(
     ]], {
     })
 
-box.space.T:insert({0, {a = 1, b = 2}})
+box.space.t:insert({0, {a = 1, b = 2}})
 
 -- Make sure it is possible to select from MAP field.
 test:do_execsql_test(
@@ -980,29 +980,6 @@ test:do_catchsql_test(
     ]], {
         1, "Failed to execute SQL statement: wrong arguments for function ZEROBLOB()"
     })
-
--- Make sure that MAP values can be used as a bound variable.
-test:do_test(
-    "builtins-13.1",
-    function()
-        local res = box.execute([[SELECT #a;]], {{['#a'] = {abc = 2, [1] = 3}}})
-        return {res.rows[1][1]}
-    end, {
-        {abc = 2, [1] = 3}
-    })
-
-local remote = require('net.box')
-box.cfg{listen = os.getenv('LISTEN')}
-local cn = remote.connect(box.cfg.listen)
-test:do_test(
-    "builtins-13.2",
-    function()
-        local res = cn:execute([[SELECT #a;]], {{['#a'] = {abc = 2, [1] = 3}}})
-        return {res.rows[1][1]}
-    end, {
-        {abc = 2, [1] = 3}
-    })
-cn:close()
 
 box.execute([[DROP TABLE t1;]])
 box.execute([[DROP TABLE t;]])

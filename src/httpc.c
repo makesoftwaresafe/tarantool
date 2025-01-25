@@ -68,7 +68,7 @@ curl_easy_io_read_cb(char *buffer, size_t size, size_t nitems, void *ctx)
 
 	size_t read_len = ibuf_len < buffer_size ? ibuf_len : buffer_size;
 	memcpy(buffer, req->send.rpos, read_len);
-	req->send.rpos += read_len;
+	ibuf_consume(&req->send, read_len);
 
 	fiber_cond_broadcast(&req->io_send_cond);
 	return read_len;
@@ -141,6 +141,15 @@ httpc_env_create(struct httpc_env *env, int max_conns, int max_total_conns)
 }
 
 void
+httpc_env_finish(struct httpc_env *ctx)
+{
+	assert(ctx);
+
+	curl_env_finish(&ctx->curl_env);
+	ctx->cleanup = 1;
+}
+
+void
 httpc_env_destroy(struct httpc_env *ctx)
 {
 	assert(ctx);
@@ -164,6 +173,7 @@ httpc_request_new(struct httpc_env *env, const char *method,
 	req->env = env;
 	req->set_connection_header = true;
 	req->set_keep_alive_header = true;
+	req->content_length = -1;
 
 	region_create(&req->resp_headers, &cord()->slabc);
 	region_create(&req->recv, &cord()->slabc);
@@ -207,12 +217,18 @@ httpc_request_new(struct httpc_env *env, const char *method,
 
 	ibuf_create(&req->send, &cord()->slabc, 1);
 
+	++env->req_count;
+
 	return req;
 }
 
 void
 httpc_request_delete(struct httpc_request *req)
 {
+	struct httpc_env *env = req->env;
+	--env->req_count;
+	assert(env->req_count >= 0);
+
 	if (req->headers != NULL)
 		curl_slist_free_all(req->headers);
 
@@ -229,6 +245,11 @@ httpc_request_delete(struct httpc_request *req)
 	}
 
 	mempool_free(&req->env->req_pool, req);
+
+	if (env->req_count == 0 &&
+	    env->cleanup == 1) {
+		httpc_env_destroy(env);
+	}
 }
 
 int
@@ -255,10 +276,19 @@ httpc_set_header(struct httpc_request *req, const char *fmt, ...)
 		 strlen(HTTP_CONNECTION_HEADER)) == 0)
 		req->set_connection_header = false;
 	else if (strncasecmp(header, HTTP_CONTENT_LENGTH_HEADER,
-			     strlen(HTTP_CONTENT_LENGTH_HEADER)) == 0)
-		req->set_chunked_header = false;
-	else if (strncasecmp(header, HTTP_KEEP_ALIVE_HEADER,
-			     strlen(HTTP_KEEP_ALIVE_HEADER)) == 0)
+			     strlen(HTTP_CONTENT_LENGTH_HEADER)) == 0) {
+		const char *len = header + strlen(HTTP_CONTENT_LENGTH_HEADER);
+		char *end = NULL;
+		long length = strtol(len, &end, 10);
+		if (*end != '\0' || length < 0) {
+			diag_set(IllegalParams,
+				 "Content-Length header value "
+				 "must be a non-negative integer");
+			return -1;
+		}
+		req->content_length = length;
+	} else if (strncasecmp(header, HTTP_KEEP_ALIVE_HEADER,
+			       strlen(HTTP_KEEP_ALIVE_HEADER)) == 0)
 		req->set_keep_alive_header = false;
 
 	struct curl_slist *l = curl_slist_append(req->headers, header);
@@ -287,7 +317,6 @@ httpc_set_body(struct httpc_request *req, const char *body, size_t size)
 
 	if (httpc_set_header(req, "Content-Length: %zu", size) != 0)
 		return -1;
-	req->set_chunked_header = false;
 
 	return 0;
 }
@@ -435,6 +464,29 @@ httpc_set_accept_encoding(struct httpc_request *req, const char *encoding)
 #endif
 }
 
+int
+httpc_set_http_version(struct httpc_request *req, const char *version)
+{
+	if (strcmp(version, "1.1") == 0) {
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_HTTP_VERSION,
+				 (long)CURL_HTTP_VERSION_1_1);
+	} else if (strcmp(version, "2") == 0) {
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_HTTP_VERSION,
+				 (long)CURL_HTTP_VERSION_2);
+	} else if (strcmp(version, "2-tls") == 0) {
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_HTTP_VERSION,
+				 (long)CURL_HTTP_VERSION_2TLS);
+	} else if (strcmp(version, "2-prior-knowledge") == 0) {
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_HTTP_VERSION,
+				 (long)CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE);
+	} else {
+		diag_set(IllegalParams, "Not a supported http version: %s",
+			 version);
+		return -1;
+	}
+	return 0;
+}
+
 /**
  * The callback to call after a CURL request is completed.
  */
@@ -468,11 +520,15 @@ httpc_set_io(struct httpc_request *req, const char *method)
 		curl_easy_setopt(req->curl_request.easy, CURLOPT_READFUNCTION,
 				 curl_easy_io_read_cb);
 		curl_easy_setopt(req->curl_request.easy, CURLOPT_UPLOAD, 1L);
+		if (req->content_length >= 0) {
+			curl_easy_setopt(req->curl_request.easy,
+					 CURLOPT_INFILESIZE,
+					 req->content_length);
+		}
 		req->io_send = true;
 		req->io_send_closed = false;
 		req->io_headers_cond = &req->io_send_cond;
 	} else {
-		req->set_chunked_header = false;
 		req->io_send = false;
 		req->io_send_closed = true;
 		req->io_headers_cond = &req->io_recv_cond;
@@ -528,7 +584,7 @@ httpc_request_io_read(struct httpc_request *req, char *buf, size_t len,
 		if (copied == ibuf_len)
 			ibuf_reset(&req->io_recv);
 		else
-			req->io_recv.rpos += copied;
+			ibuf_consume(&req->io_recv, copied);
 	}
 
 	if (copied < len && recv_len > 0) {
@@ -545,7 +601,7 @@ httpc_request_io_read(struct httpc_request *req, char *buf, size_t len,
 
 		if (recv_len > remain) {
 			const size_t tocopy = recv_len - remain;
-			char *ptr = ibuf_alloc(&req->io_recv, tocopy);
+			char *ptr = xibuf_alloc(&req->io_recv, tocopy);
 			memcpy(ptr, recv + remain, tocopy);
 		}
 
@@ -593,7 +649,7 @@ httpc_request_io_write(struct httpc_request *req, const char *ptr, size_t len,
 
 	if (len > 0) {
 		ibuf_reset(&req->send);
-		char *buf = ibuf_alloc(&req->send, len);
+		char *buf = xibuf_alloc(&req->send, len);
 		memcpy(buf, ptr, len);
 	} else {
 		req->io_send_closed = true;
@@ -649,9 +705,6 @@ httpc_request_start(struct httpc_request *req, double timeout)
 	if (req->set_keep_alive_header && req->keep_alive_timeout > 0 &&
 	    httpc_set_header(req, "Keep-Alive: timeout=%ld",
 			     req->keep_alive_timeout) != 0)
-		return -1;
-	if (req->io && req->set_chunked_header &&
-	    httpc_set_header(req, "Transfer-Encoding: chunked") != 0)
 		return -1;
 
 	curl_easy_setopt(req->curl_request.easy, CURLOPT_WRITEDATA, (void *) req);

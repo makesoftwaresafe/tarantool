@@ -633,14 +633,6 @@ sql_bind_parameter_lindex(struct Vdbe *v, const char *zName, int nName);
 #endif
 
 /*
- * GCC does not define the offsetof() macro so we'll have to do it
- * ourselves.
- */
-#ifndef offsetof
-#define offsetof(STRUCTURE,FIELD) ((int)((char*)&((STRUCTURE*)0)->FIELD))
-#endif
-
-/*
  * Macros to compute minimum and maximum of two numbers.
  */
 #ifndef MIN
@@ -1223,7 +1215,7 @@ struct UnpackedRecord {
  * @param field Number of field to be examined.
  * @retval Estimate logarithm of tuples selected by given field.
  */
-log_est_t
+int16_t
 index_field_tuple_est(const struct index_def *idx, uint32_t field);
 
 #ifdef DEFAULT_TUPLE_COUNT
@@ -1415,8 +1407,8 @@ struct Expr {
 #define EP_Error     0x000008	/* Expression contains one or more errors */
 #define EP_Distinct  0x000010	/* Aggregate function with DISTINCT keyword */
 #define EP_VarSelect 0x000020	/* pSelect is correlated, not constant */
-#define EP_DblQuoted 0x000040	/* token.z was originally in "..." */
-#define EP_InfixFunc 0x000080	/* True for an infix function: LIKE, etc */
+/** Second lookup could be performed for the ID. */
+#define EP_Lookup2   0x000040
 #define EP_Collate   0x000100	/* Tree contains a TK_COLLATE operator */
 #define EP_IntValue  0x000400	/* Integer value contained in u.iValue */
 #define EP_xIsSelect 0x000800	/* x.pSelect is valid (otherwise x.pList is) */
@@ -1430,7 +1422,6 @@ struct Expr {
 #define EP_ConstFunc 0x080000	/* A sql_FUNC_CONSTANT or _SLOCHNG function */
 #define EP_CanBeNull 0x100000	/* Can be null despite NOT NULL constraint */
 #define EP_Subquery  0x200000	/* Tree contains a TK_SELECT operator */
-#define EP_Alias     0x400000	/* Is an alias for a result set column */
 #define EP_Leaf      0x800000	/* Expr.pLeft, .pRight, .u.pSelect all NULL */
 /** Expression is system-defined. */
 #define EP_System    0x1000000
@@ -1496,6 +1487,8 @@ struct ExprList {
 		Expr *pExpr;	/* The list of expressions */
 		char *zName;	/* Token associated with this expression */
 		char *zSpan;	/* Original text of the expression */
+		/** Normalized name for the second lookup. */
+		char *legacy_name;
 		enum sort_order sort_order;
 		unsigned done:1;	/* A flag to indicate when processing is finished */
 		unsigned bSpanIsTab:1;	/* zSpan holds DB.TABLE.COLUMN */
@@ -1539,6 +1532,8 @@ struct ExprSpan {
 struct IdList {
 	struct IdList_item {
 		char *zName;	/* Name of the identifier */
+		/** Normalized name for the second lookup. */
+		char *legacy_name;
 		int idx;	/* Index in some Table.aCol[] of a column named zName */
 	} *a;
 	int nId;		/* Number of identifiers on the list */
@@ -1594,6 +1589,8 @@ struct SrcList {
 	struct SrcList_item {
 		char *zName;	/* Name of the table */
 		char *zAlias;	/* The "B" part of a "A AS B" phrase.  zName is the "A" */
+		/** Normalized name for the second lookup. */
+		char *legacy_name;
 		/** A space corresponding to zName */
 		struct space *space;
 		Select *pSelect;	/* A SELECT statement used in place of a table name */
@@ -1625,6 +1622,8 @@ struct SrcList {
 			char *zIndexedBy;	/* Identifier from "INDEXED BY <zIndex>" clause */
 			ExprList *pFuncArg;	/* Arguments to table-valued-function */
 		} u1;
+		/** Normalized index name for the second lookup. */
+		char *legacy_index_name;
 		struct index_def *pIBIndex;
 	} a[1];			/* One entry for each identifier on the list */
 };
@@ -1935,6 +1934,14 @@ enum ast_type {
 	ast_type_MAX
 };
 
+/** Information about the expressions that will be used as default values. */
+struct sql_default_func {
+	/** Fieldno of the field to which default value will be added. */
+	uint32_t fieldno;
+	/** Register that will contain the ID of the new SQL EXPR functions. */
+	int reg_func_id;
+};
+
 /*
  * An SQL parser context.  A copy of this structure is passed through
  * the parser and down into all the parser action routine in order to
@@ -2046,7 +2053,6 @@ struct Parse {
 		struct create_trigger_def create_trigger_def;
 		struct create_view_def create_view_def;
 		struct rename_entity_def rename_entity_def;
-		struct drop_constraint_def drop_constraint_def;
 		struct drop_index_def drop_index_def;
 		struct drop_table_def drop_table_def;
 		struct drop_trigger_def drop_trigger_def;
@@ -2062,6 +2068,10 @@ struct Parse {
 	 */
 	struct create_table_def create_table_def;
 	struct create_column_def create_column_def;
+	/** Array of default function descriptions. */
+	struct sql_default_func *default_funcs;
+	/** Length of array of default function descriptions. */
+	uint32_t default_func_count;
 	/** AST of parsed SQL statement. */
 	struct sql_ast ast;
 	/*
@@ -2462,49 +2472,30 @@ void sqlTreeViewWith(TreeView *, const With *);
 
 void sqlDequote(char *);
 
-/**
- * Perform SQL name normalization: cast name to the upper-case
- * (via Unicode Character Folding). Casing is locale-independent
- * and context-sensitive. The result may be longer or shorter
- * than the original. The source string and the destination buffer
- * must not overlap.
- * For example, ß is converted to SS.
- * The result is similar to SQL UPPER function.
- *
- * @param dst A buffer for the result string. The result will be
- *        0-terminated if the buffer is large enough. The contents
- *        is undefined in case of failure.
- * @param dst_size The size of the buffer (number of bytes).
- * @param src The original string.
- * @param src_len The length of the original string.
- * @retval The count of bytes written (or need to be written).
- */
-int
-sql_normalize_name(char *dst, int dst_size, const char *src, int src_len);
+/** Duplicate the string and remove the double quotes if necessary. */
+char *
+sql_name_new(const char *name, int len);
 
 /**
- * Duplicate a normalized version of @a name onto an sql_xmalloc().
- * For normalization rules @sa sql_normalize_name().
- *
- * @param name Source string.
- * @param len Length of @a name.
- * @retval Not NULL Success. A normalized string is returned.
+ * Duplicate the string onto parser region and remove the double quotes if
+ * necessary.
  */
 char *
-sql_normalized_name_new(const char *name, int len);
+sql_name_temp(struct Parse *parser, const char *name, int len);
+
+/** Normalize the given name and write it to the newly allocated memory. */
+char *
+sql_legacy_name_new(const char *name, int len);
 
 /**
- * Duplicate a normalized version of @a name onto a region @a r.
- * For normalization rules @sa sql_normalize_name().
- * @param r Region allocator.
- * @param name Source string.
- * @param len Length of @a name.
- * @retval Not NULL Success. A normalized string is returned.
- * @retval NULL Error. A diag message is set. Region is not
- *         truncated back.
+ * Normalize the given NULL-terminated name and write it to the newly allocated
+ * memory.
  */
-char *
-sql_normalized_name_region_new(struct region *r, const char *name, int len);
+static inline char *
+sql_legacy_name_new0(const char *name)
+{
+	return sql_legacy_name_new(name, strlen(name));
+}
 
 /**
  * Return an escaped version of the original name in memory allocated with
@@ -2624,6 +2615,16 @@ struct Expr *
 expr_new_variable(struct Parse *parse, const struct Token *spec,
 		  const struct Token *id);
 
+/** Return TRUE if expression is term, FALSE otherwise. */
+static inline bool
+sql_expr_is_term(const struct Expr *expr)
+{
+	uint8_t op = expr->op;
+	return op == TK_STRING || op == TK_BLOB || op == TK_INTEGER ||
+	       op == TK_FLOAT || op == TK_DECIMAL || op == TK_TRUE ||
+	       op == TK_FALSE || op == TK_UNKNOWN || op == TK_NULL;
+}
+
 /**
  * Set the sort order for the last element on the given ExprList.
  *
@@ -2682,7 +2683,7 @@ sql_show_create_table(uint32_t space_id, struct Mem *ret, struct Mem *err);
  * the rest of fields.
  */
 bool
-sql_space_column_is_in_pk(struct space *space, uint32_t);
+sql_space_column_is_in_pk(const struct space *space, uint32_t);
 
 /**
  * Given an expression list (which is really the list of expressions
@@ -2749,7 +2750,14 @@ sqlAddPrimaryKey(struct Parse *parse);
 void
 sql_create_check_contraint(struct Parse *parser, bool is_field_ck);
 
-void sqlAddDefaultValue(Parse *, ExprSpan *);
+/** Add a default literal to the last created column. */
+void
+sql_add_term_default(struct Parse *parser, struct ExprSpan *expr_span);
+
+/** Add a default expression to the last created column. */
+void
+sql_add_func_default(struct Parse *parser, struct ExprSpan *span);
+
 void sqlAddCollateType(Parse *, Token *);
 
 /**
@@ -2778,8 +2786,8 @@ sqlEndTable(struct Parse *parse);
  * @param space Pointer to space object.
  */
 void
-vdbe_emit_open_cursor(struct Parse *parse, int cursor, int index_id,
-		      struct space *space);
+vdbe_emit_open_cursor(struct Parse *parse, int cursor, uint32_t index_id,
+		      const struct space *space);
 
 /**
  * The parser calls this routine in order to create a new VIEW.
@@ -3092,11 +3100,153 @@ void sqlExprIfFalse(Parse *, Expr *, int, int);
  * Does not return NULL.
  */
 static inline char *
-sql_name_from_token(struct Token *t)
+sql_name_from_token(const struct Token *t)
 {
 	assert(t != NULL && t->z != NULL);
-	return sql_normalized_name_new(t->z, t->n);
+	return sql_name_new(t->z, t->n);
 }
+
+/**
+ * Return the name from the token in static memory. Should only be used in case
+ * of errors, as the name may be truncated due to static memory limitations.
+ */
+static inline const char *
+sql_tt_name_from_token(const struct Token *t)
+{
+	char *name = sql_name_from_token(t);
+	const char *res = tt_cstr(name, strlen(name));
+	sql_xfree(name);
+	return res;
+}
+
+/**
+ * Return space with name defined by the token. A second lookup will be
+ * performed if the space is not found on the first try and token is not start
+ * with double quote. Return NULL if the space was not found.
+ */
+const struct space *
+sql_space_by_token(const struct Token *name);
+
+/**
+ * Return space with name defined by the element of struct SrcList. A second
+ * lookup will be performed if the space is not found on the first try and field
+ * legacy_name of the src is not NULL. Return NULL if the space was not found.
+ */
+const struct space *
+sql_space_by_src(const struct SrcList_item *src);
+
+/**
+ * Return the fieldno of the field with the given name. Return UINT32_MAX if the
+ * field was not found.
+ */
+uint32_t
+sql_space_fieldno(const struct space *space, const char *name);
+
+/**
+ * Return id of index with the name defined by the token. A second lookup will
+ * be performed if the index is not found on the first try and token is not
+ * start with double quote. Return UINT32_MAX if the index was not found.
+ */
+uint32_t
+sql_index_id_by_token(const struct space *space, const struct Token *name);
+
+/**
+ * Return index with name defined by the element of struct SrcList. A second
+ * lookup will be performed if the index is not found on the first try and field
+ * legacy_index_name of the src is not NULL. Return NULL if the index was not
+ * found.
+ */
+uint32_t
+sql_index_id_by_src(const struct SrcList_item *src);
+
+/**
+ * Return the fieldno of the field with the name defined by the token. Return
+ * UINT32_MAX if the field was not found.
+ */
+uint32_t
+sql_fieldno_by_token(const struct space *space, const struct Token *name);
+
+/**
+ * Return the fieldno of the field with the name defined by the element of
+ * IdList. A second lookup will be performed if the field is not found on the
+ * first try and field legacy_name of the id is not NULL. Return UINT32_MAX if
+ * the field was not found.
+ */
+uint32_t
+sql_fieldno_by_id(const struct space *space, const struct IdList_item *id);
+
+/**
+ * Return the fieldno of the field with the name defined by the expression. A
+ * second lookup will be performed if the field is not found on the first try
+ * and flag EP_Lookup2 is set. Return UINT32_MAX if the field was not found.
+ */
+uint32_t
+sql_fieldno_by_expr(const struct space *space, const struct Expr *expr);
+
+/**
+ * Return the fieldno of the field with the name defined by the name of
+ * expression from exprList. A second lookup will be performed if the field is
+ * not found on the first try and field legacy_name of element of ExprList is
+ * not NULL. Return UINT32_MAX if the field was not found.
+ */
+uint32_t
+sql_fieldno_by_item(const struct space *space, const struct ExprList_item *it);
+
+/**
+ * Return the ID of the collation with the name defined by the token. A second
+ * lookup will be performed if the collation is not found on the first try and
+ * token is not start with double quote. Return UINT32_MAX if the field was not
+ * found.
+ */
+uint32_t
+sql_coll_id_by_token(const struct Token *name);
+
+/**
+ * Return the ID of the collation with the name defined by the expression. A
+ * second lookup will be performed if the collation is not found on the first
+ * try and EP_Lookup2 flag is set. Return UINT32_MAX if the collation was not
+ * found.
+ */
+uint32_t
+sql_coll_id_by_expr(const struct Expr *expr);
+
+/**
+ * Return the tuple foreign key constraint with the name defined by the token.
+ * A second lookup will be performed if the constraint is not found on the first
+ * try and token is not start with double quote. Return NULL if the tuple
+ * foreign key constraint was not found.
+ */
+const struct tuple_constraint_def *
+sql_tuple_fk_by_token(const struct space *space, const struct Token *name);
+
+/**
+ * Return the tuple check constraint with the name defined by the token. A
+ * second lookup will be performed if the constraint is not found on the first
+ * try and token is not start with double quote. Return NULL if the tuple check
+ * constraint was not found.
+ */
+const struct tuple_constraint_def *
+sql_tuple_ck_by_token(const struct space *space, const struct Token *name);
+
+/**
+ * Return the field foreign key constraint with the name defined by the token.
+ * A second lookup will be performed if the constraint is not found on the first
+ * try and token is not start with double quote. Return NULL if the field
+ * foreign key constraint was not found.
+ */
+const struct tuple_constraint_def *
+sql_field_fk_by_token(const struct space *space, uint32_t fieldno,
+		      const struct Token *name);
+
+/**
+ * Return the field check constraint with the name defined by the token. A
+ * second lookup will be performed if the constraint is not found on the first
+ * try and token is not start with double quote. Return NULL if the field check
+ * constraint was not found.
+ */
+const struct tuple_constraint_def *
+sql_field_ck_by_token(const struct space *space, uint32_t fieldno,
+		      const struct Token *name);
 
 int sqlExprCompare(Expr *, Expr *, int);
 int sqlExprListCompare(ExprList *, ExprList *, int);
@@ -3601,17 +3751,47 @@ int sqlJoinType(Parse *, Token *, Token *, Token *);
 void
 sql_create_foreign_key(struct Parse *parse_context);
 
-/**
- * Emit code to drop the entry from _index or _ck_contstraint or
- * _fk_constraint space corresponding with the constraint type.
- *
- * Function called from parser to handle
- * <ALTER TABLE table DROP CONSTRAINT constraint> SQL statement.
- *
- * @param parse_context Parsing context.
- */
+/** Emit code to drop UNIQUE, tuple FOREIGN KEY or tuple CHECK constraint. */
 void
-sql_drop_constraint(struct Parse *parse_context);
+sql_drop_table_constraint(struct Parse *parser, const struct Token *table_name,
+			  const struct Token *constraint_name);
+
+/** Emit code to drop tuple FOREIGN KEY constraint. */
+void
+sql_drop_tuple_foreign_key(struct Parse *parser, const struct Token *table_name,
+			   const struct Token *name);
+
+/** Emit code to drop tuple CHECK constraint. */
+void
+sql_drop_tuple_check(struct Parse *parser, const struct Token *table_name,
+		     const struct Token *name);
+
+/** Emit code to drop PRIMARY KEY constraint. */
+void
+sql_drop_primary_key(struct Parse *parser, const struct Token *table_name,
+		     const struct Token *name);
+
+/** Emit code to drop UNIQUE constraint. */
+void
+sql_drop_unique(struct Parse *parser, const struct Token *table_name,
+		const struct Token *name);
+
+/** Emit code to field FOREIGN KEY or field CHECK constraint. */
+void
+sql_drop_field_constraint(struct Parse *parser, const struct Token *table_name,
+			  const struct Token *column_name,
+			  const struct Token *name);
+
+/** Emit code to drop field FOREIGN KEY constraint. */
+void
+sql_drop_field_foreign_key(struct Parse *parser, const struct Token *table_name,
+			   const struct Token *column_name,
+			   const struct Token *name);
+
+/** Emit code to drop field CHECK constraint. */
+void
+sql_drop_field_check(struct Parse *parser, const struct Token *table_name,
+		     const struct Token *column_name, const struct Token *name);
 
 /**
  * Now our SQL implementation can't operate on spaces which
@@ -3728,21 +3908,7 @@ int sqlVListNameToNum(VList *, const char *, int);
  */
 int sqlPutVarint(unsigned char *, u64);
 u8 sqlGetVarint(const unsigned char *, u64 *);
-u8 sqlGetVarint32(const unsigned char *, u32 *);
 int sqlVarintLen(u64 v);
-
-/*
- * The common case is for a varint to be a single byte.  They following
- * macros handle the common case without a procedure call, but then call
- * the procedure for larger varints.
- */
-#define getVarint32(A,B)  \
-  (u8)((*(A)<(u8)0x80)?((B)=(u32)*(A)),1:sqlGetVarint32((A),(u32 *)&(B)))
-#define putVarint32(A,B)  \
-  (u8)(((u32)(B)<(u32)0x80)?(*(A)=(unsigned char)(B)),1:\
-  sqlPutVarint((A),(B)))
-#define getVarint    sqlGetVarint
-#define putVarint    sqlPutVarint
 
 /**
  * Code an OP_ApplyType opcode that will force types
@@ -3954,7 +4120,15 @@ void sqlSelectPrep(Parse *, Select *, NameContext *);
 const char *
 sql_select_op_name(int id);
 
-int sqlMatchSpanName(const char *, const char *, const char *);
+/**
+ * Subqueries stores the original table and column names for their result sets
+ * in ExprList.a[].zSpan, in the form "TABLE.COLUMN". Check to see if the span
+ * given to this routine matches given table or column names.
+ */
+bool
+sqlMatchSpanName(const char *span, const char *col, const char *tab,
+		 const char *old_col, const char *old_tab);
+
 int sqlResolveExprNames(NameContext *, Expr *);
 int sqlResolveExprListNames(NameContext *, ExprList *);
 void sqlResolveSelectNames(Parse *, Select *, NameContext *);
@@ -3968,17 +4142,6 @@ int sqlResolveOrderGroupBy(Parse *, Select *, ExprList *, const char *);
  */
 char *
 rename_trigger(char const *sql_stmt, char const *table_name, bool *is_quoted);
-
-/**
- * Find a collation by name. Set error in @a parser if not found.
- * @param parser Parser.
- * @param name Collation name.
- * @param[out] Collation identifier.
- *
- * @retval Collation object. NULL on error or not found.
- */
-struct coll *
-sql_get_coll_seq(Parse *parser, const char *name, uint32_t *coll_id);
 
 /**
  * This function returns average size of tuple in given index.
@@ -4325,7 +4488,7 @@ sql_func_finalize(const char *name);
  * function, 0 is returned, which means no parameters have been set.
  */
 uint32_t
-sql_func_flags(const char *name);
+sql_func_flags(const struct Expr *expr);
 
 /**
  * Generate VDBE code to halt execution with correct error if
@@ -4351,19 +4514,6 @@ vdbe_emit_halt_with_presence_test(struct Parse *parser, int space_id,
 				  int tarantool_error_code,
 				  const char *error_src, bool no_error,
 				  int cond_opcode);
-
-/**
- * Generate VDBE code to delete records from system _sql_stat1 or
- * _sql_stat4 table.
- *
- * @param parse The parsing context.
- * @param stat_table_name System stat table name.
- * @param idx_name Index name.
- * @param table_name Table name.
- */
-void
-vdbe_emit_stat_space_clear(struct Parse *parse, const char *stat_table_name,
-			   const char *idx_name, const char *table_name);
 
 /**
  * Add AUTOINCREMENT feature for one of INTEGER or UNSIGNED fields

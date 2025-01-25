@@ -57,6 +57,10 @@ extern const struct type_info type_RaftError;
 extern const struct type_info type_FileFormatError;
 /* type_info for FiberSliceIsExceeded exception */
 extern const struct type_info type_FiberSliceIsExceeded;
+/* type_info for EncodeError exception */
+extern const struct type_info type_EncodeError;
+/* type_info for DecodeError exception */
+extern const struct type_info type_DecodeError;
 
 const char *
 exception_get_string(struct error *e, const struct method_info *method);
@@ -271,11 +275,27 @@ public:
 	virtual void raise() { throw this; }
 };
 
-/**
- * Initialize the exception subsystem.
- */
-void
-exception_init();
+class EncodeError: public Exception {
+public:
+	EncodeError(const char *file, unsigned line, const char *format, ...);
+
+	EncodeError()
+		: Exception(&type_EncodeError, NULL, 0)
+	{
+	}
+	virtual void raise() { throw this; }
+};
+
+class DecodeError: public Exception {
+public:
+	DecodeError(const char *file, unsigned line, const char *format, ...);
+
+	DecodeError()
+		: Exception(&type_DecodeError, NULL, 0)
+	{
+	}
+	virtual void raise() { throw this; }
+};
 
 #define tnt_error(class, ...) ({					\
 	say_debug("%s at %s:%i", #class, __FILE__, __LINE__);		\

@@ -452,13 +452,13 @@ box.atomic(tx);
 function tx_error(space)
     space:auto_increment{'third'}
     space:auto_increment{'fourth'}
-    error("some error")
+    box.error(box.error.ILLEGAL_PARAMS, "some error")
 end;
 ---
 ...
 box.atomic(tx_error, space);
 ---
-- error: '[string "function tx_error(space)     space:auto_incre..."]:1: some error'
+- error: some error
 ...
 function nested(space)
     box.begin()
@@ -602,7 +602,7 @@ box.begin()
 box.space.test:truncate()
 box.space.vinyl:select{};
 ---
-- error: A multi-statement transaction can not use multiple storage engines
+- error: Storage engine 'vinyl' does not support cross-engine transactions
 ...
 -- A transaction is left open due to an exception in the Lua fragment
 box.rollback();
@@ -638,7 +638,7 @@ box.begin()
 box.space.test:truncate()
 box.space.vinyl:insert{2, 'truncate'};
 ---
-- error: A multi-statement transaction can not use multiple storage engines
+- error: Storage engine 'vinyl' does not support cross-engine transactions
 ...
 -- A transaction is left open due to an exception in the above fragment
 box.rollback();

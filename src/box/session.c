@@ -42,6 +42,10 @@
 #include "watcher.h"
 #include "on_shutdown.h"
 #include "sql.h"
+#include "tweaks.h"
+#include "event.h"
+#include "schema.h"
+#include "port.h"
 
 const char *session_type_strs[] = {
 	"background",
@@ -76,6 +80,11 @@ static struct fiber_cond shutdown_list_empty_cond;
 RLIST_HEAD(session_on_connect);
 RLIST_HEAD(session_on_disconnect);
 RLIST_HEAD(session_on_auth);
+struct event *session_on_connect_event;
+struct event *session_on_disconnect_event;
+struct event *session_on_auth_event;
+
+struct event *on_access_denied_event;
 
 static inline uint64_t
 sid_max(void)
@@ -320,8 +329,13 @@ session_remove_stmt_id(struct session *session, uint32_t stmt_id)
  */
 struct credentials admin_credentials;
 
+/**
+ * Runs on_connect or on_disconnect triggers. Argument triggers is for internal
+ * triggers and argument event is for user-defined ones.
+ */
 static int
-session_run_triggers(struct session *session, struct rlist *triggers)
+session_run_triggers(struct session *session, struct rlist *triggers,
+		     struct event *event)
 {
 	struct fiber *fiber = fiber();
 	assert(session == current_session());
@@ -330,7 +344,10 @@ session_run_triggers(struct session *session, struct rlist *triggers)
 	fiber_set_user(fiber, &admin_credentials);
 
 	int rc = trigger_run(triggers, NULL);
-
+	if (rc != 0)
+		goto out;
+	rc = event_run_triggers(event, NULL);
+out:
 	/* Restore original credentials */
 	fiber_set_user(fiber, &session->credentials);
 
@@ -340,20 +357,31 @@ session_run_triggers(struct session *session, struct rlist *triggers)
 void
 session_run_on_disconnect_triggers(struct session *session)
 {
-	if (session_run_triggers(session, &session_on_disconnect) != 0)
+	if (session_run_triggers(session, &session_on_disconnect,
+				 session_on_disconnect_event) != 0)
 		diag_log();
 }
 
 int
 session_run_on_connect_triggers(struct session *session)
 {
-	return session_run_triggers(session, &session_on_connect);
+	return session_run_triggers(session, &session_on_connect,
+				    session_on_connect_event);
 }
 
 int
 session_run_on_auth_triggers(const struct on_auth_trigger_ctx *result)
 {
-	return trigger_run(&session_on_auth, (void *)result);
+	if (trigger_run(&session_on_auth, (void *)result) != 0)
+		return -1;
+
+	struct port args;
+	port_c_create(&args);
+	port_c_add_str(&args, result->user_name, result->user_name_len);
+	port_c_add_bool(&args, result->is_authenticated);
+	int rc = event_run_triggers(session_on_auth_event, &args);
+	port_destroy(&args);
+	return rc;
 }
 
 void
@@ -415,11 +443,45 @@ session_on_shutdown_f(void *arg)
 	return 0;
 }
 
+/**
+ * Runs user-defined on_access_denied triggers.
+ */
+static int
+session_on_access_denied(struct trigger *trigger, void *data)
+{
+	(void)trigger;
+	assert(on_access_denied_event != NULL);
+	struct on_access_denied_ctx *data_ctx =
+		(struct on_access_denied_ctx *)data;
+
+	struct port args;
+	port_c_create(&args);
+	port_c_add_str0(&args, data_ctx->access_type);
+	port_c_add_str0(&args, data_ctx->object_type);
+	port_c_add_str0(&args, data_ctx->object_name);
+	int rc = event_run_triggers(on_access_denied_event, &args);
+	port_destroy(&args);
+	return rc;
+}
+
+static TRIGGER(session_on_access_denied_trigger, session_on_access_denied);
+
 void
 session_init(void)
 {
 	for (int type = 0; type < session_type_MAX; type++)
 		session_vtab_registry[type] = generic_session_vtab;
+	session_on_connect_event = event_get("box.session.on_connect", true);
+	event_ref(session_on_connect_event);
+	session_on_disconnect_event =
+		event_get("box.session.on_disconnect", true);
+	event_ref(session_on_disconnect_event);
+	session_on_auth_event = event_get("box.session.on_auth", true);
+	event_ref(session_on_auth_event);
+	on_access_denied_event =
+		event_get("box.session.on_access_denied", true);
+	event_ref(on_access_denied_event);
+	trigger_add(&on_access_denied, &session_on_access_denied_trigger);
 	session_registry = mh_i64ptr_new();
 	mempool_create(&session_pool, &cord()->slabc, sizeof(struct session));
 	credentials_create(&admin_credentials, admin_user);
@@ -432,6 +494,15 @@ session_init(void)
 void
 session_free(void)
 {
+	trigger_clear(&session_on_access_denied_trigger);
+	event_unref(session_on_connect_event);
+	session_on_connect_event = NULL;
+	event_unref(session_on_disconnect_event);
+	session_on_disconnect_event = NULL;
+	event_unref(session_on_auth_event);
+	session_on_auth_event = NULL;
+	event_unref(on_access_denied_event);
+	on_access_denied_event = NULL;
 	if (session_registry)
 		mh_i64ptr_delete(session_registry);
 	credentials_destroy(&admin_credentials);
@@ -454,9 +525,7 @@ access_check_session(struct user *user)
 }
 
 int
-access_check_universe_object(user_access_t access,
-			     enum schema_object_type object_type,
-			     const char *object_name)
+access_check_universe(user_access_t access)
 {
 	struct credentials *credentials = effective_user();
 	access |= PRIV_U;
@@ -472,7 +541,7 @@ access_check_universe_object(user_access_t access,
 		if (user != NULL) {
 			diag_set(AccessDeniedError,
 				 priv_name(denied_access),
-				 schema_object_name(object_type), object_name,
+				 schema_object_name(SC_UNIVERSE), "",
 				 user->def->name);
 		} else {
 			/*
@@ -487,10 +556,22 @@ access_check_universe_object(user_access_t access,
 	return 0;
 }
 
+/**
+ * If set, raise an error on any attempt to use box.session.push.
+ */
+static bool box_session_push_is_disabled = true;
+TWEAK_BOOL(box_session_push_is_disabled);
+
 int
-access_check_universe(user_access_t access)
+session_push_check_deprecation(void)
 {
-	return access_check_universe_object(access, SC_UNIVERSE, "");
+	say_warn_once("box.session.push is deprecated. "
+		      "Consider using box.broadcast instead.");
+	if (box_session_push_is_disabled) {
+		diag_set(ClientError, ER_DEPRECATED, "box.session.push");
+		return -1;
+	}
+	return 0;
 }
 
 int

@@ -25,6 +25,8 @@ local _enterprise_keys = {
     audit_nonblock = true,
     audit_format = true,
     audit_filter = true,
+    audit_spaces = true,
+    audit_extract_key = true,
     flightrec_enabled = true,
     flightrec_logs_size = true,
     flightrec_logs_max_msg_size = true,
@@ -35,7 +37,9 @@ local _enterprise_keys = {
     flightrec_requests_max_req_size = true,
     flightrec_requests_max_res_size = true,
     auth_delay = true,
+    auth_retries = true,
     disable_guest = true,
+    secure_erasing = true,
     password_lifetime_days = true,
     password_min_length = true,
     password_enforce_uppercase = true,
@@ -44,6 +48,7 @@ local _enterprise_keys = {
     password_enforce_specialchars = true,
     password_history_length = true,
     wal_ext = true,
+    wal_retention_period = true,
 }
 
 function cfg_filter(data)

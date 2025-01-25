@@ -243,7 +243,7 @@ end
 -- Make sure TYPEOF() properly works with the MAP constructor.
 g.test_map_4 = function()
     g.server:exec(function()
-        local sql = [[SELECT typeof({'a' : 123});]]
+        local sql = [[SELECT TYPEOF({'a' : 123});]]
         local res = {{'map'}}
         t.assert_equals(box.execute(sql).rows, res)
     end)
@@ -252,7 +252,7 @@ end
 -- Make sure PRINTF() properly works with the MAP constructor.
 g.test_map_5 = function()
     g.server:exec(function()
-        local sql = [[SELECT printf({});]]
+        local sql = [[SELECT PRINTF({});]]
         local res = {{'{}'}}
         t.assert_equals(box.execute(sql).rows, res)
     end)
@@ -319,4 +319,22 @@ g.test_map_9 = function()
         local res = {{{b = 3, a = 4}}}
         t.assert_equals(box.execute(sql).rows, res)
     end)
+end
+
+-- Make sure that MAP values can be used as a bound variable.
+g.test_map_binding_local = function()
+    g.server:exec(function()
+        local sql = [[SELECT #a;]]
+        local arg = {{['#a'] = {abc = 2, [1] = 3}}}
+        local res = {abc = 2, [1] = 3}
+        t.assert_equals(box.execute(sql, arg).rows[1][1], res)
+    end)
+end
+
+g.test_map_binding_remote = function()
+    local conn = g.server.net_box
+    local ok, res = pcall(conn.execute, conn, [[SELECT #a;]],
+                          {{['#a'] = {abc = 2, [1] = 3}}})
+    t.assert_equals(ok, true)
+    t.assert_equals(res.rows[1][1], {abc = 2, [1] = 3})
 end

@@ -18,17 +18,17 @@ g.test_sql_func_expr_1 = function()
         local def = {language = 'SQL_EXPR', is_deterministic = true,
                      body = 'a * b > 10'}
         box.schema.func.create('abc', def)
-        local format = {{'A', 'integer'}, {'B', 'integer'}}
+        local format = {{'a', 'integer'}, {'b', 'integer'}}
         local s = box.schema.space.create('test', {format = format})
         s:create_index('i')
         s:alter{constraint='abc'}
         t.assert_equals(s:insert{3, 4}, {3, 4})
         t.assert_error_msg_content_equals(
-            "Check constraint 'abc' failed for tuple",
+            "Check constraint 'abc' failed for a tuple",
             function() s:insert{1, 2} end
         )
         t.assert_error_msg_content_equals(
-            "Check constraint 'abc' failed for tuple",
+            "Check constraint 'abc' failed for a tuple",
             function() s:insert{true, 2} end
         )
         box.space.test:drop()
@@ -37,12 +37,12 @@ g.test_sql_func_expr_1 = function()
         def = {language = 'SQL_EXPR', is_deterministic = true,
                body = 'x * x % 10 == 6'}
         box.schema.func.create('abc', def)
-        format = {{name = 'A', type = 'integer', constraint = 'abc'}}
+        format = {{name = 'a', type = 'integer', constraint = 'abc'}}
         s = box.schema.space.create('test', {format = format})
         s:create_index('i')
         t.assert_equals(s:insert{4}, {4})
         t.assert_error_msg_content_equals(
-            "Check constraint 'abc' failed for field '1 (A)'",
+            "Check constraint 'abc' failed for field '1 (a)'",
             function() s:insert{1} end
         )
         box.space.test:drop()
@@ -51,7 +51,7 @@ g.test_sql_func_expr_1 = function()
         def = {language = 'SQL_EXPR', is_deterministic = true,
                body = 'x + y > 0'}
         box.schema.func.create('abc', def)
-        format = {{name = 'A', type = 'integer', constraint = 'abc'}}
+        format = {{name = 'a', type = 'integer', constraint = 'abc'}}
         t.assert_error_msg_content_equals(
             "Failed to create constraint 'abc' in space 'test': Number of "..
             "arguments in a SQL field constraint function is greater than one",
@@ -96,12 +96,12 @@ g.test_sql_func_expr_3 = function()
         local def = {language = 'SQL_EXPR', is_deterministic = true,
                      body = 'a * b > 10'}
         box.schema.func.create('abc', def)
-        local format = {{'A', 'integer'}, {'B', 'integer'}}
+        local format = {{'a', 'integer'}, {'b', 'integer'}}
         local s = box.schema.create_space('test', {format = format})
         s:create_index('i')
         s:alter{constraint='abc'}
         t.assert_error_msg_content_equals(
-            "Check constraint 'abc' failed for tuple",
+            "Check constraint 'abc' failed for a tuple",
             function() s:insert{1, 1} end
         )
     end)
@@ -109,7 +109,7 @@ g.test_sql_func_expr_3 = function()
     g.server:exec(function()
         t.assert_equals(box.func.abc.language, 'SQL_EXPR')
         t.assert_error_msg_content_equals(
-            "Check constraint 'abc' failed for tuple",
+            "Check constraint 'abc' failed for a tuple",
             function() box.space.test:insert{2, 2} end
         )
         t.assert_equals(box.space.test:insert{7, 7}, {7, 7})
@@ -124,13 +124,13 @@ g.test_sql_func_expr_4 = function()
         local def = {language = 'SQL_EXPR', is_deterministic = true,
                      body = 'a * b > 10'}
         box.schema.func.create('abc', def)
-        local format = {{'A', 'integer'}, {'B', 'integer', is_nullable = true}}
+        local format = {{'a', 'integer'}, {'b', 'integer', is_nullable = true}}
         local s = box.schema.space.create('test', {format = format})
         s:create_index('i')
         s:alter{constraint='abc'}
         t.assert_equals(s:insert{3, 4}, {3, 4})
         t.assert_error_msg_content_equals(
-            "Check constraint 'abc' failed for tuple",
+            "Check constraint 'abc' failed for a tuple",
             function() s:insert{1, 2} end
         )
         box.space.test:drop()
@@ -144,13 +144,13 @@ g.test_sql_func_expr_4 = function()
         local def = {language = 'SQL_EXPR', is_deterministic = true,
                      body = 'a * b > 10'}
         box.schema.func.create('abc', def)
-        local format = {{'A', 'integer'}, {'B', 'integer', is_nullable = true}}
+        local format = {{'a', 'integer'}, {'b', 'integer', is_nullable = true}}
         local s = box.schema.space.create('test', {format = format})
         s:create_index('i')
         s:alter{constraint='abc'}
         t.assert_equals(s:insert{3, 4}, {3, 4})
         t.assert_error_msg_content_equals(
-            "Check constraint 'abc' failed for tuple",
+            "Check constraint 'abc' failed for a tuple",
             function() s:insert{1, 2} end
         )
         box.space.test:drop()
@@ -164,7 +164,7 @@ g.test_sql_func_expr_5 = function()
         local def = {language = 'SQL_EXPR', is_deterministic = true,
                      body = 'a * b > 10'}
         box.schema.func.create('abc', def)
-        local format = {{'A', 'integer'}, {'B', 'integer'}}
+        local format = {{'a', 'integer'}, {'b', 'integer'}}
         local s = box.schema.space.create('test', {format = format})
         s:create_index('i')
         s:alter{constraint='abc'}

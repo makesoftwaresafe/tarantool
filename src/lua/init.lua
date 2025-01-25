@@ -1,8 +1,8 @@
-
 -- init.lua -- internal file
 
 local ffi = require('ffi')
 local loaders = require('internal.loaders')
+local tarantool = require('tarantool')
 
 ffi.cdef[[
 struct method_info;
@@ -144,7 +144,7 @@ end
 dostring = function(s, ...)
     local chunk, message = loadstring(s)
     if chunk == nil then
-        error(message, 2)
+        box.error(box.error.PROC_LUA, message, 2)
     end
     return chunk(...)
 end
@@ -157,6 +157,7 @@ local function exit(code)
     -- os.exit() never yields. After on_shutdown
     -- fiber completes, we will never wake up again.
     local TIMEOUT_INFINITY = 500 * 365 * 86400
+    fiber._internal.set_system(fiber.self())
     while true do fiber.sleep(TIMEOUT_INFINITY) end
 end
 rawset(os, "exit", exit)
@@ -193,6 +194,44 @@ local function run_preload()
     end
 end
 
+--
+-- List of modules (by path) which are required to use box.error and
+-- set trace properly.
+--
+local trace_check_required_modules = {
+    ['builtin/box/schema.lua'] = true,
+    ['builtin/box/session.lua'] = true,
+    ['builtin/digest.lua'] = true,
+    ['builtin/error.lua'] = true,
+    ['builtin/tarantool.lua']= true,
+    ['builtin/version.lua']= true,
+}
+
+--
+-- Return true if module with given `path` is required to use box.error
+-- to indicate error and error trace should be set the module function
+-- invocation place.
+--
+local function trace_check_is_required(path)
+    return trace_check_required_modules[path] ~= nil
+end
+
+--
+-- Raise box error with trace not pointing to the place of this function
+-- invocation.
+--
+local function raise_incorrect_trace()
+    box.error(box.error.UNKNOWN, 1)
+end
+
+--
+-- This module is expected to raise box errors only. Raise non box error
+-- for testing purpuses.
+--
+local function raise_non_box_error()
+    error('foo bar')
+end
+
 -- Extract all fields from a table except ones that start from
 -- the underscore.
 --
@@ -211,12 +250,20 @@ local mt = {
     __serialize = filter_out_private_fields,
 }
 
-return setmetatable({
+local tarantool_lua = {
     uptime = uptime,
     pid = pid,
     _internal = {
         strip_cwd_from_path = strip_cwd_from_path,
         module_name_from_filename = module_name_from_filename,
         run_preload = run_preload,
+        trace_check_is_required = trace_check_is_required,
+        raise_incorrect_trace = raise_incorrect_trace,
+        raise_non_box_error = raise_non_box_error,
     },
-}, mt)
+}
+-- tarantool module is already registered by src/lua/init.c
+for k, v in pairs(tarantool_lua) do
+    tarantool[k] = v
+end
+return setmetatable(tarantool, mt)

@@ -103,7 +103,9 @@ static void
 lbox_watcher_destroy_f(struct watcher *base)
 {
 	struct lbox_watcher *watcher = (struct lbox_watcher *)base;
-	luaL_unref(tarantool_L, LUA_REGISTRYINDEX, watcher->func_ref);
+	/* tarantool_L is freed on Tarantool shutdown. */
+	if (tarantool_L != NULL)
+		luaL_unref(tarantool_L, LUA_REGISTRYINDEX, watcher->func_ref);
 	free(watcher);
 }
 
@@ -165,6 +167,27 @@ lbox_watch(struct lua_State *L)
 }
 
 /**
+ * Lua wrapper around box_watch_once().
+ */
+static int
+lbox_watch_once(struct lua_State *L)
+{
+	if (lua_gettop(L) != 1)
+		return luaL_error(L, "Usage: box.watch_once(key)");
+	size_t key_len;
+	const char *key = luaL_checklstring(L, 1, &key_len);
+	const char *data_end;
+	const char *data = box_watch_once(key, key_len, &data_end);
+	if (data == NULL) {
+		assert(data_end == NULL);
+		return 0;
+	}
+	luamp_decode(L, luaL_msgpack_default, &data);
+	assert(data == data_end);
+	return 1;
+}
+
+/**
  * Lua wrapper around box_broadcast().
  */
 static int
@@ -214,6 +237,9 @@ box_lua_watcher_init(struct lua_State *L)
 	lua_getfield(L, LUA_GLOBALSINDEX, "box");
 	lua_pushstring(L, "watch");
 	lua_pushcfunction(L, lbox_watch);
+	lua_settable(L, -3);
+	lua_pushstring(L, "watch_once");
+	lua_pushcfunction(L, lbox_watch_once);
 	lua_settable(L, -3);
 	lua_pushstring(L, "broadcast");
 	lua_pushcfunction(L, lbox_broadcast);

@@ -33,11 +33,11 @@
 
 #include <stdbool.h>
 #include "salad/stailq.h"
+#include "engine.h"
 #include "trigger.h"
 #include "fiber.h"
 #include "space.h"
 #include "journal.h"
-#include "tt_static.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -46,8 +46,15 @@ extern "C" {
 /** box statistics */
 extern struct rmean *rmean_box;
 
-/** Last prepare-sequence-number that was assigned to prepared TX. */
-extern int64_t txn_last_psn;
+/**
+ * Incremental counter for psn (prepare sequence number) of a transaction.
+ * The next prepared transaction will get psn == txn_next_psn++.
+ * See also struct txn::psn.
+ */
+extern int64_t txn_next_psn;
+
+/** List of all in-progress transactions. */
+extern struct rlist txns;
 
 struct journal_entry;
 struct engine;
@@ -97,11 +104,19 @@ enum txn_flag {
 	 * committed due to conflict.
 	 */
 	TXN_IS_CONFLICTED = 0x80,
-	/*
+	/**
 	 * Transaction has been aborted by timeout so should be
 	 * rolled back at commit.
 	 */
 	TXN_IS_ABORTED_BY_TIMEOUT = 0x100,
+	/**
+	 * Transaction has been rolled back so it cannot be continued.
+	 */
+	TXN_IS_ROLLED_BACK = 0x200,
+	/** Transaction has been started in at least one engine. */
+	TXN_IS_STARTED_IN_ENGINE = 0x400,
+	/** Transaction supports multiple engines. */
+	TXN_SUPPORTS_MULTI_ENGINE = 0x800,
 };
 
 enum {
@@ -109,7 +124,14 @@ enum {
 	 * Maximum recursion depth for on_replace triggers.
 	 * Large numbers may corrupt C stack.
 	 */
-	TXN_SUB_STMT_MAX = 3
+	TXN_SUB_STMT_MAX = 3,
+	/**
+	 * The minimal PSN (prepare sequence number) that can be assigned to a
+	 * prepared transaction (see struct txn::psn). All values below this
+	 * threshold can be used by a transaction manager as values with
+	 * special meaning that no real transaction can have.
+	 */
+	TXN_MIN_PSN = 2,
 };
 
 enum {
@@ -145,6 +167,22 @@ enum {
 	 * installed into the global diag.
 	 */
 	TXN_SIGNATURE_ABORT = JOURNAL_ENTRY_ERR_MIN - 4,
+};
+
+enum txn_commit_wait_mode {
+	/** Commit blocks until the txn is complete. */
+	TXN_COMMIT_WAIT_MODE_COMPLETE,
+	/**
+	 * Txn is sent to the journal is completed later asynchronously. Commit
+	 * returns right away. Unless the journal queue is full. Then the commit
+	 * is blocked until there is space in the queue.
+	 */
+	TXN_COMMIT_WAIT_MODE_SUBMIT,
+	/**
+	 * Same as submit, but full journal queue = instant fail and rollback.
+	 * It means commit with this mode never yields.
+	 */
+	TXN_COMMIT_WAIT_MODE_NONE,
 };
 
 /** \cond public */
@@ -258,6 +296,7 @@ struct txn_stmt {
 	/** Owner of that statement. */
 	struct txn *txn;
 	/** Undo info. */
+	struct engine *engine;
 	struct space *space;
 	struct tuple *old_tuple;
 	struct tuple *new_tuple;
@@ -290,27 +329,14 @@ struct txn_stmt {
 	struct xrow_header *row;
 	/** on_commit and/or on_rollback list is not empty. */
 	bool has_triggers;
-	/**
-	 * Whether the stmt requires to replace exactly old_tuple (member).
-	 * That flag is needed for transactional conflict manager - if any
-	 * other transaction commits a replacement of old_tuple before current
-	 * one and the flag is set - the current transaction will be aborted.
-	 * For example REPLACE just replaces a key, no matter what tuple
-	 * lays in the index and thus does_require_old_tuple = false.
-	 * In contrast, UPDATE makes new tuple using old_tuple and thus
-	 * the statement will require old_tuple (does_require_old_tuple = true).
-	 * INSERT also does_require_old_tuple = true because it requires
-	 * old_tuple to be NULL.
-	 */
-	bool does_require_old_tuple;
 	/*
-	 * `insert` statement is guaranteed not to delete anything
-	 * from the transaction's point of view (i.e., there was a preceding
-	 * `delete` in the scope of the same transaction): no linking to the
-	 * list of `delete` statements is required during preparation of insert
-	 * statements that add preceding stories.
+	 * Flag that shows whether this statement overwrites own transaction
+	 * statement. For example if a transaction makes two replaces of the
+	 * same key, the second statement will be with is_own_change = true.
+	 * Or if a transaction deletes some key and then inserts that key,
+	 * the insertion statement will be with is_own_change = true.
 	 */
-	bool is_pure_insert;
+	bool is_own_change;
 	/**
 	* Request type - IPROTO type code
 	*/
@@ -470,10 +496,13 @@ struct txn {
 	struct stailq_entry *sub_stmt_begin[TXN_SUB_STMT_MAX + 1];
 	/** LSN of this transaction when written to WAL. */
 	int64_t signature;
-	/** Engine involved in multi-statement transaction. */
-	struct engine *engine;
-	/** Engine-specific transaction data */
-	void *engine_tx;
+	/**
+	 * Engines involved in multi-statement transaction. Indexed by
+	 * `engine::id'. If NULL, then the engine is not involved in txn.
+	 */
+	struct engine *engines[MAX_TX_ENGINE_COUNT];
+	/** Engine-specific transaction data. Indexed by `engine::id'. */
+	void *engines_tx[MAX_TX_ENGINE_COUNT];
 	/* A fiber to wake up when transaction is finished. */
 	struct fiber *fiber;
 	/** Timestampt of entry write start. */
@@ -490,20 +519,10 @@ struct txn {
 	struct trigger fiber_on_stop;
 	/** Commit and rollback triggers. */
 	struct rlist on_commit, on_rollback, on_wal_write;
+	/** User-defined event triggers, bounded by space ID or space name. */
+	struct txn_event txn_events[txn_event_id_MAX];
 	/** List of savepoints to find savepoint by name. */
 	struct rlist savepoints;
-	/**
-	 * List of tx_conflict_tracker records where .breaker is the current
-	 * transaction and .victim is the transactions that must be aborted
-	 * if the current transaction is committed.
-	 */
-	struct rlist conflict_list;
-	/**
-	 * List of tx_conflict_tracker records where .victim is the current
-	 * transaction and .breaker is the transactions that, if committed,
-	 * will abort the current transaction.
-	 */
-	struct rlist conflicted_by_list;
 	/**
 	 * Link in tx_manager::read_view_txs.
 	 */
@@ -512,12 +531,10 @@ struct txn {
 	struct rlist read_set;
 	/** List of point hole reads. @sa struct point_hole_item. */
 	struct rlist point_holes_list;
-	/** List of gap reads. @sa struct gap_item. */
+	/** List of gap reads. @sa struct inplace_gap_item / nearby_gap_item. */
 	struct rlist gap_list;
-	/** List of full scans. @sa struct full_scan_item. */
-	struct rlist full_scan_list;
-	/** Link in tx_manager::all_txs. */
-	struct rlist in_all_txs;
+	/** Link in global txns. */
+	struct rlist in_txns;
 	/** True in case transaction provides any DDL change. */
 	bool is_schema_changed;
 	/** Timeout for transaction, or TIMEOUT_INFINITY if not set. */
@@ -568,6 +585,8 @@ txn_flags_to_error_code(struct txn *txn)
 		return ER_TRANSACTION_YIELD;
 	else if (txn_has_flag(txn, TXN_IS_ABORTED_BY_TIMEOUT))
 		return ER_TRANSACTION_TIMEOUT;
+	else if (txn_has_flag(txn, TXN_IS_ROLLED_BACK))
+		return ER_TXN_ROLLBACK;
 	return ER_UNKNOWN;
 }
 
@@ -578,8 +597,40 @@ txn_flags_to_error_code(struct txn *txn)
 static inline int
 txn_check_can_continue(struct txn *txn)
 {
-	if (txn->status == TXN_ABORTED) {
+	enum txn_status status = txn->status;
+	if (status == TXN_ABORTED) {
 		diag_set(ClientError, txn_flags_to_error_code(txn));
+		return -1;
+	} else if (status == TXN_COMMITTED) {
+		diag_set(ClientError, ER_TXN_COMMIT);
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * Checks if the transaction can be completed (rollback or commit).
+ * There are cases when transaction cannot be continued (txn_check_can_continue
+ * will return error) but it's allowed to try to commit or rollback it.
+ * Example: when MVCC aborts a transaction due to conflict, the result is
+ * not observed by user. So he cannot execute new statements in the transaction
+ * but we cannot forbid to try to commit the transaction - only then the error
+ * will be observed and the transaction will be actually completed (rolled back
+ * due to conflict). But after the attempt to commit the transaction, we must
+ * forbid to try to complete it again - it will lead to UB.
+ * Returns 0 if true. Otherwise, sets diag and returns -1.
+ */
+static inline int
+txn_check_can_complete(struct txn *txn)
+{
+	enum txn_status status = txn->status;
+	if (status == TXN_ABORTED && txn_has_flag(txn, TXN_IS_ROLLED_BACK)) {
+		/* Cannot complete already rolled back transaction. */
+		diag_set(ClientError, ER_TXN_ROLLBACK);
+		return -1;
+	} else if (status == TXN_COMMITTED) {
+		/* Cannot complete already committed transaction. */
+		diag_set(ClientError, ER_TXN_COMMIT);
 		return -1;
 	}
 	return 0;
@@ -636,6 +687,10 @@ txn_complete_fail(struct txn *txn);
 /**
  * Complete transaction processing successfully. All the changes are going to
  * become committed and visible.
+ *
+ * This function will run any on_commit triggers associated with @a txn and only
+ * them, so if any statements of this transaction have on_commit triggers,
+ * they must be moved into txn->on_commit before this function is called.
  */
 void
 txn_complete_success(struct txn *txn);
@@ -680,7 +735,7 @@ txn_abort(struct txn *txn);
  * freed.
  */
 int
-txn_commit_try_async(struct txn *txn);
+txn_commit_submit(struct txn *txn);
 
 /**
  * Most txns don't have triggers, and txn objects
@@ -851,6 +906,30 @@ txn_is_fully_local(const struct txn *txn)
 	       txn->n_applier_rows == 0;
 }
 
+static inline bool
+txn_is_nop(const struct txn *txn)
+{
+	return txn->n_new_rows + txn->n_applier_rows == 0;
+}
+
+/**
+ * Mark @a stmt as temporary by removing the associated stmt->row
+ * and update @a txn accordingly.
+ *
+ * This function is called from on_replace_dd_* triggers to filter
+ * temporary space's metadata updates from WAL.
+ *
+ * NOTE: This could also be implemented by just not creating the stmt->row
+ * when txn_commit_stmt is called, but it would be less efficient that way
+ * as it would require putting an expensive check on a hot path.
+ * Doing the check inside the on_replace trigger is much cheaper
+ * as the data we're interested in (result of space_is_temporary(space))
+ * is readily available at that point.
+ * The downside of confusing control flow is outweighed by the efficiency.
+ */
+void
+txn_stmt_mark_as_temporary(struct txn *txn, struct txn_stmt *stmt);
+
 /**
  * End a statement. In autocommit mode, end
  * the current transaction as well.
@@ -907,6 +986,20 @@ txn_is_first_statement(struct txn *txn)
 	return stailq_last(&txn->stmts) == stailq_first(&txn->stmts);
 }
 
+/** The first statement of the transaction. */
+static inline struct txn_stmt *
+txn_first_stmt(struct txn *txn)
+{
+	return stailq_first_entry(&txn->stmts, struct txn_stmt, next);
+}
+
+/** The last statement of the transaction. */
+static inline struct txn_stmt *
+txn_last_stmt(struct txn *txn)
+{
+	return stailq_last_entry(&txn->stmts, struct txn_stmt, next);
+}
+
 /** The current statement of the transaction. */
 static inline struct txn_stmt *
 txn_current_stmt(struct txn *txn)
@@ -947,6 +1040,12 @@ tx_region_acquire(struct txn *txn);
  */
 void
 tx_region_release(struct txn *txn, enum tx_alloc_type alloc_type);
+
+/*
+ * Free txn memory and return it to a cache.
+ */
+void
+txn_free(struct txn *txn);
 
 /**
  * FFI bindings: do not throw exceptions, do not accept extra
@@ -1040,7 +1139,16 @@ box_txn_set_timeout(double timeout);
 API_EXPORT int
 box_txn_set_isolation(uint32_t level);
 
+/**
+ * Make the transaction synchronous.
+ */
+API_EXPORT void
+box_txn_make_sync(void);
 /** \endcond public */
+
+/** Commit the current txn with the chosen wait mode. */
+int
+box_txn_commit_ex(enum txn_commit_wait_mode wait_mode);
 
 typedef struct txn_savepoint box_txn_savepoint_t;
 

@@ -53,17 +53,24 @@ struct auth_request;
 struct space;
 struct vclock;
 struct key_def;
+struct ballot;
 
 /**
  * Pointer to TX thread local vclock.
  *
  * During recovery it points to the current recovery position.
- * Once recovery is complete, it is set to &replicaset.vclock.
+ * Once recovery is complete, it is set to instance_vclock.
  *
  * We need it for reporting the actual vclock in box.info while
  * the instance is in hot standby mode.
  */
 extern const struct vclock *box_vclock;
+/**
+ * Vclock of the instance as it is stored on disk. It means that during
+ * recovery this vclock points to the end of WAL, not to the current recovery
+ * position.
+ */
+extern const struct vclock *instance_vclock;
 
 /**
  * Name of the authentication method that is currently used on
@@ -74,13 +81,16 @@ extern const char *box_auth_type;
 /** Time to wait for shutdown triggers finished */
 extern double on_shutdown_trigger_timeout;
 
-/** Invoked on box shutdown. */
+/** Internal and set by C API on_shutdown triggers. */
 extern struct rlist box_on_shutdown_trigger_list;
+
+/** User-defined on_shutdown triggers set from Lua. */
+extern struct event *box_on_shutdown_event;
 
 /**
  * Triggers invoked during initial `box.cfg` call on various recovery stages.
  */
-extern struct rlist box_on_recovery_state;
+extern struct event *box_on_recovery_state_event;
 
 /**
  * Timeout during which the transaction must complete,
@@ -109,6 +119,22 @@ void
 box_init(void);
 
 /**
+ * Set instance's vclock to the given value. Works only if the instance vclock
+ * isn't already set. It must be initialized manually and explicitly this way
+ * when the instance boots from a snapshot - snapshot rows have no LSNs, so
+ * setting the instance vclock manually is the only way.
+ *
+ * It has to be a "public" API of box, because the snapshot can be remote, i.e.
+ * coming from the applier.
+ */
+void
+box_init_instance_vclock(const struct vclock *vclock);
+
+/** Shutdown box storage i.e. stop parts that need TX loop running. */
+void
+box_shutdown(void);
+
+/**
  * Cleanup box library
  */
 void
@@ -126,6 +152,12 @@ box_cfg(void);
  */
 bool
 box_is_configured(void);
+
+/**
+ * Return 0 if box has been configured, otherwise set diag and return -1.
+ */
+int
+box_check_configured(void);
 
 /** Check if the slice of main cord has expired. */
 int
@@ -146,11 +178,22 @@ box_check_slice(void)
 	}
 }
 
+/**
+ * Check if a write operation can be performed on this instance.
+ * Returns 0 on success. On error, sets diag and returns -1.
+ */
+int
+box_check_writable(void);
+
 void
 box_set_ro(void);
 
-bool
+/** \cond public */
+
+API_EXPORT bool
 box_is_ro(void);
+
+/** \endcond public */
 
 bool
 box_is_orphan(void);
@@ -159,6 +202,8 @@ box_is_orphan(void);
 bool
 box_is_anon(void);
 
+/** \cond public */
+
 /**
  * Wait until the instance switches to a desired mode.
  * \param ro wait read-only if set or read-write if unset
@@ -166,8 +211,10 @@ box_is_anon(void);
  * \retval -1 timeout or fiber is cancelled
  * \retval 0 success
  */
-int
+API_EXPORT int
 box_wait_ro(bool ro, double timeout);
+
+/** \endcond public */
 
 /**
  * Switch this instance from 'orphan' to 'running' state or
@@ -194,18 +241,28 @@ box_do_set_orphan(bool orphan);
 void
 box_update_ro_summary(void);
 
+/** \cond public */
+
 /**
  * Get the reason why the instance is read only if it is. Can't be called on a
  * writable instance.
  */
-const char *
+API_EXPORT const char *
 box_ro_reason(void);
+
+/** \endcond public */
 
 /**
  * Iterate over all spaces and save them to the
  * snapshot file.
  */
 int box_checkpoint(void);
+
+/**
+ * Make snapshot asynchronously.
+ */
+void
+box_checkpoint_async(void);
 
 typedef int (*box_backup_cb)(const char *path, void *arg);
 
@@ -240,13 +297,17 @@ const char *box_status(void);
 void
 box_reset_stat(void);
 
-#if defined(__cplusplus)
-} /* extern "C" */
-
 /** Process an authentication request. */
-void
+int
 box_process_auth(struct auth_request *request,
 		 const char *salt, uint32_t salt_len);
+
+/** Process a vote request. */
+void
+box_process_vote(struct ballot *ballot);
+
+#if defined(__cplusplus)
+} /* extern "C" */
 
 /** Send current read view to the replica. */
 void
@@ -279,9 +340,6 @@ box_process_join(struct iostream *io, const struct xrow_header *header);
 void
 box_process_subscribe(struct iostream *io, const struct xrow_header *header);
 
-void
-box_process_vote(struct ballot *ballot);
-
 /**
  * Check Lua configuration before initialization or
  * in case of a configuration change.
@@ -299,6 +357,7 @@ void box_set_checkpoint_count(void);
 void box_set_checkpoint_interval(void);
 void box_set_checkpoint_wal_threshold(void);
 int box_set_wal_queue_max_size(void);
+int box_set_replication_synchro_queue_max_size(void);
 int box_set_wal_cleanup_delay(void);
 void box_set_memtx_memory(void);
 void box_set_memtx_max_tuple_size(void);
@@ -320,6 +379,7 @@ int box_set_replication_synchro_timeout(void);
 void box_set_replication_sync_timeout(void);
 void box_set_replication_skip_conflict(void);
 void box_set_replication_anon(void);
+int box_set_replication_anon_ttl(void);
 void box_set_instance_name(void);
 void box_set_replicaset_name(void);
 void box_set_cluster_name(void);
@@ -330,6 +390,7 @@ int box_set_txn_timeout(void);
 int box_set_txn_isolation(void);
 int box_set_auth_type(void);
 int box_set_bootstrap_strategy(void);
+int box_set_bootstrap_leader(void);
 
 /**
  * Initialize logger on box init.
@@ -339,6 +400,8 @@ box_init_say();
 
 extern "C" {
 #endif /* defined(__cplusplus) */
+
+int box_set_wal_retention_period(void);
 
 typedef struct tuple box_tuple_t;
 
@@ -606,6 +669,31 @@ box_upsert(uint32_t space_id, uint32_t index_id, const char *tuple,
 	   const char *tuple_end, const char *ops, const char *ops_end,
 	   int index_base, box_tuple_t **result);
 
+struct ArrowArray;
+struct ArrowSchema;
+
+/**
+ * Executes a batch insert request.
+ *
+ * A record batch from the Arrow `array` is inserted into the space columns,
+ * whose names are provided by the Arrow `schema`. Column types in the schema
+ * must match the types of the corresponding fields in the space format.
+ *
+ * If a column is nullable in space format, it can be omitted. All non-nullable
+ * columns (including primary key parts) must be present in the batch.
+ *
+ * This function does not release neither `array` nor `schema`.
+ *
+ * \param space_id space identifier
+ * \param array input data in ArrowArray format
+ * \param schema definition of the input data in ArrowSchema format
+ * \retval 0 on success
+ * \retval -1 on error (check box_error_last())
+ */
+API_EXPORT int
+box_insert_arrow(uint32_t space_id, struct ArrowArray *array,
+		 struct ArrowSchema *schema);
+
 /**
  * Truncate space.
  *
@@ -721,6 +809,29 @@ API_EXPORT int
 box_iproto_override(uint32_t req_type, iproto_handler_t handler,
 		    iproto_handler_destroy_t destroy, void *ctx);
 
+/**
+ * Get self LSN component of box vclock, -1 if no one or bootstrap haven't
+ * succeeded.
+ */
+API_EXPORT int64_t
+box_info_lsn(void);
+
+/*! Codes for request memtx status information for box.slab.info. */
+enum box_slab_info_type {
+	BOX_SLAB_INFO_ITEMS_SIZE = 0, /*!< Allocated only for tuples. */
+	BOX_SLAB_INFO_ITEMS_USED = 1, /*!< Used only for tuples. */
+	BOX_SLAB_INFO_ARENA_SIZE = 2, /*!< Allocated for  tuples and indexes. */
+	BOX_SLAB_INFO_ARENA_USED = 3, /*!< Used for both tuples and indexes. */
+	BOX_SLAB_INFO_QUOTA_SIZE = 4, /*!< Memory limit for slab allocator. */
+	BOX_SLAB_INFO_QUOTA_USED = 5, /*!< Used by slab allocator. */
+};
+
+/**
+ * Get memtx status information for box.slab.info.
+ */
+API_EXPORT uint64_t
+box_slab_info(enum box_slab_info_type type);
+
 /** \endcond public */
 
 /**
@@ -752,13 +863,19 @@ boxk(int type, uint32_t space_id, const char *format, ...);
 
 /** Generate unique id for non-system space. */
 int
-box_generate_space_id(uint32_t *new_space_id);
+box_generate_space_id(uint32_t *new_space_id, bool is_temporary);
 
 /**
  * Broadcast the identification of the instance
  */
 void
 box_broadcast_id(void);
+
+/**
+ * Broadcast the status of the instance.
+ */
+void
+box_broadcast_status(void);
 
 /**
  * Broadcast the current election state of RAFT machinery

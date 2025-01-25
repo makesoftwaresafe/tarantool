@@ -160,6 +160,11 @@ struct xdir {
 	 */
 	vclockset_t index;
 	/**
+	 * Number of seconds to delay garbage collection of files
+	 * after they are closed.
+	 */
+	double retention_period;
+	/**
 	 * Directory path.
 	 */
 	char dirname[PATH_MAX];
@@ -197,6 +202,27 @@ int
 xdir_check(struct xdir *dir);
 
 /**
+ * Set new value for retention_period, update expiration time
+ * of all existing files.
+ */
+void
+xdir_set_retention_period(struct xdir *xdir, double period);
+
+/**
+ * Return vclock (unless @vclock is NULL) of the oldest file,
+ * which is protected from garbage collection.
+ */
+void
+xdir_get_retention_vclock(struct xdir *xdir, struct vclock *vclock);
+
+/**
+ * Find requested @vclock in index of xdir and set its retention
+ * according to retention_period.
+ */
+void
+xdir_set_retention_vclock(struct xdir *xdir, struct vclock *vclock);
+
+/**
  * Return a file name based on directory type, vector clock
  * sum, and a suffix (.inprogress or not).
  */
@@ -215,7 +241,17 @@ static inline bool
 xdir_has_garbage(struct xdir *dir, int64_t signature)
 {
 	struct vclock *vclock = vclockset_first(&dir->index);
-	return vclock != NULL && vclock_sum(vclock) < signature;
+	if (vclock == NULL)
+		return false;
+
+	struct vclock retention;
+	xdir_get_retention_vclock(dir, &retention);
+	if (!vclock_is_set(&retention) ||
+	    vclock_compare(vclock, &retention) < 0)
+		return vclock_sum(vclock) < signature;
+
+	/** All files are protected from gc. */
+	return false;
 }
 
 /**
@@ -247,11 +283,23 @@ xdir_collect_garbage(struct xdir *dir, int64_t signature, unsigned flags);
 int
 xdir_remove_file_by_vclock(struct xdir *dir, struct vclock *vclock);
 
+typedef bool
+(*xlog_file_is_temporary_f)(const char *filename);
+
 /**
- * Remove inprogress files in the specified directory.
+ * Returns true if the file with the given name is a temporary xlog file that
+ * should be removed by xdir_remove_temporary_files().
+ */
+extern xlog_file_is_temporary_f xlog_file_is_temporary;
+
+/**
+ * Removes all temporary files in the specified directory.
+ *
+ * We call this function at startup to clean up the xlog directory of
+ * incomplete files left from the previous run.
  */
 void
-xdir_collect_inprogress(struct xdir *xdir);
+xdir_remove_temporary_files(struct xdir *xdir);
 
 /**
  * Return LSN and vclock (unless @vclock is NULL) of the oldest
@@ -481,15 +529,6 @@ xlog_is_open(struct xlog *l)
 }
 
 /**
- * Rename xlog
- *
- * @retval 0 for ok
- * @retval -1 for error
- */
-int
-xlog_rename(struct xlog *l);
-
-/**
  * Allocate @size bytes of disk space at the end of the given
  * xlog file.
  *
@@ -501,7 +540,7 @@ ssize_t
 xlog_fallocate(struct xlog *log, size_t size);
 
 /**
- * Write a row to xlog, 
+ * Write a row to xlog,
  *
  * @retval count of writen bytes
  * @retval -1 for error
@@ -538,25 +577,64 @@ xlog_tx_rollback(struct xlog *log);
 ssize_t
 xlog_flush(struct xlog *log);
 
-
 /**
- * Sync a log file. The exact action is defined
- * by xdir flags.
+ * Closes an xlog object.
  *
- * @retval 0 success
- * @retval -1 error
+ * This function seals the xlog file by flushing the write buffer, writing
+ * the EOF marker, and syncing the file, then closes the xlog file fd.
+ * After calling the function, the xlog file must not be used for writing
+ * anymore. However, it may still be materialized with xlog_materialize() or
+ * discarded with xlog_discard() unless it hasn't been already materialized.
+ *
+ * Returns 0 on success. On failure, sets diag and returns -1.
+ *
+ * Note that the write buffers are freed and the xlog file fd is closed
+ * on both success and error.
+ *
+ * MT note: This function must be called in the same thread where the xlog
+ * object was created because the write buffer isn't MT-safe.
  */
 int
-xlog_sync(struct xlog *l);
+xlog_close(struct xlog *l);
 
 /**
- * Close the log file and free xlog object.
- *
- * @retval 0 success
- * @retval -1 error (fclose() failed).
+ * Same as xlog_close() but doesn't close the fd. Instead, it stores it in
+ * the out argument. Useful if the caller needs to reuse the xlog fd for reads.
  */
 int
-xlog_close(struct xlog *l, bool reuse_fd);
+xlog_close_reuse_fd(struct xlog *l, int *fd);
+
+/**
+ * Materializes an xlog object.
+ *
+ * This function removes the .inprogress suffix from the xlog file name thus
+ * making it available for future reads. It may only be called only once for
+ * an xlog object created with xlog_create(). It may not be called for an xlog
+ * object created with xlog_open(). It's allowed to call this function after
+ * closing the xlog object with xlog_close().
+ *
+ * Returns 0 on success. On error, sets diag and returns -1.
+ *
+ * MT note: This function is safe to call in any thread.
+ */
+int
+xlog_materialize(struct xlog *l);
+
+/**
+ * Discards an xlog object.
+ *
+ * This function closes the xlog file fd if it's still open and deletes the
+ * xlog file if it hasn't already been deleted. The xlog object must not be
+ * materialized (see xlog_materialize()). The xlog object must not be used
+ * after calling this function but it's allowed to call xlog_discard() more
+ * than once (all subsequent calls will be no-ops).
+ *
+ * MT note: If the xlog object was closed (see xlog_close()), this function may
+ * be called in any thread, otherwise it must be called in the same thread
+ * where the xlog object was created because the write buffer isn't MT-safe.
+ */
+void
+xlog_discard(struct xlog *l);
 
 /* {{{ xlog_tx_cursor - iterate over rows in xlog transaction */
 
@@ -595,10 +673,29 @@ xlog_tx_cursor_destroy(struct xlog_tx_cursor *tx_cursor);
  * Fetch next xrow from xlog tx cursor
  *
  * @retval 0 for Ok
+ * @retval 1 if current tx is done
  * @retval -1 for error
  */
 int
 xlog_tx_cursor_next_row(struct xlog_tx_cursor *tx_cursor, struct xrow_header *xrow);
+
+/**
+ * Fetch next xrow from current xlog tx cursor.
+ *
+ * This function is similar to xlog_tx_cursor_next_row() except it doesn't
+ * parse the xrow nor does it advance the data pointer.
+ *
+ * @param cursor cursor
+ * @param[out] data pointer to the position in the internal buffer where
+ *                  the next xrow is stored
+ * @param[out] end end of the buffer
+ *
+ * @retval 0 for Ok
+ * @retval 1 if current tx is done
+ */
+int
+xlog_tx_cursor_next_row_raw(struct xlog_tx_cursor *cursor,
+			    const char ***data, const char **end);
 
 /**
  * Return current tx cursor position
@@ -758,6 +855,24 @@ int
 xlog_cursor_next_row(struct xlog_cursor *cursor, struct xrow_header *xrow);
 
 /**
+ * Fetch next xrow from current xlog tx.
+ *
+ * This function is similar to xlog_cursor_next_row() except it doesn't
+ * parse the xrow nor does it advance the data pointer.
+ *
+ * @param cursor cursor
+ * @param[out] data pointer to the position in the internal buffer where
+ *                  the next xrow is stored
+ * @param[out] end end of the buffer
+ *
+ * @retval 0 for Ok
+ * @retval 1 if current tx is done
+ */
+int
+xlog_cursor_next_row_raw(struct xlog_cursor *cursor,
+			 const char ***data, const char **end);
+
+/**
  * Fetch next row from cursor, ignores xlog tx boundary,
  * open a next one tx if current is done.
  *
@@ -817,6 +932,47 @@ xlog_cursor_tx_pos(struct xlog_cursor *cursor)
 int
 xdir_open_cursor(struct xdir *dir, int64_t signature,
 		 struct xlog_cursor *cursor);
+
+/** }}} */
+
+/** {{{ xlog_remove_file */
+
+/**
+ * Flags passed to xlog_remove_file().
+ */
+enum {
+	/** Log info message on success. */
+	XLOG_RM_VERBOSE = 1 << 0,
+	/** Remove file asynchronously. */
+	XLOG_RM_ASYNC = 1 << 1,
+};
+
+typedef int
+(*xlog_remove_file_impl_f)(const char *filename, bool *existed);
+
+/**
+ * Low-level function used by xlog_remove_file().
+ *
+ * Removes an xlog file with the given name.
+ *
+ * On success, sets the 'existed' flag to true if the file existed and was
+ * actually deleted or to false otherwise and returns 0. On failure, sets
+ * diag and returns -1.
+ *
+ * Note that this function doesn't treat ENOENT as error.
+ */
+extern xlog_remove_file_impl_f xlog_remove_file_impl;
+
+/**
+ * Removes an xlog file with the given name.
+ *
+ * Returns true if the file was removed or didn't exist. If the file wasn't
+ * removed due to an error, logs the error and returns false.
+ *
+ * See XLOG_RM_* for available flags.
+ */
+bool
+xlog_remove_file(const char *filename, unsigned flags);
 
 /** }}} */
 

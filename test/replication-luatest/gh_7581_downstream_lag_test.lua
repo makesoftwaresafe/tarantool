@@ -30,6 +30,7 @@ g.before_each(function(g)
         box_cfg = box_cfg,
     })
     g.cluster:start()
+    g.cluster:wait_for_fullmesh()
     g.server1:exec(function()
         box.schema.space.create("test")
         box.space.test:create_index("pk")
@@ -53,7 +54,10 @@ local function wait_downstream_updated(master, replica)
     local id = replica:get_instance_id()
     t.helpers.retrying({}, function()
         master:exec(function(id)
-            t.assert_equals(box.info.vclock,
+            -- Ignore local lsn
+            local vclock = table.deepcopy(box.info.vclock)
+            vclock[0] = nil
+            t.assert_equals(vclock,
                             box.info.replication[id].downstream.vclock,
                             "Downstream vclock is updated")
         end, {id})

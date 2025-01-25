@@ -29,7 +29,6 @@ ignore = {
 
 include_files = {
     "**/*.lua",
-    "extra/dist/tarantoolctl.in",
 }
 
 exclude_files = {
@@ -106,5 +105,13 @@ files["test/replication/replica_quorum.lua"] = {
     globals = {
         "INSTANCE_URI",
         "nonexistent_uri",
+    },
+}
+
+-- Defined functions is unused in preamble,
+-- but could be used by generated Lua programs.
+files["test/fuzz/luaL_loadbuffer/preamble.lua"] = {
+    ignore = {
+        "211",
     },
 }

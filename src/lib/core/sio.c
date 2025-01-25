@@ -43,6 +43,10 @@
 #include "uri/uri.h"
 #include "errinj.h"
 
+#if TARGET_OS_DARWIN
+#include <sys/sysctl.h>
+#endif
+
 static_assert(SMALL_STATIC_SIZE > NI_MAXHOST + NI_MAXSERV,
 	      "static buffer should fit host name");
 
@@ -51,38 +55,49 @@ static_assert(SMALL_STATIC_SIZE > NI_MAXHOST + NI_MAXSERV,
  * checks and all.
  */
 static int
-sio_socketname_to_buffer(int fd, char *buf, int size)
+sio_socketname_to_buffer(int fd,
+			 const struct sockaddr *base_addr, socklen_t addrlen,
+			 const struct sockaddr *peer_addr, socklen_t peerlen,
+			 char *buf, int size)
 {
 	int n = 0;
 	(void)n;
 	SNPRINT(n, snprintf, buf, size, "fd %d", fd);
 	if (fd < 0)
 		return 0;
-	struct sockaddr_storage addr;
-	socklen_t addrlen = sizeof(addr);
-	struct sockaddr *base_addr = (struct sockaddr *)&addr;
-	int rc = getsockname(fd, base_addr, &addrlen);
-	if (rc == 0) {
+	if (base_addr != NULL) {
 		SNPRINT(n, snprintf, buf, size, ", aka ");
 		SNPRINT(n, sio_addr_snprintf, buf, size, base_addr, addrlen);
 	}
-	addrlen = sizeof(addr);
-	rc = getpeername(fd, (struct sockaddr *) &addr, &addrlen);
-	if (rc == 0) {
+	if (peer_addr != NULL) {
 		SNPRINT(n, snprintf, buf, size, ", peer of ");
-		SNPRINT(n, sio_addr_snprintf, buf, size, base_addr, addrlen);
+		SNPRINT(n, sio_addr_snprintf, buf, size,
+			peer_addr, peerlen);
 	}
 	return 0;
 }
 
 const char *
-sio_socketname(int fd)
+sio_socketname_addr(int fd, const struct sockaddr *base_addr,
+		    socklen_t addrlen)
 {
 	/* Preserve errno */
 	int save_errno = errno;
 	int name_size = SERVICE_NAME_MAXLEN;
 	char *name = static_alloc(name_size);
-	int rc = sio_socketname_to_buffer(fd, name, name_size);
+
+	struct sockaddr_storage peer_addr_storage;
+	socklen_t peerlen = sizeof(peer_addr_storage);
+	struct sockaddr *peer_addr = (struct sockaddr *)&peer_addr_storage;
+	int rcp = getpeername(fd, peer_addr, &peerlen);
+	if (rcp != 0) {
+		peer_addr = NULL;
+	}
+
+	int rc = sio_socketname_to_buffer(fd,
+					  base_addr, addrlen,
+					  peer_addr, peerlen,
+					  name, name_size);
 	/*
 	 * Could fail only because of a bad format in snprintf, but it is not
 	 * bad, so should not fail.
@@ -92,6 +107,29 @@ sio_socketname(int fd)
 	/*
 	 * Restore the original errno, it might have been reset by
 	 * snprintf() or getsockname().
+	 */
+	errno = save_errno;
+	return name;
+}
+
+const char *
+sio_socketname(int fd)
+{
+	/* Preserve errno */
+	int save_errno = errno;
+
+	struct sockaddr_storage addr;
+	socklen_t addrlen = sizeof(addr);
+	struct sockaddr *base_addr = (struct sockaddr *)&addr;
+	int rcb = getsockname(fd, base_addr, &addrlen);
+	if (rcb != 0) {
+		base_addr = NULL;
+	}
+
+	const char *name = sio_socketname_addr(fd, base_addr, addrlen);
+	/*
+	 * Restore the original errno, it might have been reset by
+	 * getsockname().
 	 */
 	errno = save_errno;
 	return name;
@@ -137,7 +175,31 @@ sio_listen_backlog()
 		if (rc == 1)
 			return backlog;
 	}
-#endif /* TARGET_OS_LINUX */
+#elif TARGET_OS_DARWIN
+	int somaxconn = 0;
+	size_t size = sizeof(somaxconn);
+	const char *name = "kern.ipc.somaxconn";
+	int rc = sysctlbyname(name, &somaxconn, &size, NULL, 0);
+	if (rc == 0) {
+		/*
+		 * From tests it appears that values > INT16_MAX
+		 * work strangely. For example, 32768 behaves
+		 * worse than 32767. Like if nothing was changed.
+		 * The suspicion is that listen() on Mac
+		 * internally uses int16_t or 'short' for storing
+		 * the queue size and it simply gets reset to
+		 * default on bigger values.
+		 */
+		if (somaxconn > INT16_MAX) {
+			say_warn("%s is too high (%d), "
+				 "truncated to %d", name,
+				 somaxconn, (int)INT16_MAX);
+			somaxconn = INT16_MAX;
+		}
+		return somaxconn;
+	}
+	say_syserror("couldn't get system's %s setting", name);
+#endif
 	return SOMAXCONN;
 }
 
@@ -217,7 +279,9 @@ sio_bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
 {
 	int rc = bind(fd, addr, addrlen);
 	if (rc < 0)
-		diag_set(SocketError, sio_socketname(fd), "bind");
+		diag_set(SocketError,
+			 sio_socketname_addr(fd, addr, addrlen),
+			 "bind");
 	return rc;
 }
 

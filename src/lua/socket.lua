@@ -32,6 +32,7 @@ ffi.cdef[[
     ssize_t read(int fd, void *buf, size_t count);
     int listen(int fd, int backlog);
     int socket(int domain, int type, int protocol);
+    int socketpair(int domain, int type, int protocol, int sv[2]);
     int coio_close(int s);
     int shutdown(int s, int how);
     ssize_t send(int sockfd, const void *buf, size_t len, int flags);
@@ -105,17 +106,27 @@ end
 
 local gc_socket_sentinel = ffi.new(gc_socket_t, { fd = -1 })
 
+local function do_detach(socket)
+    -- .fd is const to prevent tampering
+    ffi.copy(socket._gc_socket, gc_socket_sentinel, ffi.sizeof(gc_socket_t))
+end
+
 local function socket_close(socket)
     local fd = check_socket(socket)
     socket._errno = nil
     local r = ffi.C.coio_close(fd)
-    -- .fd is const to prevent tampering
-    ffi.copy(socket._gc_socket, gc_socket_sentinel, ffi.sizeof(gc_socket_t))
+    do_detach(socket)
     if r ~= 0 then
         socket._errno = boxerrno()
         return false
     end
     return true
+end
+
+local function socket_detach(socket)
+    check_socket(socket)
+    socket._errno = nil
+    do_detach(socket)
 end
 
 local soname_mt = {
@@ -694,7 +705,7 @@ local function read(self, limit, timeout, check, ...)
     if len ~= nil then
         self._errno = nil
         local data = ffi.string(rbuf.rpos, len)
-        rbuf.rpos = rbuf.rpos + len
+        rbuf:consume(len)
         return data
     end
 
@@ -709,15 +720,15 @@ local function read(self, limit, timeout, check, ...)
             self._errno = nil
             local len = rbuf:size()
             local data = ffi.string(rbuf.rpos, len)
-            rbuf.rpos = rbuf.rpos + len
+            rbuf:consume(len)
             return data
         elseif res ~= nil then
-            rbuf.wpos = rbuf.wpos + res
+            rbuf:alloc(res)
             local len = check(self, limit, ...)
             if len ~= nil then
                 self._errno = nil
                 local data = ffi.string(rbuf.rpos, len)
-                rbuf.rpos = rbuf.rpos + len
+                rbuf:consume(len)
                 return data
             end
         elseif not errno_is_transient[self._errno] then
@@ -923,7 +934,7 @@ local function socket_sendto(self, host, port, octets, flags)
     return tonumber(res)
 end
 
-local function socket_new(domain, stype, proto)
+local function check_socket_args(domain, stype, proto)
     local idomain = get_ivalue(internal.DOMAIN, domain)
     if idomain == nil then
         boxerrno(boxerrno.EINVAL)
@@ -941,6 +952,14 @@ local function socket_new(domain, stype, proto)
         return nil
     end
 
+    return idomain, itype, iproto
+end
+
+local function socket_new(domain, stype, proto)
+    local idomain, itype, iproto = check_socket_args(domain, stype, proto)
+    if idomain == nil then
+        return nil
+    end
     local fd = ffi.C.socket(idomain, itype, iproto)
     if fd >= 0 then
         local socket = make_socket(fd, itype)
@@ -950,6 +969,41 @@ local function socket_new(domain, stype, proto)
             return socket
         end
     end
+end
+
+local function socket_socketpair(domain, stype, proto)
+    local idomain, itype, iproto = check_socket_args(domain, stype, proto)
+    if idomain == nil then
+        return nil
+    end
+    local sv = ffi.new('int[2]')
+    if ffi.C.socketpair(idomain, itype, iproto, sv) ~= 0 then
+        return nil
+    end
+    local s1 = make_socket(sv[0], itype)
+    local s2 = make_socket(sv[1], itype)
+    if not s1:nonblock(true) or not s2:nonblock(true) then
+        s1:close()
+        s2:close()
+        return nil
+    end
+    return s1, s2
+end
+
+local function socket_from_fd(fd)
+    if type(fd) ~= 'number' then
+        error('fd must be a number')
+    end
+    -- Try to determine the socket type. Ignore errors.
+    local itype = 0
+    local level = internal.SOL_SOCKET
+    local opt = internal.SO_OPT[level].SO_TYPE.iname
+    local value = ffi.new('int[1]')
+    local len = ffi.new('size_t[1]', ffi.sizeof('int'))
+    if ffi.C.getsockopt(fd, level, opt, value, len) == 0 and len[0] == 4 then
+        itype = tonumber(value[0])
+    end
+    return make_socket(fd, itype)
 end
 
 local function getaddrinfo(host, port, timeout, opts)
@@ -1240,6 +1294,7 @@ end
 socket_mt   = {
     __index = {
         close = socket_close;
+        detach = socket_detach;
         errno = socket_errno;
         error = socket_error;
         sysconnect = socket_sysconnect;
@@ -1594,6 +1649,8 @@ end
 --------------------------------------------------------------------------------
 
 return setmetatable({
+    from_fd = socket_from_fd;
+    socketpair = socket_socketpair;
     getaddrinfo = getaddrinfo,
     tcp_connect = tcp_connect,
     tcp_server = tcp_server,

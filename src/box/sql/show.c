@@ -59,13 +59,10 @@ sql_desc_append_name(struct sql_desc *desc, const char *name)
 {
 	char *escaped = sql_escaped_name_new(name);
 	assert(escaped[0] == '"' && escaped[strlen(escaped) - 1] == '"');
-	char *normalized = sql_normalized_name_new(name, strlen(name));
-	if (isalpha(name[0]) && strlen(escaped) == strlen(name) + 2 &&
-	    strcmp(normalized, name) == 0)
-		sqlXPrintf(&desc->acc, "%s", normalized);
+	if (isalpha(name[0]) && strlen(escaped) == strlen(name) + 2)
+		sqlXPrintf(&desc->acc, "%s", name);
 	else
 		sqlXPrintf(&desc->acc, "%s", escaped);
-	sql_xfree(normalized);
 	sql_xfree(escaped);
 }
 
@@ -278,19 +275,16 @@ sql_describe_field(struct sql_desc *desc, const struct field_def *field)
 
 	if (field->coll_id != 0) {
 		struct coll_id *coll_id = coll_by_id(field->coll_id);
-		if (coll_id == NULL) {
-			sql_desc_error(desc, "collation",
-				       tt_sprintf("%d", field->coll_id),
-				       "collation does not exist");
-		} else {
-			sql_desc_append(desc, " COLLATE ");
-			sql_desc_append_name(desc, coll_id->name);
-		}
+		assert(coll_id != NULL);
+		sql_desc_append(desc, " COLLATE ");
+		sql_desc_append_name(desc, coll_id->name);
 	}
 	if (!field->is_nullable)
 		sql_desc_append(desc, " NOT NULL");
-	if (field->default_value != NULL)
-		sql_desc_append(desc, " DEFAULT(%s)", field->default_value);
+	if (field->default_value != NULL || field->default_func_id != 0) {
+		const char *err = "BOX default values are unsupported";
+		sql_desc_error(desc, "field", field->name, err);
+	}
 	for (uint32_t i = 0; i < field->constraint_count; ++i) {
 		struct tuple_constraint_def *cdef = &field->constraint_def[i];
 		assert(cdef->type == CONSTR_FKEY || cdef->type == CONSTR_FUNC);

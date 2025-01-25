@@ -38,7 +38,7 @@ tuple_constraint_func_find(struct tuple_constraint *constr)
 
 /**
  * Verify function @a func comply function rules for constraint @a constr.
- * Return nonzero in case on some problems, diag is set (@a space_name is
+ * Return nonzero in case of some problems, diag is set (@a space_name is
  * used for better error message).
  */
 static int
@@ -97,7 +97,8 @@ tuple_constraint_call_func(const struct tuple_constraint *constr,
 					constr->space->format);
 	port_c_add_str(&in_port, constr->def.name, constr->def.name_len);
 
-	int rc = func_call(constr->func_cache_holder.func, &in_port, &out_port);
+	int rc = func_call_no_access_check(constr->func_cache_holder.func,
+					   &in_port, &out_port);
 	port_destroy(&in_port);
 	if (rc == 0) {
 		uint32_t ret_size;
@@ -115,17 +116,11 @@ tuple_constraint_call_func(const struct tuple_constraint *constr,
 	if (rc != 0 && field != NULL) {
 		const char *field_path =
 			tuple_field_path(field, constr->space->format);
-		struct error *e = diag_set(ClientError,
-					   ER_FIELD_CONSTRAINT_FAILED,
-					   constr->def.name, field_path);
-		error_set_str(e, "name", constr->def.name);
-		error_set_str(e, "field_path", field_path);
-		error_set_uint(e, "field_id", field->id);
+		diag_set(ClientError, ER_FIELD_CONSTRAINT_FAILED,
+			 constr->def.name, field_path, field->id);
 	} else if (rc != 0) {
-		struct error *e = diag_set(ClientError,
-					   ER_TUPLE_CONSTRAINT_FAILED,
-					   constr->def.name);
-		error_set_str(e, "name", constr->def.name);
+		diag_set(ClientError, ER_TUPLE_CONSTRAINT_FAILED,
+			 constr->def.name);
 	}
 	return rc;
 }
@@ -184,12 +179,12 @@ tuple_constraint_func_init(struct tuple_constraint *constr,
 	if (func == NULL && recovery_state <= INITIAL_RECOVERY) {
 		/*
 		 * That's an initial recovery and func space is not loaded yet,
-		 * we heave to leave it a return to it after.
+		 * we have to leave it and return to it after.
 		 */
 		assert(constr->check == tuple_constraint_noop_check);
 		return 0;
 	}
-	if (func == NULL ||
+	if (func == NULL || func_access_check(func) != 0 ||
 	    tuple_constraint_func_verify(constr, func, is_field) != 0) {
 		constr->space = NULL;
 		return -1;

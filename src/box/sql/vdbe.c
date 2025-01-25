@@ -240,13 +240,8 @@ static int
 vdbe_add_new_autoinc_id(struct Vdbe *vdbe, int64_t id)
 {
 	assert(vdbe != NULL);
-	size_t size;
 	struct autoinc_id_entry *id_entry =
-		region_alloc_object(&fiber()->gc, typeof(*id_entry), &size);
-	if (id_entry == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_object", "id_entry");
-		return -1;
-	}
+		xregion_alloc_object(&fiber()->gc, typeof(*id_entry));
 	id_entry->id = id;
 	stailq_add_tail_entry(vdbe_autoinc_id_list(vdbe), id_entry, link);
 	return 0;
@@ -535,7 +530,10 @@ case OP_Goto: {             /* jump */
  * text description of the error.
  */
 case OP_SetDiag: {             /* jump */
-	box_error_set(__FILE__, __LINE__, pOp->p1, pOp->p4.z);
+	assert(pOp->p1 == ER_TRIGGER_EXISTS || pOp->p1 == ER_NO_SUCH_TRIGGER ||
+	       pOp->p1 == ER_SPACE_EXISTS || pOp->p1 == ER_FUNCTION_EXISTS ||
+	       pOp->p1 == ER_SQL_CANT_ADD_AUTOINC || pOp->p1 == ER_SQL_EXECUTE);
+	diag_set(ClientError, pOp->p1, pOp->p4.z);
 	if (pOp->p2 != 0)
 		goto jump_to_p2;
 	break;
@@ -2136,6 +2134,8 @@ case OP_Count: {         /* out2 */
 		assert((pCrsr->curFlags & BTCF_TEphemCursor) != 0);
 		nEntry = tarantoolsqlEphemeralCount(pCrsr);
 	}
+	if (nEntry < 0)
+		goto abort_due_to_error;
 	pOut = vdbe_prepare_null_out(p, pOp->p2);
 	mem_set_uint(pOut, nEntry);
 	break;
@@ -2200,25 +2200,81 @@ case OP_CreateCheck: {
 }
 
 /**
- * Opcode: DropTupleConstraint P1 * * P4 *
- * Synopsis: Drop constraint from box.space[P1]
- *
- * Drop constraint named P4.z from space P1.
+ * Opcode: OP_DropTupleForeignKey P1 * * P4 *
+ * Synopsis: Drop FOREIGN KEY constraint from box.space[P1]
  */
-case OP_DropTupleConstraint: {
+case OP_DropTupleForeignKey: {
 	assert(pOp->p1 >= 0 && pOp->p4.z != NULL);
-	if (sql_constraint_drop(pOp->p1, pOp->p4.z) != 0)
+	if (sql_tuple_foreign_key_drop(pOp->p1, pOp->p4.z) != 0)
 		goto abort_due_to_error;
 	assert(p->nChange == 0);
 	p->nChange = 1;
 	break;
 }
 
-/* Opcode: Savepoint P1 * * P4 *
+/**
+ * Opcode: DropTupleConstraint P1 * * P4 *
+ * Synopsis: Drop CHECK constraint from box.space[P1]
+ */
+case OP_DropTupleCheck: {
+	assert(pOp->p1 >= 0 && pOp->p4.z != NULL);
+	if (sql_tuple_check_drop(pOp->p1, pOp->p4.z) != 0)
+		goto abort_due_to_error;
+	assert(p->nChange == 0);
+	p->nChange = 1;
+	break;
+}
+
+/**
+ * Opcode: OP_DropFieldForeignKey P1 * P3 P4 *
+ * Synopsis: Drop FOREIGN KEY constraint from field P3 of box.space[P1]
+ */
+case OP_DropFieldForeignKey: {
+	assert(pOp->p1 >= 0 && pOp->p4.z != NULL);
+	if (sql_field_foreign_key_drop(pOp->p1, pOp->p3, pOp->p4.z) != 0)
+		goto abort_due_to_error;
+	assert(p->nChange == 0);
+	p->nChange = 1;
+	break;
+}
+
+/**
+ * Opcode: OP_DropFieldCheck P1 * P3 P4 *
+ * Synopsis: Drop CHECK constraint from field P3 of box.space[P1]
+ */
+case OP_DropFieldCheck: {
+	assert(pOp->p1 >= 0 && pOp->p4.z != NULL);
+	if (sql_field_check_drop(pOp->p1, pOp->p3, pOp->p4.z) != 0)
+		goto abort_due_to_error;
+	assert(p->nChange == 0);
+	p->nChange = 1;
+	break;
+}
+
+/**
+ * Opcode: AddFuncDefault P1 P2 P3 * *
+ * Synopsis: Add function r[P2] as default for field P3 of box.space[r[P1]]
+ */
+case OP_AddFuncDefault: {
+	assert(aMem[pOp->p1].type == MEM_TYPE_UINT);
+	uint32_t space_id = aMem[pOp->p1].u.u;
+	uint32_t fieldno = pOp->p3;
+	assert(aMem[pOp->p2].type == MEM_TYPE_UINT);
+	uint32_t func_id = aMem[pOp->p2].u.u;
+	if (sql_add_default(space_id, fieldno, func_id) != 0)
+		goto abort_due_to_error;
+	break;
+}
+
+/* Opcode: Savepoint P1 * P3 P4 *
  *
  * Open, release or rollback the savepoint named by parameter P4, depending
  * on the value of P1. To open a new savepoint, P1==0. To release (commit) an
  * existing savepoint, P1==1, or to rollback an existing savepoint P1==2.
+ *
+ * For RELEASE SAVEPOINT and ROLLBACK SAVEPOINT, if P3 is not 0, if a savepoint
+ * is not found by the name specified in P4, an additional search is performed
+ * on the name specified in P3.
  */
 case OP_Savepoint: {
 	int p1;                         /* Value of P1 operand */
@@ -2251,6 +2307,10 @@ case OP_Savepoint: {
 		 * an error is returned to the user.
 		 */
 		struct txn_savepoint *sv = txn_savepoint_by_name(txn, zName);
+		if (sv == NULL && pOp->p3 > 0) {
+			struct Mem *old_name = &aMem[pOp->p3];
+			sv = txn_savepoint_by_name(txn, old_name->z);
+		}
 		if (sv == NULL) {
 			diag_set(ClientError, ER_NO_SUCH_SAVEPOINT);
 			goto abort_due_to_error;
@@ -3172,11 +3232,7 @@ case OP_RowData: {
 	if (n > SQL_MAX_LENGTH)
 		goto too_big;
 
-	char *buf = region_alloc(&fiber()->gc, n);
-	if (buf == NULL) {
-		diag_set(OutOfMemory, n, "region_alloc", "buf");
-		goto abort_due_to_error;
-	}
+	char *buf = xregion_alloc(&fiber()->gc, n);
 	sqlCursorPayload(pCrsr, 0, n, buf);
 	mem_set_bin_ephemeral(pOut, buf, n);
 	assert(sqlVdbeCheckMemInvariants(pOut));
@@ -3608,13 +3664,7 @@ case OP_Update: {
 		goto abort_due_to_error;
 	}
 	uint32_t ops_size = region_used(region) - used;
-	const char *ops = region_join(region, ops_size);
-	if (ops == NULL) {
-		region_truncate(&fiber()->gc, used);
-		diag_set(OutOfMemory, ops_size, "region_join", "raw");
-		goto abort_due_to_error;
-	}
-
+	const char *ops = xregion_join(region, ops_size);
 	assert(rc == 0);
 	rc = box_update(space->def->id, 0, key_mem->z, key_mem->z + key_mem->n,
 			ops, ops + ops_size, 0, NULL);
@@ -4339,7 +4389,7 @@ case OP_GenSpaceid: {
 	assert(pOp->p1 > 0);
 	pOut = vdbe_prepare_null_out(p, pOp->p1);
 	uint32_t u;
-	if (box_generate_space_id(&u) != 0)
+	if (box_generate_space_id(&u, false) != 0)
 		goto abort_due_to_error;
 	mem_set_uint(pOut, u);
 	break;

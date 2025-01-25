@@ -15,9 +15,13 @@
 #include "core/backtrace.h"
 #include "crash.h"
 #include "say.h"
+#include "tweaks.h"
 
 /** Storage for crash_collect function return value. */
 static struct crash_info crash_info;
+
+bool crash_produce_coredump = true;
+TWEAK_BOOL(crash_produce_coredump);
 
 /**
  * The routine is called inside crash signal handler so
@@ -187,6 +191,10 @@ crash_signal_cb(int signo, siginfo_t *siginfo, void *context)
 		fprintf(stderr, "Fatal %d while backtracing\n", signo);
 	}
 
+	lsan_turn_off();
+	if (!crash_produce_coredump)
+		exit(EXIT_FAILURE);
+
 	/* Try to dump a core */
 	struct sigaction sa = {
 		.sa_handler = SIG_DFL,
@@ -225,9 +233,12 @@ crash_signal_init(void)
 	 *
 	 * SA_NODEFER allows receiving the same signal
 	 * during handler.
+	 *
+	 * SA_ONSTACK is required to handle stack overflow, which
+	 * makes the current stack unusable.
 	 */
 	struct sigaction sa = {
-		.sa_flags = SA_RESETHAND | SA_NODEFER | SA_SIGINFO,
+		.sa_flags = SA_RESETHAND | SA_NODEFER | SA_SIGINFO | SA_ONSTACK,
 		.sa_sigaction = crash_signal_cb,
 	};
 	sigemptyset(&sa.sa_mask);

@@ -40,17 +40,12 @@ g.test_downgrade_sanity_checks = function(cg)
         end
 
         local version = schema_version()
-        t.assert_error_msg_contains('version should be in format A.B.C',
-                                    box.schema.downgrade, 'xxx')
+        local msg = "Error during parsing version string"
+        t.assert_error_msg_contains(msg, box.schema.downgrade, 'xxx')
         t.assert_equals(schema_version(), version)
-        t.assert_error_msg_contains('version should be in format A.B.C',
-                                    box.schema.downgrade, '2')
+        t.assert_error_msg_contains(msg, box.schema.downgrade, '2')
         t.assert_equals(schema_version(), version)
-        t.assert_error_msg_contains('version should be in format A.B.C',
-                                    box.schema.downgrade, '2.2')
-        t.assert_equals(schema_version(), version)
-        t.assert_error_msg_contains('version should be in format A.B.C',
-                                    box.schema.downgrade, '2.2.2.2')
+        t.assert_error_msg_contains(msg, box.schema.downgrade, '2.2')
         t.assert_equals(schema_version(), version)
 
         t.assert_error_msg_contains(
@@ -73,6 +68,28 @@ g.test_downgrade_sanity_checks = function(cg)
             ' then schema version 2.9.1 for Tarantool 2.10.0',
             box.schema.downgrade, '2.10.0')
         t.assert_equals(schema_version(), "2.7.1")
+    end)
+end
+
+g.test_downgrade_from_more_recent_version = function(cg)
+    cg.server:exec(function()
+        local tarantool = require('tarantool')
+        local function schema_version()
+            local t = box.space._schema:get{'version'}
+            return string.format('%d.%d.%d', t[2], t[3], t[4])
+        end
+
+        local app_version = tarantool.version:match('^%d+%.%d+%.%d+')
+        local major, minor, patch = app_version:match('(%d+)%.(%d+)%.(%d+)')
+        box.space._schema:replace({'version', tonumber(major), tonumber(minor),
+                                   tonumber(patch) + 1})
+        local new_version = schema_version()
+        local err = 'Cannot downgrade as current schema version %s is newer' ..
+                    ' than Tarantool version %s'
+        t.assert_error_msg_contains(err:format(new_version, app_version),
+                                    box.schema.downgrade,
+                                    box.schema.downgrade_versions()[1])
+        t.assert_equals(schema_version(), new_version)
     end)
 end
 
@@ -684,7 +701,7 @@ g.test_downgrade_sql_expr_function = function(cg)
             box.space._func:auto_increment{
                 1, name, 1, 'SQL_EXPR', body, 'function', {},
                 'any', 'none', 'none', true, true, true, {'LUA'},
-                empty, '', datetime, datetime
+                empty, '', datetime, datetime, {}
             }
         end
 
@@ -796,8 +813,8 @@ g.test_downgrade_sql_tuple_check_contraints = function(cg)
     cg.server:exec(function()
         local helper = require('test.box-luatest.downgrade_helper')
 
-        box.execute([[CREATE TABLE t(i INT PRIMARY KEY, a INT);]])
-        box.execute([[ALTER TABLE t ADD CONSTRAINT c CHECK (a > 10);]])
+        box.execute([[CREATE TABLE T(I INT PRIMARY KEY, A INT);]])
+        box.execute([[ALTER TABLE T ADD CONSTRAINT C CHECK (A > 10);]])
 
         local function constraint_before()
             local space = box.space._space.index.name:get{'T'}
@@ -806,7 +823,7 @@ g.test_downgrade_sql_tuple_check_contraints = function(cg)
             t.assert(func_id ~= nil)
             local func = box.space._func:get{func_id}
             t.assert(func ~= nil)
-            t.assert_equals(func.body, 'a > 10')
+            t.assert_equals(func.body, 'A > 10')
         end
 
         local function constraint_after(func_id)
@@ -814,7 +831,7 @@ g.test_downgrade_sql_tuple_check_contraints = function(cg)
             t.assert(box.space._func:get{func_id} == nil)
             t.assert(space.flags.constraint == nil)
             local result = box.space._ck_constraint:get{space.id, 'C'}
-            local expected = {space.id, 'C', false, 'SQL', 'a > 10', true}
+            local expected = {space.id, 'C', false, 'SQL', 'A > 10', true}
             t.assert_equals(result, expected)
         end
 
@@ -917,37 +934,147 @@ end
 g.test_downgrade_global_names = function(cg)
     cg.server:exec(function()
         local helper = require('test.box-luatest.downgrade_helper')
+        local name = 'test'
         box.cfg{
             force_recovery = true,
-            cluster_name = 'test'
-        }
-        local prev_version = helper.prev_version(helper.app_version('3.0.0'))
-        local issues = box.schema.downgrade_issues(prev_version)
-        t.assert_str_contains(issues[1], 'Cluster name is set')
-        box.space._schema:delete{'cluster_name'}
-        box.cfg{
-            cluster_name = box.NULL,
-            replicaset_name = 'test'
-        }
-        issues = box.schema.downgrade_issues(prev_version)
-        t.assert_str_contains(issues[1], 'Replicaset name is set')
-        box.space._schema:delete{'replicaset_name'}
-        box.cfg{
-            replicaset_name = box.NULL,
-            instance_name = 'test',
-        }
-        issues = box.schema.downgrade_issues(prev_version)
-        t.assert_str_contains(issues[1], 'Instance name is set')
-        box.space._cluster:update({box.info.id}, {{'#', 'name', 1}})
-        box.cfg{
-            instance_name = box.NULL,
-            force_recovery = false,
+            cluster_name = name,
+            replicaset_name = name,
+            instance_name = name,
         }
 
+        local prev_version = helper.prev_version(helper.app_version('3.0.0'))
+        t.assert_equals(box.schema.downgrade_issues(prev_version), {})
         local format = box.space._cluster:format()
         t.assert_equals(#format, 3)
         t.assert_equals(format[3].name, 'name')
+
         box.schema.downgrade(prev_version)
         t.assert_equals(#box.space._cluster:format(), 2)
+        local info = box.info
+        t.assert_equals(info.name, name)
+        t.assert_equals(box.space._cluster:get(1)[3], name)
+        t.assert_equals(info.replicaset.name, name)
+        t.assert_equals(box.space._schema:get('replicaset_name')[2], name)
+        t.assert_equals(info.cluster.name, 'test')
+        t.assert_equals(box.space._schema:get('cluster_name')[2], name)
+    end)
+end
+
+-----------------------------
+-- Check downgrade from 3.1.0
+-----------------------------
+
+g.test_downgrade_func_trigger = function(cg)
+    cg.server:exec(function()
+        local helper = require('test.box-luatest.downgrade_helper')
+        local _func = box.space._func
+
+        local function check_before_downgrade(has_trigger_funcs)
+            t.assert_equals(#_func:format(), 20)
+            t.assert_equals(_func:format()[20].name, 'trigger')
+            t.assert_equals(#_func:get(box.func.not_trigger.id), 20)
+            t.assert_equals(_func:get(box.func.not_trigger.id).trigger, {})
+            if not has_trigger_funcs then
+                return
+            end
+            t.assert_equals(#_func:get(box.func.trigger1.id), 20)
+            t.assert_equals(_func:get(box.func.trigger1.id).trigger, {'trg'})
+            t.assert_equals(#_func:get(box.func.trigger2.id), 20)
+            t.assert_equals(_func:get(box.func.trigger2.id).trigger, {'trg'})
+        end
+
+        local function check_after_downgrade()
+            t.assert_equals(#_func:format(), 19)
+            t.assert_equals(#_func:get(box.func.not_trigger.id), 19)
+        end
+
+        local lua_code = 'function(a, b) return a + b end'
+        box.schema.func.create('trigger1', {body = lua_code, trigger = 'trg'})
+        box.schema.func.create('trigger2', {body = lua_code, trigger = 'trg'})
+        box.schema.func.create('not_trigger', {body = lua_code})
+
+        -- Check if nothing changes after downgrade to version that supports
+        -- the feature
+        local app_version = helper.app_version('3.1.0')
+        t.assert_equals(box.schema.downgrade_issues(app_version), {})
+        box.schema.downgrade(app_version)
+        check_before_downgrade(true)
+
+        -- Check if downgrade_issues are collected correctly and downgrade
+        -- actually doesn't happen
+        local fmt = 'Function %s is registered as ' ..
+                    'event trigger. It is supported starting from version 3.1.0'
+        local expected_issues = {
+            string.format(fmt, 'trigger1'),
+            string.format(fmt, 'trigger2')
+        }
+        local prev_version = helper.prev_version('3.1.0')
+        t.assert_equals(box.schema.downgrade_issues(prev_version),
+                        expected_issues)
+        t.assert_error_msg_contains(expected_issues[1],
+                                    box.schema.downgrade, prev_version)
+        check_before_downgrade(true)
+
+        -- Drop the functions with trigger and check if downgrade collects
+        -- no issues and works correctly. Upgrade is needed to be able to
+        -- drop the functions - DDL is disabled when schema is outdated.
+        box.schema.upgrade()
+        box.func.trigger1:drop()
+        box.func.trigger2:drop()
+        t.assert_equals(box.schema.downgrade_issues(prev_version), {})
+        check_before_downgrade(false)
+        -- 2 for idempotence.
+        for _ = 1, 2 do
+            box.schema.downgrade(prev_version)
+            check_after_downgrade()
+        end
+    end)
+end
+
+-----------------------------
+-- Check downgrade from 3.3.0
+-----------------------------
+
+g.test_downgrade_drop_gc_consumers = function(cg)
+    cg.server:exec(function()
+        local helper = require('test.box-luatest.downgrade_helper')
+        local space_id = box.schema.GC_CONSUMERS_ID
+        local _priv = box.space._priv
+        local map = setmetatable({}, {__serialize = 'map'})
+
+        local function check_before_downgrade()
+            t.assert_not_equals(box.space._gc_consumers, nil)
+            t.assert_equals(#_priv.index.object:select{'space', space_id}, 1)
+            t.assert_equals(#box.space._gc_consumers:select{}, 1)
+        end
+
+        local function check_after_downgrade()
+            t.assert_equals(box.space._gc_consumers, nil)
+            t.assert_equals(_priv.index.object:select{'space', space_id}, {})
+        end
+
+        local replica_uuid = require('uuid').str()
+        box.space._cluster:insert{2, replica_uuid}
+        box.space._gc_consumers:replace{replica_uuid, map, map}
+
+        -- Check if nothing changes after downgrade to version that supports
+        -- the feature
+        local app_version = helper.app_version('3.3.0')
+        t.assert_equals(box.schema.downgrade_issues(app_version), {})
+        box.schema.downgrade(app_version)
+        check_before_downgrade()
+
+        -- Check if downgrade_issues are not collected and downgrade
+        -- actually doesn't happen
+        local prev_version = helper.prev_version('3.3.0')
+        t.assert_equals(box.schema.downgrade_issues(prev_version), {})
+        check_before_downgrade()
+
+        -- Check if downgrade works correctly and gc_consumer is dropped
+        -- automatically. Test 2 times for idempotence.
+        for _ = 1, 2 do
+            box.schema.downgrade(prev_version)
+            check_after_downgrade()
+        end
     end)
 end

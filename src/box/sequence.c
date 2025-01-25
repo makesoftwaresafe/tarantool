@@ -85,11 +85,12 @@ sequence_data_equal_key(struct sequence_data data, uint32_t id)
 
 static struct light_sequence_core sequence_data_index;
 static struct mempool sequence_data_extent_pool;
+static struct matras_allocator sequence_data_extent_allocator;
 
 static void *
-sequence_data_extent_alloc(void *ctx)
+sequence_data_extent_alloc(struct matras_allocator *allocator)
 {
-	(void)ctx;
+	(void)allocator;
 	void *ret = mempool_alloc(&sequence_data_extent_pool);
 	if (ret == NULL)
 		diag_set(OutOfMemory, SEQUENCE_DATA_EXTENT_SIZE,
@@ -98,9 +99,9 @@ sequence_data_extent_alloc(void *ctx)
 }
 
 static void
-sequence_data_extent_free(void *ctx, void *extent)
+sequence_data_extent_free(struct matras_allocator *allocator, void *extent)
 {
-	(void)ctx;
+	(void)allocator;
 	mempool_free(&sequence_data_extent_pool, extent);
 }
 
@@ -115,27 +116,26 @@ sequence_init(void)
 {
 	mempool_create(&sequence_data_extent_pool, &cord()->slabc,
 		       SEQUENCE_DATA_EXTENT_SIZE);
+	matras_allocator_create(&sequence_data_extent_allocator,
+				SEQUENCE_DATA_EXTENT_SIZE,
+				sequence_data_extent_alloc,
+				sequence_data_extent_free);
 	light_sequence_create(&sequence_data_index, 0,
-			      SEQUENCE_DATA_EXTENT_SIZE,
-			      sequence_data_extent_alloc,
-			      sequence_data_extent_free, NULL, NULL);
+			      &sequence_data_extent_allocator, NULL);
 }
 
 void
 sequence_free(void)
 {
 	light_sequence_destroy(&sequence_data_index);
+	matras_allocator_destroy(&sequence_data_extent_allocator);
 	mempool_destroy(&sequence_data_extent_pool);
 }
 
 struct sequence *
 sequence_new(struct sequence_def *def)
 {
-	struct sequence *seq = calloc(1, sizeof(*seq));
-	if (seq == NULL) {
-		diag_set(OutOfMemory, sizeof(*seq), "malloc", "sequence");
-		return NULL;
-	}
+	struct sequence *seq = xcalloc(1, sizeof(*seq));
 	seq->def = def;
 	return seq;
 }
@@ -341,7 +341,7 @@ sequence_data_iterator_next_raw(struct index_read_view_iterator *iterator,
 
 	const size_t buf_size = mp_sizeof_array(2) +
 				2 * mp_sizeof_uint(UINT64_MAX);
-	char *buf = region_alloc(&fiber()->gc, buf_size);
+	char *buf = xregion_alloc(&fiber()->gc, buf_size);
 	char *buf_end = buf;
 	buf_end = mp_encode_array(buf_end, 2);
 	buf_end = mp_encode_uint(buf_end, sd->id);
@@ -392,7 +392,9 @@ sequence_data_iterator_create(struct index_read_view *base,
 	struct sequence_data_iterator *iter =
 		(struct sequence_data_iterator *)iterator;
 	iter->base.index = base;
+	iter->base.destroy = generic_index_read_view_iterator_destroy;
 	iter->base.next_raw = sequence_data_iterator_next_raw;
+	iter->base.position = generic_index_read_view_iterator_position;
 	light_sequence_view_iterator_begin(&rv->view, &iter->iter);
 	return 0;
 }
@@ -410,17 +412,16 @@ sequence_data_read_view_free(struct index_read_view *base)
 struct index_read_view *
 sequence_data_read_view_create(struct index *index)
 {
-	(void)index;
 	static const struct index_read_view_vtab vtab = {
 		.free = sequence_data_read_view_free,
+		.count = generic_index_read_view_count,
 		.get_raw = sequence_data_read_view_get_raw,
 		.create_iterator = sequence_data_iterator_create,
+		.create_iterator_with_offset =
+			generic_index_read_view_create_iterator_with_offset,
 	};
 	struct sequence_data_read_view *rv = xmalloc(sizeof(*rv));
-	if (index_read_view_create(&rv->base, &vtab, index->def) != 0) {
-		free(rv);
-		return NULL;
-	}
+	index_read_view_create(&rv->base, &vtab, index->def);
 	light_sequence_view_create(&rv->view, &sequence_data_index);
 	return (struct index_read_view *)rv;
 }

@@ -248,6 +248,7 @@ recover_xlog(struct recovery *r, struct xstream *stream,
 	     const struct vclock *stop_vclock)
 {
 	struct xrow_header row;
+	bool is_sending_tx = false;
 	while (xlog_cursor_next_xc(&r->cursor, &row,
 				   r->wal_dir.force_recovery) == 0) {
 		if (++stream->row_count % WAL_ROWS_PER_YIELD == 0) {
@@ -268,9 +269,6 @@ recover_xlog(struct recovery *r, struct xstream *stream,
 		if (stop_vclock != NULL &&
 		    r->vclock.signature >= stop_vclock->signature)
 			return;
-		int64_t current_lsn = vclock_get(&r->vclock, row.replica_id);
-		if (row.lsn <= current_lsn)
-			continue; /* already applied, skip */
 
 		/*
 		 * All rows in xlog files have an assigned replica
@@ -278,13 +276,32 @@ recover_xlog(struct recovery *r, struct xstream *stream,
 		 * are signed with a zero replica id.
 		 */
 		assert(row.replica_id != 0 || row.group_id == GROUP_LOCAL);
-		/*
-		 * We can promote the vclock either before or
-		 * after xstream_write(): it only makes any impact
-		 * in case of forced recovery, when we skip the
-		 * failed row anyway.
-		 */
-		vclock_follow_xrow(&r->vclock, &row);
+		int64_t current_lsn = vclock_get(&r->vclock, row.replica_id);
+		if (row.lsn <= current_lsn) {
+			/*
+			 * Skip the already applied row, if it is not needed to
+			 * preserve transaction boundaries (is not the last row
+			 * of a currently recovered transaction). Otherwise,
+			 * replace it with a NOP, so that the transaction end
+			 * flag reaches the receiver, but the data isn't
+			 * recovered twice.
+			 */
+			if (!is_sending_tx || !row.is_commit)
+				continue; /* already applied, skip */
+			row.type = IPROTO_NOP;
+			row.bodycnt = 0;
+			row.body[0].iov_base = NULL;
+			row.body[0].iov_len = 0;
+		} else {
+			/*
+			 * We can promote the vclock either before or
+			 * after xstream_write(): it only makes any impact
+			 * in case of forced recovery, when we skip the
+			 * failed row anyway.
+			 */
+			vclock_follow_xrow(&r->vclock, &row);
+		}
+		is_sending_tx = !row.is_commit;
 		if (xstream_write(stream, &row) != 0) {
 			if (!r->wal_dir.force_recovery)
 				diag_raise();

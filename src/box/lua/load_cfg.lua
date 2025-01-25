@@ -77,6 +77,12 @@ local function ifdef_security(value)
     end
 end
 
+local function ifdef_wal_retention_period(value)
+    if private.cfg_set_wal_retention_period ~= nil then
+        return value
+    end
+end
+
 -- all available options
 local default_cfg = {
     listen              = nil,
@@ -116,10 +122,14 @@ local default_cfg = {
     audit_nonblock      = ifdef_audit(true),
     audit_format        = ifdef_audit('json'),
     audit_filter        = ifdef_audit('compatibility'),
+    audit_spaces        = ifdef_audit(nil),
+    audit_extract_key   = ifdef_audit(false),
 
     auth_type           = 'chap-sha1',
     auth_delay          = ifdef_security(0),
+    auth_retries        = ifdef_security(0),
     disable_guest       = ifdef_security(false),
+    secure_erasing      = ifdef_security(false),
     password_lifetime_days = ifdef_security(0),
     password_min_length = ifdef_security(0),
     password_enforce_uppercase = ifdef_security(false),
@@ -146,7 +156,8 @@ local default_cfg = {
     wal_max_size        = 256 * 1024 * 1024,
     wal_dir_rescan_delay= 2,
     wal_queue_max_size  = 16 * 1024 * 1024,
-    wal_cleanup_delay   = 4 * 3600,
+    wal_cleanup_delay   = nil,
+    wal_retention_period = ifdef_wal_retention_period(0),
     wal_ext             = ifdef_wal_ext(nil),
     force_recovery      = false,
     replication         = nil,
@@ -172,13 +183,15 @@ local default_cfg = {
     election_fencing_mode = 'soft',
     replication_timeout = 1,
     replication_sync_lag = 10,
-    replication_sync_timeout = 300,
+    replication_sync_timeout = 0,
     replication_synchro_quorum = "N / 2 + 1",
     replication_synchro_timeout = 5,
+    replication_synchro_queue_max_size = 16 * 1024 * 1024,
     replication_connect_timeout = 30,
     replication_connect_quorum = nil, -- connect all
     replication_skip_conflict = false,
     replication_anon      = false,
+    replication_anon_ttl  = 60 * 60,
     replication_threads   = 1,
     bootstrap_strategy    = "auto",
     bootstrap_leader      = nil,
@@ -193,6 +206,7 @@ local default_cfg = {
     sql_cache_size        = 5 * 1024 * 1024,
     txn_timeout           = 365 * 100 * 86400,
     txn_isolation         = "best-effort",
+    memtx_sort_threads    = nil,
 
     metrics     = {
         include = 'all',
@@ -243,7 +257,7 @@ local compat_options = {
         oldval = 300,
         newval = 0,
         obsolete = nil,
-        default = 'old',
+        default = 'new',
     },
 }
 
@@ -310,10 +324,14 @@ local template_cfg = {
     audit_nonblock      = ifdef_audit('boolean'),
     audit_format        = ifdef_audit('string'),
     audit_filter        = ifdef_audit('string'),
+    audit_spaces        = ifdef_audit('table'),
+    audit_extract_key   = ifdef_audit('boolean'),
 
     auth_type           = 'string',
     auth_delay          = ifdef_security('number'),
+    auth_retries        = ifdef_security('number'),
     disable_guest       = ifdef_security('boolean'),
+    secure_erasing      = ifdef_security('boolean'),
     password_lifetime_days = ifdef_security('number'),
     password_min_length = ifdef_security('number'),
     password_enforce_uppercase = ifdef_security('boolean'),
@@ -340,6 +358,7 @@ local template_cfg = {
     wal_max_size        = 'number',
     wal_dir_rescan_delay= 'number',
     wal_cleanup_delay   = 'number',
+    wal_retention_period = ifdef_wal_retention_period('number'),
     wal_ext             = ifdef_wal_ext('table'),
     force_recovery      = 'boolean',
     replication         = 'string, number, table',
@@ -370,10 +389,12 @@ local template_cfg = {
     replication_sync_timeout = 'number',
     replication_synchro_quorum = 'string, number',
     replication_synchro_timeout = 'number',
+    replication_synchro_queue_max_size = 'number',
     replication_connect_timeout = 'number',
     replication_connect_quorum = 'number',
     replication_skip_conflict = 'boolean',
     replication_anon      = 'boolean',
+    replication_anon_ttl  = 'number',
     replication_threads   = 'number',
     bootstrap_strategy    = 'string',
     bootstrap_leader      = 'string, number',
@@ -387,6 +408,7 @@ local template_cfg = {
     net_msg_max           = 'number',
     sql_cache_size        = 'number',
     txn_timeout           = 'number',
+    memtx_sort_threads    = 'number',
 
     metrics = 'table',
 }
@@ -486,7 +508,15 @@ local dynamic_cfg = {
     worker_pool_threads     = private.cfg_set_worker_pool_threads,
     -- do nothing, affects new replicas, which query this value on start
     wal_dir_rescan_delay    = nop,
-    wal_cleanup_delay       = private.cfg_set_wal_cleanup_delay,
+    wal_cleanup_delay       = function()
+        if compat.wal_cleanup_delay_deprecation:is_old() then
+            log.warn("Option wal_cleanup_delay is deprecated.")
+        else
+            box.error(box.error.DEPRECATED, "Option wal_cleanup_delay")
+        end
+        private.cfg_set_wal_cleanup_delay()
+    end,
+    wal_retention_period    = private.cfg_set_wal_retention_period,
     custom_proc_title       = function()
         require('title').update(box.cfg.custom_proc_title)
     end,
@@ -501,9 +531,13 @@ local dynamic_cfg = {
     replication_sync_timeout = private.cfg_set_replication_sync_timeout,
     replication_synchro_quorum = private.cfg_set_replication_synchro_quorum,
     replication_synchro_timeout = private.cfg_set_replication_synchro_timeout,
+    replication_synchro_queue_max_size =
+        private.cfg_set_replication_synchro_queue_max_size,
     replication_skip_conflict = private.cfg_set_replication_skip_conflict,
     replication_anon        = private.cfg_set_replication_anon,
+    replication_anon_ttl    = private.cfg_set_replication_anon_ttl,
     bootstrap_strategy      = private.cfg_set_bootstrap_strategy,
+    bootstrap_leader        = private.cfg_set_bootstrap_leader,
     instance_uuid           = check_instance_uuid,
     instance_name           = private.cfg_set_instance_name,
     replicaset_uuid         = check_replicaset_uuid,
@@ -515,7 +549,9 @@ local dynamic_cfg = {
     txn_isolation           = private.cfg_set_txn_isolation,
     auth_type               = private.cfg_set_auth_type,
     auth_delay              = private.cfg_set_security,
+    auth_retries            = private.cfg_set_security,
     disable_guest           = private.cfg_set_security,
+    secure_erasing          = private.cfg_set_security,
     password_lifetime_days  = private.cfg_set_security,
     password_min_length     = ifdef_security(nop),
     password_enforce_uppercase = ifdef_security(nop),
@@ -615,11 +651,13 @@ local dynamic_cfg_order = {
     replication_sync_timeout    = 150,
     replication_synchro_quorum  = 150,
     replication_synchro_timeout = 150,
+    replication_synchro_queue_max_size = 150,
     replication_connect_timeout = 150,
     replication_connect_quorum  = 150,
     -- Apply bootstrap_strategy before replication, but after
     -- replication_connect_quorum. The latter might influence its value.
     bootstrap_strategy      = 175,
+    bootstrap_leader        = 175,
     replication             = 200,
     -- Anon is set after `replication` as a temporary workaround
     -- for the problem, that `replication` and `replication_anon`
@@ -662,10 +700,13 @@ local dynamic_cfg_skip_at_load = {
     replication_sync_timeout = true,
     replication_synchro_quorum = true,
     replication_synchro_timeout = true,
+    replication_synchro_queue_max_size = true,
     replication_skip_conflict = true,
     replication_anon        = true,
     bootstrap_strategy      = true,
+    bootstrap_leader        = true,
     wal_dir_rescan_delay    = true,
+    wal_queue_max_size      = true,
     custom_proc_title       = true,
     force_recovery          = true,
     instance_uuid           = true,
@@ -677,8 +718,11 @@ local dynamic_cfg_skip_at_load = {
     readahead               = true,
     auth_type               = true,
     auth_delay              = ifdef_security(true),
+    auth_retries            = ifdef_security(true),
     disable_guest           = ifdef_security(true),
+    secure_erasing          = ifdef_security(true),
     password_lifetime_days  = ifdef_security(true),
+    wal_retention_period    = ifdef_wal_retention_period(true),
 }
 
 -- Options that are not part of dynamic_cfg_modules and applied individually
@@ -796,13 +840,20 @@ local function check_cfg_option_type(template, name, value)
                       template)
         end
     end
+    -- It makes no sense to set any configuration option value to an infinite
+    -- number (nan, inf, -inf). To prevent such numbers from slipping through
+    -- configuration option sanity checks and breaking the application logic,
+    -- we forbid them explicitly at the top level.
+    if type(value) == 'number' and not
+            (value == value and value > -math.huge and value < math.huge) then
+        box.error(box.error.CFG, name, "should be a finite number")
+    end
 end
 
-local function prepare_cfg(cfg, default_cfg, template_cfg, modify_cfg)
+local function prepare_cfg(cfg, old_cfg, default_cfg, template_cfg, modify_cfg)
     if cfg == nil then
-        return {}
-    end
-    if type(cfg) ~= 'table' then
+        cfg = {}
+    elseif type(cfg) ~= 'table' then
         error("Error: cfg should be a table")
     end
     local new_cfg = {}
@@ -820,6 +871,15 @@ local function prepare_cfg(cfg, default_cfg, template_cfg, modify_cfg)
         end
         new_cfg[k] = v
     end
+    -- Use the old config for omitted options.
+    for k, v in pairs(old_cfg) do
+        -- Don't override options set to box.NULL (which equals nil but
+        -- evaluates to true) because setting an option to box.NULL must
+        -- be equivalent to resetting it to the default value.
+        if cfg[k] == nil and not cfg[k] then
+            new_cfg[k] = v
+        end
+    end
     return new_cfg
 end
 
@@ -832,16 +892,6 @@ local function apply_env_cfg(cfg, env_cfg, skip_cfg)
     for k, v in pairs(env_cfg) do
         if cfg[k] == nil and (skip_cfg == nil or skip_cfg[k] == nil) then
             cfg[k] = v
-        end
-    end
-end
-
-local function merge_cfg(cfg, cur_cfg)
-    for k,v in pairs(cur_cfg) do
-        if cfg[k] == nil then
-            cfg[k] = v
-        elseif type(v) == 'table' then
-            merge_cfg(cfg[k], v)
         end
     end
 end
@@ -928,14 +978,18 @@ local function reconfig_modules(module_keys, oldcfg, newcfg, log_basecfg)
             error(err)
         end
 
-        log_changed_options(oldcfg, keys, log_basecfg)
+        if log_basecfg ~= nil then
+            log_changed_options(oldcfg, keys, log_basecfg)
+        else
+            log_changed_options(oldcfg, keys, oldvals)
+        end
     end
 end
 
 local function reload_cfg(oldcfg, cfg)
     cfg = upgrade_cfg(cfg, translate_cfg)
-    local newcfg = prepare_cfg(cfg, default_cfg, template_cfg, modify_cfg)
-
+    local newcfg = prepare_cfg(cfg, {}, default_cfg, template_cfg,
+                               modify_cfg)
     local module_keys = {}
     -- iterate over original table because prepare_cfg() may store NILs
     for key in pairs(cfg) do
@@ -988,11 +1042,14 @@ local box_cfg_guard_whitelist = {
     malloc = true;
     ctl = true;
     watch = true;
+    watch_once = true;
     broadcast = true;
     txn_isolation_level = true;
     NULL = true;
     info = true;
     iproto = true;
+    priv = true;
+    schema = true;
 };
 
 -- List of box members that requires full box loading.
@@ -1011,9 +1068,8 @@ for k, v in pairs(box) do
 end
 
 setmetatable(box, {
-    __index = function(table, index) -- luacheck: no unused args
-        error(debug.traceback("Please call box.cfg{} first"))
-        error("Please call box.cfg{} first")
+    __index = function()
+        box.error(box.error.UNCONFIGURED)
      end
 })
 
@@ -1030,11 +1086,16 @@ local function load_cfg(cfg)
 
     cfg = upgrade_cfg(cfg, translate_cfg)
 
+    -- Forced recovery can be envoked by CLI options. Set the appropriate
+    -- box_cfg option in this case.
+    if cfg.force_recovery == nil and private.cfg_get_force_recovery() then
+        cfg.force_recovery = true;
+    end
+
     -- Set options passed through environment variables.
     apply_env_cfg(cfg, box.internal.cfg.env, pre_load_cfg_is_set)
 
-    cfg = prepare_cfg(cfg, default_cfg, template_cfg, modify_cfg)
-    merge_cfg(cfg, pre_load_cfg);
+    cfg = prepare_cfg(cfg, pre_load_cfg, default_cfg, template_cfg, modify_cfg)
 
     -- Save new box.cfg
     box.cfg = cfg
@@ -1150,7 +1211,12 @@ local function load_cfg(cfg)
     -- warning if it's not (in case user forgot to call
     -- box.schema.upgrade()).
     if private.schema_needs_upgrade() then
-        log.warn(box.error.last())
+        local msg = string.format(
+            'Your schema version is %s while Tarantool %s requires a more'..
+            ' recent schema version. Please, consider using box.'..
+            'schema.upgrade().', tostring(box.internal.dd_version()),
+            box.info.version)
+        log.warn(msg)
     end
 end
 box.cfg = locked(load_cfg)
@@ -1178,9 +1244,12 @@ local function get_option_from_env(option)
     if param_type:find('table') and (raw_value:startswith('{') or
                                      raw_value:startswith('[')) then
         return json.decode(raw_value)
-    elseif param_type:find('table') and raw_value:find('=') then
+    end
+
+    if param_type:find('table') and raw_value:find('=') then
         assert(not param_type:find('boolean'))
         local res = {}
+        local contains_uri = false
         for _, v in ipairs(raw_value:split(',')) do
             local eq = v:find('=')
             if eq == nil then
@@ -1195,17 +1264,37 @@ local function get_option_from_env(option)
                                          'in `key=value` or `value` format, ' ..
                                          '`key` must not be empty'))
             end
+            -- Don't interpret `=` as a key-value separator if
+            -- there is `?` in a key.
+            --
+            -- Otherwise, for example,
+            -- `localhost:3301?transport=plain` would be
+            -- interpreted as the following map.
+            --
+            -- {
+            --     ['localhost:3301?transport'] = 'plain',
+            -- }
+            if lhs:find('?') then
+                contains_uri = true
+            end
             res[lhs] = tonumber(rhs) or rhs
         end
-        return res
-    elseif param_type:find('table') and raw_value:find(',') then
+        if not contains_uri then
+            return res
+        end
+        -- Fall through otherwise.
+    end
+
+    if param_type:find('table') and raw_value:find(',') then
         assert(not param_type:find('boolean'))
         local res = {}
         for i, v in ipairs(raw_value:split(',')) do
             res[i] = tonumber(v) or v
         end
         return res
-    elseif param_type:find('boolean') then
+    end
+
+    if param_type:find('boolean') then
         assert(param_type == 'boolean')
         if raw_value:lower() == 'false' then
             return false
@@ -1213,20 +1302,24 @@ local function get_option_from_env(option)
             return true
         end
         error(err_msg_fmt:format(env_var_name, option, '"true" or "false"'))
-    elseif param_type == 'number' then
+    end
+
+    if param_type == 'number' then
         local res = tonumber(raw_value)
         if res == nil then
             error(err_msg_fmt:format(env_var_name, option,
                 'convertible to a number'))
         end
         return res
-    elseif param_type:find('number') then
+    end
+
+    if param_type:find('number') then
         assert(not param_type:find('boolean'))
         return tonumber(raw_value) or raw_value
-    else
-        assert(param_type == 'string')
-        return raw_value
     end
+
+    assert(param_type == 'string')
+    return raw_value
 end
 
 -- Get options from env vars for given set.
@@ -1251,7 +1344,6 @@ end
 
 box.internal.prepare_cfg = prepare_cfg
 box.internal.apply_env_cfg = apply_env_cfg
-box.internal.merge_cfg = merge_cfg
 box.internal.check_cfg_option_type = check_cfg_option_type
 box.internal.update_cfg = update_cfg
 box.internal.env_cfg = env_cfg
@@ -1270,6 +1362,11 @@ box.internal.cfg = setmetatable({}, {
         error('Attempt to modify a read-only table')
     end,
 })
+
+-- Expose list of all available box.cfg() options and their
+-- default values for testing purposes.
+box.internal.template_cfg = template_cfg
+box.internal.default_cfg = default_cfg
 
 -- gh-810:
 -- hack luajit default cpath

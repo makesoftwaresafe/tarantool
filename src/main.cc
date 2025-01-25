@@ -43,7 +43,6 @@
 #include <sys/resource.h>
 #include <pwd.h>
 #include <unistd.h>
-#include <getopt.h>
 #include <locale.h>
 #include <libgen.h>
 #include <sysexits.h>
@@ -76,6 +75,7 @@
 #include "title.h"
 #include <libutil.h>
 #include "box/lua/init.h" /* box_lua_init() */
+#include "box/lua/console.h"
 #include "box/session.h"
 #include "box/memtx_tx.h"
 #include "box/module_cache.h"
@@ -88,6 +88,9 @@
 #include "core/errinj.h"
 #include "core/clock_lowres.h"
 #include "lua/utils.h"
+#include "core/event.h"
+#include "on_shutdown.h"
+#include "tnt_thread.h"
 
 static pid_t master_pid = getpid();
 static struct pidfh *pid_file_handle;
@@ -104,7 +107,8 @@ static double start_time;
 /** A preallocated fiber to run on_shutdown triggers. */
 static struct fiber *on_shutdown_fiber = NULL;
 /** A flag restricting repeated execution of tarantool_exit(). */
-static bool is_shutting_down = false;
+static bool shutdown_started = false;
+static bool shutdown_finished = false;
 static int exit_code = 0;
 
 char tarantool_path[PATH_MAX];
@@ -122,28 +126,14 @@ tarantool_uptime(void)
 	return ev_monotonic_now(loop()) - start_time;
 }
 
-/**
- * Create a checkpoint from signal handler (SIGUSR1)
- */
-static int
-sig_checkpoint_f(va_list ap)
-{
-	(void)ap;
-	if (box_checkpoint() != 0)
-		diag_log();
-	return 0;
-}
-
 static void
-sig_checkpoint(ev_loop * /* loop */, struct ev_signal * /* w */,
-	     int /* revents */)
+signal_checkpoint(ev_loop *loop, struct ev_signal *w, int revents)
 {
-	struct fiber *f = fiber_new_system("checkpoint", sig_checkpoint_f);
-	if (f == NULL) {
-		say_warn("failed to allocate checkpoint fiber");
-		return;
-	}
-	fiber_wakeup(f);
+	(void)loop;
+	(void)w;
+	(void)revents;
+	say_info("got signal SIGUSR1, triggering checkpoint");
+	box_checkpoint_async();
 }
 
 static int
@@ -159,15 +149,17 @@ on_shutdown_f(va_list ap)
 		fiber_sleep(0.0);
 
 	/* Handle spurious wakeups. */
-	while (!is_shutting_down)
+	while (!shutdown_started)
 		fiber_yield();
 
-	if (trigger_fiber_run(&box_on_shutdown_trigger_list, NULL,
-			      on_shutdown_trigger_timeout) != 0) {
+	if (on_shutdown_run_triggers() != 0) {
 		say_error("on_shutdown triggers failed");
 		diag_log();
 		diag_clear(diag_get());
 	}
+	box_shutdown();
+	tnt_thread_shutdown();
+	shutdown_finished = true;
 	ev_break(loop(), EVBREAK_ALL);
 	return 0;
 }
@@ -176,7 +168,7 @@ void
 tarantool_exit(int code)
 {
 	start_loop = false;
-	if (is_shutting_down) {
+	if (shutdown_started) {
 		/*
 		 * We are already running on_shutdown triggers,
 		 * and will exit as soon as they'll finish.
@@ -184,7 +176,7 @@ tarantool_exit(int code)
 		 */
 		return;
 	}
-	is_shutting_down = true;
+	shutdown_started = true;
 	exit_code = code;
 	box_broadcast_fmt("box.shutdown", "%b", true);
 	fiber_wakeup(on_shutdown_fiber);
@@ -290,7 +282,7 @@ signal_init(void)
 	fiber_signal_init();
 	crash_signal_init();
 
-	ev_signal_init(&ev_sigs[0], sig_checkpoint, SIGUSR1);
+	ev_signal_init(&ev_sigs[0], signal_checkpoint, SIGUSR1);
 	ev_signal_init(&ev_sigs[1], signal_sigint_cb, SIGINT);
 	ev_signal_init(&ev_sigs[2], signal_cb, SIGTERM);
 	ev_signal_init(&ev_sigs[3], signal_sigwinch_cb, SIGWINCH);
@@ -519,7 +511,7 @@ load_cfg(void)
 static void
 free_rl_state(void)
 {
-	/* tarantool_lua_free() was formerly reponsible for terminal reset,
+	/* tarantool_lua_free() was formerly responsible for terminal reset,
 	 * but it is no longer called
 	 */
 	if (isatty(STDIN_FILENO)) {
@@ -567,6 +559,8 @@ tarantool_free(void)
 	coio_shutdown();
 
 	box_lua_free();
+	/* Lua may have reference to engine tuples. */
+	tarantool_lua_free();
 	box_free();
 
 	title_free(main_argc, main_argv);
@@ -582,16 +576,16 @@ tarantool_free(void)
 #ifdef ENABLE_GCOV
 	gcov_flush();
 #endif
+	tnt_thread_free();
 	cbus_free();
 #if 0
 	/*
 	 * This doesn't work reliably since things
 	 * are too interconnected.
 	 */
-	tarantool_lua_free();
 	session_free();
-	user_cache_free();
 #endif
+	event_free();
 	ssl_free();
 	memtx_tx_manager_free();
 	coll_free();
@@ -613,29 +607,132 @@ print_version(void)
 	printf("CXX_FLAGS:%s\n", TARANTOOL_CXX_FLAGS);
 }
 
+/**
+ * Yield Tarantool help message to the given stream.
+ */
 static void
-print_help(const char *program)
+print_help(FILE *stream)
 {
-	puts("Tarantool - a Lua application server");
-	puts("");
-	printf("Usage: %s script.lua [OPTIONS] [SCRIPT [ARGS]]\n", program);
-	puts("");
-	puts("All command line options are passed to the interpreted script.");
-	puts("When no script name is provided, the server responds to:");
-	puts("  -h, --help\t\t\tdisplay this help and exit");
-	puts("  -v, --version\t\t\tprint program version and exit");
-	puts("  -e EXPR\t\t\texecute string 'EXPR'");
-	puts("  -l NAME\t\t\trequire library 'NAME'");
-	puts("  -j cmd\t\t\tperform LuaJIT control command");
-	puts("  -b ...\t\t\tsave or list bytecode");
-	puts("  -d\t\t\t\tactivate debugging session for 'SCRIPT'");
-	puts("  -i\t\t\t\tenter interactive mode after executing 'SCRIPT'");
-	puts("  --\t\t\t\tstop handling options");
-	puts("  -\t\t\t\texecute stdin and stop handling options");
-	puts("");
-	puts("Please visit project home page at https://tarantool.org");
-	puts("to see online documentation, submit bugs or contribute a patch.");
+	static const char help_msg[] = "Tarantool %s\n"
+		"\n"
+		"----------------------------------------------------------\n"
+		"\n"
+		"The recommended way to work with Tarantool is to use tt\n"
+		"tool.\n"
+		"\n"
+		"Run a Tarantool instance:\n"
+		"\n"
+		"$ tt start <app name>:<instance name>\n"
+		"\n"
+		"Connect to an instance:\n"
+		"\n"
+		"$ tt connect <uri>\n"
+		"\n"
+		"Execute a Lua script:\n"
+		"\n"
+		"$ tt run [OPTIONS] script.lua [ARGS]\n"
+		"\n"
+		"Run an interactive Lua interpreter:\n"
+		"\n"
+		"$ tt run -i\n"
+		"\n"
+		"Please visit https://tarantool.io/tt to see online\n"
+		"documentation.\n"
+		"\n"
+		"----------------------------------------------------------\n"
+		"\n"
+		"At the lower level there are the following action options.\n"
+		"\n"
+		"-h\n"
+		"--help\n"
+		"\n"
+		"    Print this help message.\n"
+		"\n"
+		"-v, -V\n"
+		"--version\n"
+		"\n"
+		"    Print version and build information.\n"
+		"\n"
+		"--help-env-list\n"
+		"\n"
+		"    Print environment variables list.\n"
+		"\n"
+		"-n <...> [-c <...>]\n"
+		"--name <...> [--config <...>]\n"
+		"\n"
+		"    Start an instance.\n"
+		"\n"
+		"    The path to the configuration file can be omitted if a\n"
+		"    configuration is stored in etcd and TT_CONFIG_ETCD_*\n"
+		"    environment variables are set.\n"
+		"\n"
+		"<first positional argument> [<..more args..>]\n"
+		"\n"
+		"    Run a Lua script file. All the arguments after the\n"
+		"    script name are stored in the `arg` global value.\n"
+		"\n"
+		"    The file may be pointed as `-` to read the script from\n"
+		"    stdin.\n"
+		"\n"
+		"-e <..code..>\n"
+		"\n"
+		"    Run a Lua code.\n"
+		"\n"
+		"    It can be used on its own (as an action option) or\n"
+		"    together with another action option (as a modifier).\n"
+		"\n"
+		"-i\n"
+		"\n"
+		"    Run the interactive REPL.\n"
+		"\n"
+		"--failover\n"
+		"\n"
+		"    Run a failover coordinator service.\n"
+		"\n"
+		"    It is available in Tarantool Enterprise Edition.\n"
+		"\n"
+		"The following modifier options are applicable to actions.\n"
+		"\n"
+		"--force-recovery\n"
+		"\n"
+		"    Enable force-recovery mode at database loading.\n"
+		"\n"
+		"--integrity-check <path/to/hashes.json>\n"
+		"\n"
+		"    Enable integrity check and load hash sums.\n"
+		"\n"
+		"-l <module>\n"
+		"\n"
+		"    `require` Lua module <module> and set it the same named\n"
+		"    global variable.\n"
+		"\n"
+		"-j <cmd>\n"
+		"\n"
+		"    Perform LuaJIT control command <cmd>.\n"
+		"\n"
+		"-b <...>\n"
+		"\n"
+		"    Save or list bytecode.\n"
+		"\n"
+		"-d\n"
+		"\n"
+		"    Activate debugging session for a given script.\n"
+		"\n"
+		"--\n"
+		"\n"
+		"    End-of-options marker. All the arguments after the\n"
+		"    marker are interpreted as non-option ones.\n"
+		"\n"
+		"Please visit project home page at https://tarantool.io\n"
+		"to see online documentation.\n"
+		"\n"
+		"Visit https://github.com/tarantool/tarantool to submit bugs\n"
+		"or contribute a patch.\n";
+	fprintf(stream, help_msg, tarantool_version());
 }
+
+/* Instance configuration data. */
+static instance_state instance;
 
 int
 main(int argc, char **argv)
@@ -649,31 +746,100 @@ main(int argc, char **argv)
 
 	/* Enter interactive mode after executing 'script' */
 	uint32_t opt_mask = 0;
-	/* Lua interpeter options, e.g. -e and -l */
+	/* Lua interpreter options, e.g. -e and -l */
 	int optc = 0;
 	const char **optv = NULL;
-	/* The maximum possible number of Lua interpeter options */
+	/* The maximum possible number of Lua interpreter options */
 	int optc_max = (argc - 1) * 2;
+	bool say_entering_the_event_loop = true;
 	auto guard = make_scoped_guard([&optc, &optv]{ if (optc) free(optv); });
 
 	static struct option longopts[] = {
 		{"help", no_argument, 0, 'h'},
 		{"version", no_argument, 0, 'v'},
+		{"config", required_argument, 0, 'c'},
+		{"name", required_argument, 0, 'n'},
+		/*
+		 * Use 'E' character as an indicator of the
+		 * --help-env-list option.
+		 *
+		 * Note: there is no -E short option, see the
+		 * `opts` variable below.
+		 *
+		 * An arbitrary `int` value that is not used for
+		 * another option may be used here. Feel free to
+		 * change it if -E short option should be added.
+		 */
+		{"help-env-list", no_argument, 0, 'E'},
+		{"force-recovery", no_argument, 0, 'F'},
+		{"integrity-check", required_argument, 0, 'I'},
+		/*
+		 * Use 'O' for --failover. See --help-env-list
+		 * above for details of the approach.
+		 */
+		{"failover", no_argument, 0, 'O'},
 		{NULL, 0, 0, 0},
 	};
-	static const char *opts = "+hVvb::ij:e:l:d";
+	static const char *opts = "+hVvb::ij:e:l:dc:n:";
 
 	int ch;
 	bool lj_arg = false;
 	while ((ch = getopt_long(argc, argv, opts, longopts, NULL)) != -1) {
 		switch (ch) {
+		case 'n':
+			/*
+			 * XXX: The given argument is copied to be
+			 * consistent with <getenv_safe> results.
+			 */
+			free((void *)instance.name);
+			instance.name = (const char *)xstrdup(optarg);
+			break;
+		case 'c':
+			/*
+			 * XXX: The given argument is copied to be
+			 * consistent with <getenv_safe> results.
+			 */
+			free((void *)instance.config);
+			instance.config = (const char *)xstrdup(optarg);
+			break;
 		case 'V':
 		case 'v':
 			print_version();
 			return 0;
 		case 'h':
-			print_help(basename(argv[0]));
+			print_help(stdout);
 			return 0;
+		case 'E':
+			opt_mask |= O_HELP_ENV_LIST;
+			break;
+		case 'F':
+			box_is_force_recovery = true;
+			break;
+		case 'I':
+#if ENABLE_INTEGRITY
+			opt_mask |= O_INTEGRITY;
+
+			/*
+			 * Reset all environment variables.
+			 * XXX: This is the most early spot to
+			 * reset the environment; if the error
+			 * occurs, execution cannot be proceed.
+			 */
+			if (clearenv() != 0) {
+				fprintf(stderr, "Environment is not reset, but "
+					"integrity check is enabled.\n");
+				return 1;
+			}
+
+			instance.hashes = optarg;
+			break;
+#else
+			fprintf(stderr, "--integrity-check CLI option is "
+				"available only in Tarantool "
+				"Enterprise Edition\n");
+			return EX_USAGE;
+#endif
+
 		case 'i':
 			/* Force interactive mode */
 			opt_mask |= O_INTERACTIVE;
@@ -691,9 +857,26 @@ main(int argc, char **argv)
 			lj_arg = true;
 			optind--;
 			break;
+		case 'O':
+#if ENABLE_FAILOVER
+			/*
+			 * No much sense to print this message for
+			 * a standalone failover coordinator
+			 * service.
+			 */
+			say_entering_the_event_loop = false;
+			opt_mask |= O_FAILOVER;
+			break;
+#else
+			fprintf(stderr, "--failover CLI option is available "
+				"only in Tarantool Enterprise Edition\n");
+			return EX_USAGE;
+#endif
+		case 'e':
+			opt_mask |= O_EXECUTE;
+			FALLTHROUGH;
 		case 'j':
 		case 'l':
-		case 'e':
 			/* Save Lua interepter options to optv as is */
 			if (optc == 0)
 				optv = (const char **)xcalloc(optc_max,
@@ -715,6 +898,11 @@ main(int argc, char **argv)
 		if (lj_arg)
 			break;
 	}
+
+	if (instance.name == NULL)
+		instance.name = getenv_safe("TT_INSTANCE_NAME", NULL, 0);
+	if (instance.config == NULL)
+		instance.config = getenv_safe("TT_CONFIG", NULL, 0);
 
 	/* Shift arguments */
 	argc = 1 + (argc - optind);
@@ -743,7 +931,7 @@ main(int argc, char **argv)
 
 	argv = title_init(argc, argv);
 	/*
-	 * Support only #!/usr/bin/tarantol but not
+	 * Support only #!/usr/bin/tarantool but not
 	 * #!/usr/bin/tarantool -a -b because:
 	 * - not all shells support it,
 	 * - those shells that do support it, do not
@@ -766,6 +954,37 @@ main(int argc, char **argv)
 	if (strlen(tarantool_path) < strlen(tarantool_bin))
 		panic("executable path is trimmed");
 
+	/*
+	 * The idea of the check below is that we can't run
+	 * tarantool without any action: there should be at least
+	 * one.
+	 *
+	 * There are the following actions.
+	 *
+	 * * Print a help message or a version (--help, --version;
+	 *   these actions are handled above).
+	 * * Print environment variables list (--help-env-list).
+	 * * Start an instance (with a name and a config).
+	 * * Run a script pointed by a positional argument or
+	 *   written using -e option.
+	 * * Start interactive REPL (-i).
+	 * * Start a failover coordinator (--failover).
+	 */
+	uint32_t action_opt_mask = O_INTERACTIVE | O_EXECUTE | O_HELP_ENV_LIST |
+		O_FAILOVER;
+	if (script == NULL && (opt_mask & action_opt_mask) == 0 &&
+	    instance.name == NULL) {
+		static const char misuse_msg[] = "Invalid usage: "
+			"please either provide a Lua script name\n"
+			"or specify an instance name to be started\n"
+			"or set -i CLI flag to spawn Lua REPL or run a\n"
+			"failover coordinator using --failover CLI option.\n\n"
+			;
+		fputs(misuse_msg, stderr);
+		print_help(stderr);
+		return EXIT_FAILURE;
+	}
+
 	struct timespec ts;
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
 		tarantool_start_time = ts.tv_sec;
@@ -780,18 +999,18 @@ main(int argc, char **argv)
 	main_argc = argc;
 	main_argv = argv;
 
-	exception_init();
-
 	fiber_init(fiber_cxx_invoke);
 	popen_init();
 	coio_init();
 	coio_enable();
 	signal_init();
 	cbus_init();
+	tnt_thread_init();
 	coll_init();
 	memtx_tx_manager_init();
 	module_init();
 	ssl_init();
+	event_init();
 	systemd_init();
 
 	const int override_cert_paths_env_vars = 0;
@@ -802,7 +1021,14 @@ main(int argc, char **argv)
 #ifndef NDEBUG
 	errinj_set_with_environment_vars();
 #endif
-	tarantool_lua_init(tarantool_bin, script, main_argc, main_argv);
+	/*
+	 * Pass either a configuration file or a script file to
+	 * configure Lua loaders paths.
+	 */
+	const char *config_or_script = instance.config != NULL ?
+		instance.config : script;
+	tarantool_lua_init(tarantool_bin, config_or_script, main_argc,
+			   main_argv);
 
 	start_time = ev_monotonic_time();
 
@@ -834,8 +1060,8 @@ main(int argc, char **argv)
 		 * is why script must run only after the server was fully
 		 * initialized.
 		 */
-		if (tarantool_lua_run_script(script, opt_mask, optc, optv,
-					     main_argc, main_argv) != 0)
+		if (tarantool_lua_run_script(script, &instance, opt_mask, optc,
+					     optv, main_argc, main_argv) != 0)
 			diag_raise();
 		/*
 		 * Start event loop after executing Lua script if signal_cb()
@@ -844,8 +1070,14 @@ main(int argc, char **argv)
 		 */
 		start_loop = start_loop && ev_activecnt(loop()) > events;
 		if (start_loop) {
-			say_info("entering the event loop");
+			if (say_entering_the_event_loop)
+				say_info("entering the event loop");
 			systemd_snotify("READY=1");
+			if (is_console_exited) {
+				printf("Exited console. Type Ctrl-C to exit "
+				       "Tarantool.\n");
+				fflush(stdout);
+			}
 			ev_now_update(loop());
 			ev_run(loop(), 0);
 		}
@@ -867,20 +1099,10 @@ main(int argc, char **argv)
 	 * init script, and there was neither os.exit nor SIGTERM, then call
 	 * tarantool_exit and start an event loop to run on_shutdown triggers.
 	 */
-	if (!is_shutting_down) {
+	if (!shutdown_started)
 		tarantool_exit(exit_code);
+	if (!shutdown_finished)
 		ev_run(loop(), 0);
-	}
-	/* freeing resources */
 	tarantool_free();
-	ERROR_INJECT(ERRINJ_MAIN_MAKE_FILE_ON_RETURN, do {
-		int fd = open("tt_exit_file.txt.inprogress",
-			      O_WRONLY | O_CREAT | O_TRUNC, -1);
-		if (fd < 0)
-			break;
-		dprintf(fd, "ExitCode: %d\n", exit_code);
-		close(fd);
-		rename("tt_exit_file.txt.inprogress", "tt_exit_file.txt");
-	} while (false));
 	return exit_code;
 }

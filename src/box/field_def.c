@@ -39,6 +39,7 @@
 #include "tt_uuid.h"
 #include "tt_static.h"
 #include "tuple_constraint_def.h"
+#include "tuple_dictionary.h"
 #include "tuple_format.h"
 #include "salad/grp_alloc.h"
 #include "small/region.h"
@@ -68,7 +69,8 @@ const uint32_t field_mp_type[] = {
 	/* [FIELD_TYPE_STRING]   =  */ 1U << MP_STR,
 	/* [FIELD_TYPE_NUMBER]   =  */ (1U << MP_UINT) | (1U << MP_INT) |
 		(1U << MP_FLOAT) | (1U << MP_DOUBLE),
-	/* [FIELD_TYPE_DOUBLE]   =  */ 1U << MP_DOUBLE,
+	/* [FIELD_TYPE_DOUBLE]   =  */ (1U << MP_UINT) | (1U << MP_INT) |
+		(1U << MP_FLOAT) | (1U << MP_DOUBLE),
 	/* [FIELD_TYPE_INTEGER]  =  */ (1U << MP_UINT) | (1U << MP_INT),
 	/* [FIELD_TYPE_BOOLEAN]  =  */ 1U << MP_BOOL,
 	/* [FIELD_TYPE_VARBINARY] =  */ 1U << MP_BIN,
@@ -81,7 +83,20 @@ const uint32_t field_mp_type[] = {
 	/* [FIELD_TYPE_INTERVAL] =  */ 0,
 	/* [FIELD_TYPE_ARRAY]    =  */ 1U << MP_ARRAY,
 	/* [FIELD_TYPE_MAP]      =  */ (1U << MP_MAP),
+	/* [FIELD_TYPE_INT8]     =  */ (1U << MP_UINT) | (1U << MP_INT),
+	/* [FIELD_TYPE_UINT8]    =  */ 1U << MP_UINT,
+	/* [FIELD_TYPE_INT16]    =  */ (1U << MP_UINT) | (1U << MP_INT),
+	/* [FIELD_TYPE_UINT16]   =  */ 1U << MP_UINT,
+	/* [FIELD_TYPE_INT32]    =  */ (1U << MP_UINT) | (1U << MP_INT),
+	/* [FIELD_TYPE_UINT32]   =  */ 1U << MP_UINT,
+	/* [FIELD_TYPE_INT64]    =  */ (1U << MP_UINT) | (1U << MP_INT),
+	/* [FIELD_TYPE_UINT64]   =  */ 1U << MP_UINT,
+	/* [FIELD_TYPE_FLOAT32]  =  */ 1U << MP_FLOAT,
+	/* [FIELD_TYPE_FLOAT64]  =  */ 1U << MP_DOUBLE,
 };
+
+static_assert(lengthof(field_mp_type) == field_type_MAX,
+	      "Each field type must be present in field_mp_type");
 
 const uint32_t field_ext_type[] = {
 	/* [FIELD_TYPE_ANY]       = */ UINT32_MAX ^ (1U << MP_UNKNOWN_EXTENSION),
@@ -100,7 +115,20 @@ const uint32_t field_ext_type[] = {
 	/* [FIELD_TYPE_INTERVAL]  = */ 1U << MP_INTERVAL,
 	/* [FIELD_TYPE_ARRAY]     = */ 0,
 	/* [FIELD_TYPE_MAP]       = */ 0,
+	/* [FIELD_TYPE_INT8]      = */ 0,
+	/* [FIELD_TYPE_UINT8]     = */ 0,
+	/* [FIELD_TYPE_INT16]     = */ 0,
+	/* [FIELD_TYPE_UINT16]    = */ 0,
+	/* [FIELD_TYPE_INT32]     = */ 0,
+	/* [FIELD_TYPE_UINT32]    = */ 0,
+	/* [FIELD_TYPE_INT64]     = */ 0,
+	/* [FIELD_TYPE_UINT64]    = */ 0,
+	/* [FIELD_TYPE_FLOAT32]   = */ 0,
+	/* [FIELD_TYPE_FLOAT64]   = */ 0,
 };
+
+static_assert(lengthof(field_ext_type) == field_type_MAX,
+	      "Each field type must be present in field_ext_type");
 
 const char *field_type_strs[] = {
 	/* [FIELD_TYPE_ANY]      = */ "any",
@@ -118,7 +146,150 @@ const char *field_type_strs[] = {
 	/* [FIELD_TYPE_INTERVAL] = */ "interval",
 	/* [FIELD_TYPE_ARRAY]    = */ "array",
 	/* [FIELD_TYPE_MAP]      = */ "map",
+	/* [FIELD_TYPE_INT8]     = */ "int8",
+	/* [FIELD_TYPE_UINT8]    = */ "uint8",
+	/* [FIELD_TYPE_INT16]    = */ "int16",
+	/* [FIELD_TYPE_UINT16]   = */ "uint16",
+	/* [FIELD_TYPE_INT32]    = */ "int32",
+	/* [FIELD_TYPE_UINT32]   = */ "uint32",
+	/* [FIELD_TYPE_INT64]    = */ "int64",
+	/* [FIELD_TYPE_UINT64]   = */ "uint64",
+	/* [FIELD_TYPE_FLOAT32]  = */ "float32",
+	/* [FIELD_TYPE_FLOAT64]  = */ "float64",
 };
+
+static_assert(lengthof(field_type_strs) == field_type_MAX,
+	      "Each field type must be present in field_type_strs");
+
+/**
+ * True for fixed-size signed integer field types.
+ */
+const bool field_type_is_fixed_signed[] = {
+	/* [FIELD_TYPE_ANY]       = */ false,
+	/* [FIELD_TYPE_UNSIGNED]  = */ false,
+	/* [FIELD_TYPE_STRING]    = */ false,
+	/* [FIELD_TYPE_NUMBER]    = */ false,
+	/* [FIELD_TYPE_DOUBLE]    = */ false,
+	/* [FIELD_TYPE_INTEGER]   = */ false,
+	/* [FIELD_TYPE_BOOLEAN]   = */ false,
+	/* [FIELD_TYPE_VARBINARY] = */ false,
+	/* [FIELD_TYPE_SCALAR]    = */ false,
+	/* [FIELD_TYPE_DECIMAL]   = */ false,
+	/* [FIELD_TYPE_UUID]      = */ false,
+	/* [FIELD_TYPE_DATETIME]  = */ false,
+	/* [FIELD_TYPE_INTERVAL]  = */ false,
+	/* [FIELD_TYPE_ARRAY]     = */ false,
+	/* [FIELD_TYPE_MAP]       = */ false,
+	/* [FIELD_TYPE_INT8]      = */ true,
+	/* [FIELD_TYPE_UINT8]     = */ false,
+	/* [FIELD_TYPE_INT16]     = */ true,
+	/* [FIELD_TYPE_UINT16]    = */ false,
+	/* [FIELD_TYPE_INT32]     = */ true,
+	/* [FIELD_TYPE_UINT32]    = */ false,
+	/* [FIELD_TYPE_INT64]     = */ true,
+	/* [FIELD_TYPE_UINT64]    = */ false,
+	/* [FIELD_TYPE_FLOAT32]   = */ false,
+	/* [FIELD_TYPE_FLOAT64]   = */ false,
+};
+
+static_assert(lengthof(field_type_is_fixed_signed) == field_type_MAX,
+	      "Each field type must be present in field_type_is_fixed_signed");
+
+/**
+ * True for fixed-size unsigned integer field types.
+ */
+const bool field_type_is_fixed_unsigned[] = {
+	/* [FIELD_TYPE_ANY]       = */ false,
+	/* [FIELD_TYPE_UNSIGNED]  = */ false,
+	/* [FIELD_TYPE_STRING]    = */ false,
+	/* [FIELD_TYPE_NUMBER]    = */ false,
+	/* [FIELD_TYPE_DOUBLE]    = */ false,
+	/* [FIELD_TYPE_INTEGER]   = */ false,
+	/* [FIELD_TYPE_BOOLEAN]   = */ false,
+	/* [FIELD_TYPE_VARBINARY] = */ false,
+	/* [FIELD_TYPE_SCALAR]    = */ false,
+	/* [FIELD_TYPE_DECIMAL]   = */ false,
+	/* [FIELD_TYPE_UUID]      = */ false,
+	/* [FIELD_TYPE_DATETIME]  = */ false,
+	/* [FIELD_TYPE_INTERVAL]  = */ false,
+	/* [FIELD_TYPE_ARRAY]     = */ false,
+	/* [FIELD_TYPE_MAP]       = */ false,
+	/* [FIELD_TYPE_INT8]      = */ false,
+	/* [FIELD_TYPE_UINT8]     = */ true,
+	/* [FIELD_TYPE_INT16]     = */ false,
+	/* [FIELD_TYPE_UINT16]    = */ true,
+	/* [FIELD_TYPE_INT32]     = */ false,
+	/* [FIELD_TYPE_UINT32]    = */ true,
+	/* [FIELD_TYPE_INT64]     = */ false,
+	/* [FIELD_TYPE_UINT64]    = */ true,
+	/* [FIELD_TYPE_FLOAT32]   = */ false,
+	/* [FIELD_TYPE_FLOAT64]   = */ false,
+};
+
+static_assert(lengthof(field_type_is_fixed_unsigned) == field_type_MAX, "Each "
+	      "field type must be present in field_type_is_fixed_unsigned");
+
+const int64_t field_type_min_value[] = {
+	/* [FIELD_TYPE_ANY]       = */ 0,
+	/* [FIELD_TYPE_UNSIGNED]  = */ 0,
+	/* [FIELD_TYPE_STRING]    = */ 0,
+	/* [FIELD_TYPE_NUMBER]    = */ 0,
+	/* [FIELD_TYPE_DOUBLE]    = */ 0,
+	/* [FIELD_TYPE_INTEGER]   = */ 0,
+	/* [FIELD_TYPE_BOOLEAN]   = */ 0,
+	/* [FIELD_TYPE_VARBINARY] = */ 0,
+	/* [FIELD_TYPE_SCALAR]    = */ 0,
+	/* [FIELD_TYPE_DECIMAL]   = */ 0,
+	/* [FIELD_TYPE_UUID]      = */ 0,
+	/* [FIELD_TYPE_DATETIME]  = */ 0,
+	/* [FIELD_TYPE_INTERVAL]  = */ 0,
+	/* [FIELD_TYPE_ARRAY]     = */ 0,
+	/* [FIELD_TYPE_MAP]       = */ 0,
+	/* [FIELD_TYPE_INT8]      = */ INT8_MIN,
+	/* [FIELD_TYPE_UINT8]     = */ 0,
+	/* [FIELD_TYPE_INT16]     = */ INT16_MIN,
+	/* [FIELD_TYPE_UINT16]    = */ 0,
+	/* [FIELD_TYPE_INT32]     = */ INT32_MIN,
+	/* [FIELD_TYPE_UINT32]    = */ 0,
+	/* [FIELD_TYPE_INT64]     = */ INT64_MIN,
+	/* [FIELD_TYPE_UINT64]    = */ 0,
+	/* [FIELD_TYPE_FLOAT32]   = */ 0,
+	/* [FIELD_TYPE_FLOAT64]   = */ 0,
+};
+
+static_assert(lengthof(field_type_min_value) == field_type_MAX,
+	      "Each field type must be present in field_type_min_value");
+
+const uint64_t field_type_max_value[] = {
+	/* [FIELD_TYPE_ANY]       = */ 0,
+	/* [FIELD_TYPE_UNSIGNED]  = */ 0,
+	/* [FIELD_TYPE_STRING]    = */ 0,
+	/* [FIELD_TYPE_NUMBER]    = */ 0,
+	/* [FIELD_TYPE_DOUBLE]    = */ 0,
+	/* [FIELD_TYPE_INTEGER]   = */ 0,
+	/* [FIELD_TYPE_BOOLEAN]   = */ 0,
+	/* [FIELD_TYPE_VARBINARY] = */ 0,
+	/* [FIELD_TYPE_SCALAR]    = */ 0,
+	/* [FIELD_TYPE_DECIMAL]   = */ 0,
+	/* [FIELD_TYPE_UUID]      = */ 0,
+	/* [FIELD_TYPE_DATETIME]  = */ 0,
+	/* [FIELD_TYPE_INTERVAL]  = */ 0,
+	/* [FIELD_TYPE_ARRAY]     = */ 0,
+	/* [FIELD_TYPE_MAP]       = */ 0,
+	/* [FIELD_TYPE_INT8]      = */ INT8_MAX,
+	/* [FIELD_TYPE_UINT8]     = */ UINT8_MAX,
+	/* [FIELD_TYPE_INT16]     = */ INT16_MAX,
+	/* [FIELD_TYPE_UINT16]    = */ UINT16_MAX,
+	/* [FIELD_TYPE_INT32]     = */ INT32_MAX,
+	/* [FIELD_TYPE_UINT32]    = */ UINT32_MAX,
+	/* [FIELD_TYPE_INT64]     = */ INT64_MAX,
+	/* [FIELD_TYPE_UINT64]    = */ UINT64_MAX,
+	/* [FIELD_TYPE_FLOAT32]   = */ 0,
+	/* [FIELD_TYPE_FLOAT64]   = */ 0,
+};
+
+static_assert(lengthof(field_type_max_value) == field_type_MAX,
+	      "Each field type must be present in field_type_max_value");
 
 const char *on_conflict_action_strs[] = {
 	/* [ON_CONFLICT_ACTION_NONE]     = */ "none",
@@ -136,36 +307,49 @@ field_type_by_name_wrapper(const char *str, uint32_t len)
 	return field_type_by_name(str, len);
 }
 
-/**
- * Table of a field types compatibility.
- * For an i row and j column the value is true, if the i type
- * values can be stored in the j type.
- */
-static const bool field_type_compatibility[] = {
-/*              ANY   UNSIGNED  STRING   NUMBER  DOUBLE  INTEGER  BOOLEAN VARBINARY SCALAR  DECIMAL   UUID   DATETIME INTERVAL  ARRAY    MAP   */
-/*   ANY    */ true,   false,   false,   false,   false,   false,   false,   false,  false,  false,  false,   false,   false,   false,  false,
-/* UNSIGNED */ true,   true,    false,   true,    false,   true,    false,   false,  true,   false,  false,   false,   false,   false,  false,
-/*  STRING  */ true,   false,   true,    false,   false,   false,   false,   false,  true,   false,  false,   false,   false,   false,  false,
-/*  NUMBER  */ true,   false,   false,   true,    false,   false,   false,   false,  true,   false,  false,   false,   false,   false,  false,
-/*  DOUBLE  */ true,   false,   false,   true,    true,    false,   false,   false,  true,   false,  false,   false,   false,   false,  false,
-/*  INTEGER */ true,   false,   false,   true,    false,   true,    false,   false,  true,   false,  false,   false,   false,   false,  false,
-/*  BOOLEAN */ true,   false,   false,   false,   false,   false,   true,    false,  true,   false,  false,   false,   false,   false,  false,
-/* VARBINARY*/ true,   false,   false,   false,   false,   false,   false,   true,   true,   false,  false,   false,   false,   false,  false,
-/*  SCALAR  */ true,   false,   false,   false,   false,   false,   false,   false,  true,   false,  false,   false,   false,   false,  false,
-/*  DECIMAL */ true,   false,   false,   true,    false,   false,   false,   false,  true,   true,   false,   false,   false,   false,  false,
-/*   UUID   */ true,   false,   false,   false,   false,   false,   false,   false,  true,   false,  true,    false,   false,   false,  false,
-/* DATETIME */ true,   false,   false,   false,   false,   false,   false,   false,  true,   false,  false,   true,    false,   false,  false,
-/* INTERVAL */ true,   false,   false,   false,   false,   false,   false,   false,  false,  false,  false,   false,   true,    false,  false,
-/*   ARRAY  */ true,   false,   false,   false,   false,   false,   false,   false,  false,  false,  false,   false,   false,   true,   false,
-/*    MAP   */ true,   false,   false,   false,   false,   false,   false,   false,  false,  false,  false,   false,   false,   false,  true,
-};
-
 bool
 field_type1_contains_type2(enum field_type type1, enum field_type type2)
 {
-	int idx = type2 * field_type_MAX + type1;
-	return field_type_compatibility[idx];
+	uint32_t mp_type1, mp_type2;
+	assert(type1 < field_type_MAX);
+	assert(type2 < field_type_MAX);
+	if (type1 == type2)
+		return true;
+
+	bool is_mp_ext = field_mp_type[type2] == 0;
+	if (is_mp_ext) {
+		mp_type1 = field_ext_type[type1];
+		mp_type2 = field_ext_type[type2];
+	} else {
+		mp_type1 = field_mp_type[type1];
+		mp_type2 = field_mp_type[type2];
+	}
+
+	bool type1_contains_type2 = (mp_type1 & mp_type2) == mp_type2;
+	if (!type1_contains_type2)
+		return false;
+	if (!field_type_is_fixed_int(type1))
+		return true;
+	if (!field_type_is_fixed_int(type2)) {
+		/* uint64 is an alias for unsigned. */
+		return type1 == FIELD_TYPE_UINT64 &&
+		       type2 == FIELD_TYPE_UNSIGNED;
+	}
+
+	int64_t min1 = field_type_min_value[type1];
+	int64_t min2 = field_type_min_value[type2];
+	uint64_t max1 = field_type_max_value[type1];
+	uint64_t max2 = field_type_max_value[type2];
+	return min1 <= min2 && max1 >= max2;
 }
+
+/**
+ * Callback to parse a value with 'default' key in msgpack field definition.
+ * See function definition below.
+ */
+static int
+field_def_parse_default_value(const char **data, void *opts,
+			      struct region *region);
 
 /**
  * Callback to parse a value with 'constraint' key in msgpack field definition.
@@ -191,11 +375,17 @@ static const struct opt_def field_def_reg[] = {
 	OPT_DEF_ENUM("nullable_action", on_conflict_action, struct field_def,
 		     nullable_action, NULL),
 	OPT_DEF("collation", OPT_UINT32, struct field_def, coll_id),
-	OPT_DEF("default", OPT_STRPTR, struct field_def, default_value),
 	OPT_DEF_ENUM("compression", compression_type, struct field_def,
 		     compression_type, NULL),
+	OPT_DEF_CUSTOM("default", field_def_parse_default_value),
+	OPT_DEF("default_func", OPT_UINT32, struct field_def, default_func_id),
 	OPT_DEF_CUSTOM("constraint", field_def_parse_constraint),
 	OPT_DEF_CUSTOM("foreign_key", field_def_parse_foreign_key),
+	OPT_END,
+};
+
+static const struct opt_def field_def_reg_names_only[] = {
+	OPT_DEF("name", OPT_STRPTR, struct field_def, name),
 	OPT_END,
 };
 
@@ -206,6 +396,8 @@ const struct field_def field_def_default = {
 	.nullable_action = ON_CONFLICT_ACTION_DEFAULT,
 	.coll_id = COLL_NONE,
 	.default_value = NULL,
+	.default_value_size = 0,
+	.default_func_id = 0,
 	.constraint_count = 0,
 	.constraint_def = NULL,
 };
@@ -225,6 +417,90 @@ field_type_by_name(const char *name, size_t len)
 	else if (len == 1 && name[0] == '*')
 		return FIELD_TYPE_ANY;
 	return field_type_MAX;
+}
+
+#define ERROR_MSG(r, v) "expected [%" r "..%" r "], got %" v
+
+bool
+field_mp_is_in_fixed_int_range(enum field_type type, const char *data,
+			       char *mp_min, char *mp_max,
+			       const char **details)
+{
+	assert(field_type_is_fixed_int(type));
+	enum mp_type mp_type = mp_typeof(*data);
+	if (mp_type == MP_NIL)
+		return true;
+	assert(mp_type == MP_INT || mp_type == MP_UINT);
+
+	if (field_type_is_fixed_signed[type]) {
+		int64_t min = field_type_min_value[type];
+		int64_t max = field_type_max_value[type];
+		if (mp_type == MP_INT) {
+			int64_t value = mp_decode_int(&data);
+			if (value < min || value > max) {
+				mp_encode_int(mp_min, min);
+				mp_encode_uint(mp_max, max);
+				if (details != NULL)
+					*details = tt_sprintf(ERROR_MSG(PRId64,
+									PRId64),
+							      min, max, value);
+				return false;
+			}
+		} else {
+			assert(mp_type == MP_UINT);
+			uint64_t value = mp_decode_uint(&data);
+			if (value > (uint64_t)max) {
+				mp_encode_int(mp_min, min);
+				mp_encode_uint(mp_max, max);
+				if (details != NULL)
+					*details = tt_sprintf(ERROR_MSG(PRId64,
+									PRIu64),
+							      min, max, value);
+				return false;
+			}
+		}
+	} else {
+		assert(field_type_is_fixed_unsigned[type]);
+		assert(mp_type == MP_UINT);
+		uint64_t value = mp_decode_uint(&data);
+		uint64_t min = field_type_min_value[type];
+		uint64_t max = field_type_max_value[type];
+		if (value > max) {
+			mp_encode_uint(mp_min, min);
+			mp_encode_uint(mp_max, max);
+			if (details != NULL)
+				*details = tt_sprintf(ERROR_MSG(PRIu64, PRIu64),
+						      min, max, value);
+			return false;
+		}
+	}
+	return true;
+}
+
+#undef ERROR_MSG
+
+/**
+ * Parse default field value from msgpack.
+ * Used as callback to parse a value with 'default' key in field definition.
+ * Move @a data msgpack pointer to the end of msgpack value.
+ * By convention @a opts must point to corresponding struct field_def.
+ * Allocate a temporary copy of a default value on @a region and set pointer to
+ * it as field_def->default_value, also setting field_def->default_value_size.
+ */
+static int
+field_def_parse_default_value(const char **data, void *opts,
+			      struct region *region)
+{
+	struct field_def *def = (struct field_def *)opts;
+	const char *default_value = *data;
+	mp_next(data);
+	const char *default_value_end = *data;
+	size_t size = default_value_end - default_value;
+
+	def->default_value = xregion_alloc(region, size);
+	def->default_value_size = size;
+	memcpy(def->default_value, default_value, size);
+	return 0;
 }
 
 /**
@@ -278,10 +554,11 @@ field_def_parse_foreign_key(const char **data, void *opts,
  * @param data MessagePack map to decode.
  * @param fieldno Field number to decode. Used in error messages.
  * @param region Region to allocate field name.
+ * @param names_only Only decode 'name' field, ignore the rest.
  */
 static int
 field_def_decode(struct field_def *field, const char **data,
-		 uint32_t fieldno, struct region *region)
+		 uint32_t fieldno, struct region *region, bool names_only)
 {
 	if (mp_typeof(**data) != MP_MAP) {
 		field_def_error(fieldno, "expected a map");
@@ -299,7 +576,9 @@ field_def_decode(struct field_def *field, const char **data,
 		}
 		uint32_t key_len;
 		const char *key = mp_decode_str(data, &key_len);
-		if (opts_parse_key(field, field_def_reg, key, key_len, data,
+		const struct opt_def *reg =
+			names_only ? field_def_reg_names_only : field_def_reg;
+		if (opts_parse_key(field, reg, key, key_len, data,
 				   region, true) != 0) {
 			field_def_error(fieldno,
 					diag_last_error(diag_get())->errmsg);
@@ -359,7 +638,8 @@ field_def_decode(struct field_def *field, const char **data,
 
 int
 field_def_array_decode(const char **data, struct field_def **fields,
-		       uint32_t *field_count, struct region *region)
+		       uint32_t *field_count, struct region *region,
+		       bool names_only)
 {
 	assert(mp_typeof(**data) == MP_ARRAY);
 	uint32_t count = mp_decode_array(data);
@@ -378,7 +658,8 @@ field_def_array_decode(const char **data, struct field_def **fields,
 		return -1;
 	}
 	for (uint32_t i = 0; i < count; ++i) {
-		if (field_def_decode(&region_defs[i], data, i, region) != 0)
+		if (field_def_decode(&region_defs[i], data, i, region,
+				     names_only) != 0)
 			return -1;
 	}
 	*fields = region_defs;
@@ -394,8 +675,7 @@ field_def_array_dup(const struct field_def *fields, uint32_t field_count)
 	grp_alloc_reserve_data(&all, sizeof(*fields) * field_count);
 	for (uint32_t i = 0; i < field_count; i++) {
 		grp_alloc_reserve_str0(&all, fields[i].name);
-		if (fields[i].default_value != NULL)
-			grp_alloc_reserve_str0(&all, fields[i].default_value);
+		grp_alloc_reserve_data(&all, fields[i].default_value_size);
 	}
 	grp_alloc_use(&all, xmalloc(grp_alloc_size(&all)));
 	struct field_def *copy = grp_alloc_create_data(
@@ -404,8 +684,10 @@ field_def_array_dup(const struct field_def *fields, uint32_t field_count)
 		copy[i] = fields[i];
 		copy[i].name = grp_alloc_create_str0(&all, fields[i].name);
 		if (fields[i].default_value != NULL) {
-			copy[i].default_value = grp_alloc_create_str0(
-				&all, fields[i].default_value);
+			size_t size = fields[i].default_value_size;
+			char *buf = grp_alloc_create_data(&all, size);
+			memcpy(buf, fields[i].default_value, size);
+			copy[i].default_value = buf;
 		}
 		copy[i].constraint_def = tuple_constraint_def_array_dup(
 			fields[i].constraint_def, fields[i].constraint_count);

@@ -32,14 +32,19 @@
 #include "sequence.h"
 #include "assoc.h"
 #include "alter.h"
+#include "box.h"
 #include "scoped_guard.h"
 #include "user.h"
 #include "vclock/vclock.h"
 #include "fiber.h"
+#include "session.h"
 #include "memtx_tx.h"
 #include "txn.h"
 #include "engine.h"
 #include "version.h"
+#include "event.h"
+#include "port.h"
+#include "tt_static.h"
 
 /**
  * @module Data Dictionary
@@ -70,12 +75,17 @@ static uint32_t latest_dd_version_id = 0;
 /** Fiber that is currently running a schema upgrade. */
 static struct fiber *schema_upgrade_fiber;
 
-struct rlist on_schema_init = RLIST_HEAD_INITIALIZER(on_schema_init);
 struct rlist on_alter_space = RLIST_HEAD_INITIALIZER(on_alter_space);
 struct rlist on_alter_sequence = RLIST_HEAD_INITIALIZER(on_alter_sequence);
 struct rlist on_alter_func = RLIST_HEAD_INITIALIZER(on_alter_func);
 
 struct entity_access entity_access;
+
+STRS(schema_feature, SCHEMA_FEATURES);
+#define SCHEMA_FEATURE_MEMBER(t, n, a, b, c) {a, b, c},
+const struct version schema_feature_version[schema_feature_MAX] = {
+	SCHEMA_FEATURES(SCHEMA_FEATURE_MEMBER)
+};
 
 API_EXPORT uint64_t
 box_schema_version(void)
@@ -88,6 +98,13 @@ extern "C" uint32_t
 box_dd_version_id(void)
 {
 	return dd_version_id;
+}
+
+/** Called from Lua via FFI to get latest_dd_version_id. */
+extern "C" uint32_t
+box_latest_dd_version_id(void)
+{
+	return latest_dd_version_id;
 }
 
 /** Called from Lua via FFI to init latest_dd_version_id. */
@@ -107,15 +124,7 @@ extern "C" bool
 box_schema_needs_upgrade(void)
 {
 	assert(latest_dd_version_id != 0);
-	if (dd_version_id < latest_dd_version_id) {
-		diag_set(ClientError, ER_SCHEMA_NEEDS_UPGRADE,
-			 version_id_major(dd_version_id),
-			 version_id_minor(dd_version_id),
-			 version_id_patch(dd_version_id),
-			 tarantool_version());
-		return true;
-	}
-	return false;
+	return dd_version_id < latest_dd_version_id;
 }
 
 /**
@@ -152,6 +161,43 @@ box_schema_upgrade_end(void)
 	schema_upgrade_fiber = NULL;
 }
 
+bool
+dd_check_is_disabled(void)
+{
+	/*
+	 * We disable data dictionary checks in the following scenarios:
+	 *  - in the fiber that is currently running a schema upgrade or
+	 *    downgrade so that it can perform DDL operations required to
+	 *    modify the schema, in particular drop a system space;
+	 *  - in the applier fiber so that it can replicate changes done by
+	 *    a schema upgrade on the master;
+	 *  - during bootstrap so that DDL operations can be performed when
+	 *    generating new bootstrap snapshot;
+	 *  - during recovery so that DDL records written to the WAL can be
+	 *    replayed.
+	 */
+	return fiber() == schema_upgrade_fiber ||
+	       current_session()->type == SESSION_TYPE_APPLIER ||
+	       !box_is_configured() || recovery_state != FINISHED_RECOVERY;
+}
+
+int
+schema_check_feature(enum schema_feature feature)
+{
+	if (dd_check_is_disabled())
+		return 0;
+	struct version v = schema_feature_version[feature];
+	uint32_t id = version_id(v.major, v.minor, v.patch);
+	if (dd_version_id < id) {
+		diag_set(ClientError, ER_SCHEMA_NEEDS_UPGRADE,
+			 version_id_to_string(dd_version_id),
+			 schema_feature_strs[feature],
+			 version_id_to_string(id));
+		return -1;
+	}
+	return 0;
+}
+
 static int
 on_replace_dd_system_space(struct trigger *trigger, void *event)
 {
@@ -164,15 +210,9 @@ on_replace_dd_system_space(struct trigger *trigger, void *event)
 	}
 	/*
 	 * In general it's unsafe to execute a DDL operation with an old schema
-	 * so we only allow it
-	 *  - in the fiber that is currently running a schema upgrade because
-	 *    a schema upgrade implies DDL;
-	 *  - during recovery so that DDL records written to the WAL can be
-	 *    replayed.
+	 * so we only allow it for schema upgrade.
 	 */
-	if (recovery_state == FINISHED_RECOVERY &&
-	    fiber() != schema_upgrade_fiber &&
-	    box_schema_needs_upgrade())
+	if (schema_check_feature(SCHEMA_FEATURE_DDL_BEFORE_UPGRADE) != 0)
 		return -1;
 	memtx_tx_acquire_ddl(txn);
 	return 0;
@@ -185,7 +225,12 @@ sc_space_new(uint32_t id, const char *name,
 	     uint32_t key_part_count,
 	     struct trigger *replace_trigger)
 {
-	struct key_def *key_def = key_def_new(key_parts, key_part_count, false);
+	struct space_def *def =
+		space_def_new_xc(id, ADMIN, 0, name, strlen(name), "memtx",
+				 strlen("memtx"), &space_opts_default, NULL, 0,
+				 NULL, 0);
+	auto def_guard = make_scoped_guard([=] { space_def_delete(def); });
+	struct key_def *key_def = key_def_new(key_parts, key_part_count, 0);
 	if (key_def == NULL)
 		diag_raise();
 	auto key_def_guard =
@@ -194,17 +239,13 @@ sc_space_new(uint32_t id, const char *name,
 						    0 /* index id */,
 						    "primary", /* name */
 						    strlen("primary"),
+						    def->name, /* space name */
+						    def->engine_name,
 						    TREE /* index type */,
 						    &index_opts_default,
 						    key_def, NULL);
-	if (index_def == NULL)
-		diag_raise();
 	auto index_def_guard =
 		make_scoped_guard([=] { index_def_delete(index_def); });
-	struct space_def *def =
-		space_def_new_xc(id, ADMIN, 0, name, strlen(name), "memtx",
-				 strlen("memtx"), &space_opts_default, NULL, 0);
-	auto def_guard = make_scoped_guard([=] { space_def_delete(def); });
 	struct rlist key_list;
 	rlist_create(&key_list);
 	rlist_add_entry(&key_list, index_def, link);
@@ -273,6 +314,18 @@ schema_find_id(uint32_t system_space_id, uint32_t index_id,
 	iterator_delete(it);
 	region_truncate(region, used);
 	return rc;
+}
+
+/**
+ * Runs on_schema_init triggers.
+ */
+static void
+run_on_schema_init_triggers(void)
+{
+	struct event *event = event_get("box.ctl.on_schema_init", false);
+	if (event == NULL)
+		return;
+	event_run_triggers_no_fail(event, NULL);
 }
 
 /**
@@ -412,7 +465,7 @@ schema_init(void)
 		struct space_def *def;
 		def = space_def_new_xc(BOX_VINYL_DEFERRED_DELETE_ID, ADMIN, 0,
 				       name, strlen(name), engine,
-				       strlen(engine), &opts, NULL, 0);
+				       strlen(engine), &opts, NULL, 0, NULL, 0);
 		auto def_guard = make_scoped_guard([=] {
 			space_def_delete(def);
 		});
@@ -426,7 +479,7 @@ schema_init(void)
 	 * Run the triggers right after creating all the system
 	 * space stubs.
 	 */
-	trigger_run(&on_schema_init, NULL);
+	run_on_schema_init_triggers();
 }
 
 void
@@ -512,66 +565,3 @@ sequence_cache_delete(uint32_t id)
 	if (k != mh_end(sequences))
 		mh_i32ptr_del(sequences, k, NULL);
 }
-
-const char *
-schema_find_name(enum schema_object_type type, uint32_t object_id)
-{
-	switch (type) {
-	case SC_UNIVERSE:
-	case SC_ENTITY_SPACE:
-	case SC_ENTITY_FUNCTION:
-	case SC_ENTITY_SEQUENCE:
-	case SC_ENTITY_ROLE:
-	case SC_ENTITY_USER:
-		return "";
-	case SC_SPACE:
-		{
-			struct space *space = space_by_id(object_id);
-			if (space != NULL)
-				return space->def->name;
-			diag_set(ClientError, ER_NO_SUCH_SPACE,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	case SC_FUNCTION:
-		{
-			struct func *func = func_by_id(object_id);
-			if (func != NULL)
-				return func->def->name;
-			diag_set(ClientError, ER_NO_SUCH_FUNCTION,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	case SC_SEQUENCE:
-		{
-			struct sequence *seq = sequence_by_id(object_id);
-			if (seq != NULL)
-				return seq->def->name;
-			diag_set(ClientError, ER_NO_SUCH_SEQUENCE,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	case SC_ROLE:
-		{
-			struct user *role = user_by_id(object_id);
-			if (role != NULL)
-				return role->def->name;
-			diag_set(ClientError, ER_NO_SUCH_ROLE,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	case SC_USER:
-		{
-			struct user *user = user_by_id(object_id);
-			if (user != NULL)
-				return user->def->name;
-			diag_set(ClientError, ER_NO_SUCH_USER,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	default:
-		unreachable();
-	}
-	return NULL;
-}
-

@@ -480,12 +480,10 @@ src_list_append_unique(struct SrcList *list, const char *new_name)
 
 	for (int i = 0; i < list->nSrc; ++i) {
 		const char *name = list->a[i].zName;
-		if (name != NULL && strcmp(new_name, name) == 0)
+		if (strcmp(new_name, name) == 0)
 			return list;
 	}
-	struct SrcList *new_list =
-		sql_src_list_enlarge(list, 1, list->nSrc);
-	list = new_list;
+	list = sql_src_list_enlarge(list, 1, list->nSrc);
 	struct SrcList_item *pItem = &list->a[list->nSrc - 1];
 	pItem->zName = sql_xstrdup(new_name);
 	return list;
@@ -502,8 +500,7 @@ select_collect_table_names(struct Walker *walker, struct Select *select)
 		walker->u.pSrcList =
 			src_list_append_unique(walker->u.pSrcList,
 					       select->pSrc->a[i].zName);
-		if (walker->u.pSrcList == NULL)
-			return WRC_Abort;
+		assert(walker->u.pSrcList != NULL);
 	}
 	return WRC_Continue;
 }
@@ -514,14 +511,13 @@ sql_select_expand_from_tables(struct Select *select)
 	assert(select != NULL);
 	struct Walker walker;
 	struct SrcList *table_names = sql_src_list_new();
+	table_names->nSrc = 0;
 	memset(&walker, 0, sizeof(walker));
 	walker.xExprCallback = sqlExprWalkNoop;
 	walker.xSelectCallback = select_collect_table_names;
 	walker.u.pSrcList = table_names;
-	if (sqlWalkSelect(&walker, select) != 0) {
-		sqlSrcListDelete(walker.u.pSrcList);
-		return NULL;
-	}
+	int rc = sqlWalkSelect(&walker, select);
+	assert(rc == WRC_Continue); (void)rc;
 	return walker.u.pSrcList;
 }
 
@@ -867,6 +863,8 @@ sqlProcessJoin(Parse * pParse, Select * p)
 			pRight->pOn = 0;
 		}
 
+		if (pRight->pUsing == NULL)
+			continue;
 		/* Create extra terms on the WHERE clause for each column named
 		 * in the USING clause.  Example: If the two tables to be joined are
 		 * A and B and the USING clause names X, Y, and Z, then add this
@@ -874,32 +872,30 @@ sqlProcessJoin(Parse * pParse, Select * p)
 		 * Report an error if any column mentioned in the USING clause is
 		 * not contained in both tables to be joined.
 		 */
-		if (pRight->pUsing) {
-			const char *err = "cannot join using column %s - "\
-					  "column not present in both tables";
-			IdList *pList = pRight->pUsing;
-			for (j = 0; j < pList->nId; j++) {
-				char *zName;	/* Name of the term in the USING clause */
-				int iLeft;	/* Table on the left with matching column name */
-				int iLeftCol;	/* Column number of matching column on the left */
-				int iRightCol;	/* Column number of matching column on the right */
-
-				zName = pList->a[j].zName;
-				iRightCol = columnIndex(right_space->def, zName);
-				if (iRightCol < 0
-				    || !tableAndColumnIndex(pSrc, i + 1, zName,
-							    &iLeft, &iLeftCol)
-				    ) {
-					err = tt_sprintf(err, zName);
-					diag_set(ClientError,
-						 ER_SQL_PARSER_GENERIC, err);
-					pParse->is_aborted = true;
-					return 1;
-				}
-				addWhereTerm(pParse, pSrc, iLeft, iLeftCol,
-					     i + 1, iRightCol, isOuter,
-					     &p->pWhere);
+		for (int id = 0; id < pRight->pUsing->nId; ++id) {
+			struct IdList_item *item = &pRight->pUsing->a[id];
+			uint32_t fieldno_right = sql_fieldno_by_id(right_space,
+								   item);
+			uint32_t fieldno_left = UINT32_MAX;
+			int n;
+			for (n = 0; n <= i; ++n) {
+				const struct space *space = pSrc->a[n].space;
+				fieldno_left = sql_fieldno_by_id(space, item);
+				if (fieldno_left != UINT32_MAX)
+					break;
 			}
+			if (fieldno_left == UINT32_MAX ||
+			    fieldno_right == UINT32_MAX) {
+				diag_set(ClientError, ER_SQL_PARSER_GENERIC,
+					 tt_sprintf("cannot join using column "
+						    "%s - column not present "
+						    "in both tables",
+						    item->zName));
+				pParse->is_aborted = true;
+				return 1;
+			}
+			addWhereTerm(pParse, pSrc, n, fieldno_left, i + 1,
+				     fieldno_right, isOuter, &p->pWhere);
 		}
 	}
 	return 0;
@@ -1653,7 +1649,7 @@ sql_key_info_to_key_def(struct sql_key_info *key_info)
 {
 	if (key_info->key_def == NULL) {
 		key_info->key_def = key_def_new(key_info->parts,
-						key_info->part_count, false);
+						key_info->part_count, 0);
 	}
 	return key_info->key_def;
 }
@@ -1934,14 +1930,6 @@ generate_column_metadata(struct Parse *pParse, struct SrcList *pTabList,
 	if (pParse->colNamesSet)
 		return;
 	assert(v != 0);
-	size_t size;
-	uint32_t *var_pos =
-		region_alloc_array(&pParse->region, typeof(var_pos[0]),
-				   pParse->nVar, &size);
-	if (var_pos == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "var_pos");
-		return;
-	}
 	assert(pTabList != 0);
 	pParse->colNamesSet = 1;
 	bool is_full_meta = (pParse->sql_flags & SQL_FullMetadata) != 0;
@@ -1953,7 +1941,7 @@ generate_column_metadata(struct Parse *pParse, struct SrcList *pTabList,
 		if (NEVER(p == 0))
 			continue;
 		if (p->op == TK_VARIABLE)
-			var_pos[var_count++] = i;
+			var_count++;
 		enum field_type type = sql_expr_type(p);
 		vdbe_metadata_set_col_type(v, i, field_type_strs[type]);
 		if (is_full_meta && (type == FIELD_TYPE_STRING ||
@@ -2028,13 +2016,14 @@ generate_column_metadata(struct Parse *pParse, struct SrcList *pTabList,
 	}
 	if (var_count == 0)
 		return;
-	v->var_pos = (uint32_t *) malloc(var_count * sizeof(uint32_t));
-	if (v->var_pos ==  NULL) {
-		diag_set(OutOfMemory, var_count * sizeof(uint32_t),
-			 "malloc", "v->var_pos");
-		return;
+	uint32_t *var_pos = xmalloc(var_count * sizeof(*var_pos));
+	for (int i = 0, j = 0; i < pEList->nExpr; i++) {
+		struct Expr *e = pEList->a[i].pExpr;
+		assert(e != NULL);
+		if (e->op == TK_VARIABLE)
+			var_pos[j++] = i;
 	}
-	memcpy(v->var_pos, var_pos, var_count * sizeof(uint32_t));
+	v->var_pos = var_pos;
 	v->res_var_count = var_count;
 }
 
@@ -2065,9 +2054,14 @@ sqlColumnsFromExprList(Parse * parse, ExprList * expr_list,
 	 */
 	assert(space_def->fields == NULL);
 	struct region *region = &parse->region;
-	space_def->fields =
-		xregion_alloc_array(region, typeof(space_def->fields[0]),
-				    column_count);
+	if (column_count > 0) {
+		space_def->fields =
+			xregion_alloc_array(region,
+					    typeof(space_def->fields[0]),
+					    column_count);
+	} else {
+		space_def->fields = NULL;
+	}
 	for (uint32_t i = 0; i < column_count; i++) {
 		memcpy(&space_def->fields[i], &field_def_default,
 		       sizeof(field_def_default));
@@ -2191,8 +2185,6 @@ sqlResultSetOfSelect(Parse * pParse, Select * pSelect)
 		pSelect = pSelect->pPrior;
 	pParse->sql_flags = saved_flags;
 	struct space *space = sql_template_space_new(pParse, NULL);
-	if (space == NULL)
-		return NULL;
 	/* The sqlResultSetOfSelect() is only used in contexts where lookaside
 	 * is disabled
 	 */
@@ -2267,8 +2259,7 @@ computeLimitRegisters(Parse * pParse, Select * p, int iBreak)
 		   (p->pOffset != NULL &&
 		   (p->pOffset->flags & EP_Collate) != 0)) {
 			diag_set(ClientError, ER_SQL_SYNTAX_NEAR_TOKEN,
-				 pParse->line_count, sizeof("COLLATE"),
-				 "COLLATE");
+				 pParse->line_count, "COLLATE");
 			pParse->is_aborted = true;
 			return;
 		}
@@ -2284,9 +2275,8 @@ computeLimitRegisters(Parse * pParse, Select * p, int iBreak)
 		sqlVdbeAddOp2(v, OP_Integer, 0, r1);
 		sqlVdbeAddOp3(v, OP_Ge, r1, positive_limit_label, iLimit);
 		/* Otherwise return an error and stop */
-		const char *err = tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-					     "Only positive integers are "\
-					     "allowed in the LIMIT clause");
+		const char *err = "Only positive integers are allowed in the "
+				  "LIMIT clause";
 		sqlVdbeResolveLabel(v, halt_label);
 		sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, err,
 			      P4_STATIC);
@@ -2316,10 +2306,8 @@ computeLimitRegisters(Parse * pParse, Select * p, int iBreak)
 				sqlVdbeAddOp2(v, OP_Integer, 1, r1);
 				int no_err = sqlVdbeMakeLabel(v);
 				sqlVdbeAddOp3(v, OP_Eq, iLimit, no_err, r1);
-				err = tnt_errcode_desc(ER_SQL_EXECUTE);
-				err = tt_sprintf(err, "Expression subquery "\
-						 "could be limited only "\
-						 "with 1");
+				err = "Expression subquery could be limited "
+				      "only with 1";
 				sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0,
 					      0, err, P4_STATIC);
 				sqlVdbeAddOp1(v, OP_Halt, -1);
@@ -2343,9 +2331,8 @@ computeLimitRegisters(Parse * pParse, Select * p, int iBreak)
 
             		sqlVdbeAddOp3(v, OP_Ge, r1, positive_offset_label, iOffset);
 			/* Otherwise return an error and stop */
-			err = tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-					 "Only positive integers are allowed "\
-					 "in the OFFSET clause");
+			err = "Only positive integers are allowed in the "
+			      "OFFSET clause";
 			sqlVdbeResolveLabel(v, offset_error_label);
 			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, err,
 				      P4_STATIC);
@@ -4180,8 +4167,10 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 	 */
 	sql_xfree(pSubitem->zName);
 	sql_xfree(pSubitem->zAlias);
+	sql_xfree(pSubitem->legacy_name);
 	pSubitem->zName = 0;
 	pSubitem->zAlias = 0;
+	pSubitem->legacy_name = NULL;
 	pSubitem->pSelect = 0;
 
 	/* Deletion of the pSubitem->space will be done when a corresponding
@@ -4266,10 +4255,14 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 		pList = pParent->pEList;
 		for (i = 0; i < pList->nExpr; i++) {
 			if (pList->a[i].zName == 0) {
-				char *str = pList->a[i].zSpan;
-				int len = strlen(str);
-				char *name = sql_normalized_name_new(str, len);
+				const char *str = pList->a[i].zSpan;
+				size_t len = strlen(str);
+				char *name = sql_name_new(str, len);
 				pList->a[i].zName = name;
+				if (pList->a[i].zSpan[0] != '"') {
+					pList->a[i].legacy_name =
+						sql_legacy_name_new(str, len);
+				}
 			}
 		}
 		if (pSub->pOrderBy) {
@@ -4509,25 +4502,17 @@ is_simple_count(struct Select *select, struct AggInfo *agg_info)
 int
 sqlIndexedByLookup(Parse * pParse, struct SrcList_item *pFrom)
 {
-	if (pFrom->space != NULL && pFrom->fg.isIndexedBy) {
-		struct space *space = pFrom->space;
-		char *zIndexedBy = pFrom->u1.zIndexedBy;
-		struct index *idx = NULL;
-		for (uint32_t i = 0; i < space->index_count; ++i) {
-			if (strcmp(space->index[i]->def->name,
-				   zIndexedBy) == 0) {
-				idx = space->index[i];
-				break;
-			}
-		}
-		if (idx == NULL) {
-			diag_set(ClientError, ER_NO_SUCH_INDEX_NAME,
-				 zIndexedBy, space->def->name);
-			pParse->is_aborted = true;
-			return -1;
-		}
-		pFrom->pIBIndex = idx->def;
+	if (pFrom->space == NULL || pFrom->fg.isIndexedBy == 0)
+		return 0;
+	uint32_t index_id = sql_index_id_by_src(pFrom);
+	if (index_id == UINT32_MAX) {
+		diag_set(ClientError, ER_NO_SUCH_INDEX_NAME,
+			 pFrom->u1.zIndexedBy, pFrom->space->def->name);
+		pParse->is_aborted = true;
+		return -1;
 	}
+	assert(index_id <= pFrom->space->index_id_max);
+	pFrom->pIBIndex = pFrom->space->index_map[index_id]->def;
 	return 0;
 }
 
@@ -4717,8 +4702,6 @@ withExpand(Walker * pWalker, struct SrcList_item *pFrom)
 
 		assert(pFrom->space == NULL);
 		pFrom->space = sql_template_space_new(pParse, pCte->zName);
-		if (pFrom->space == NULL)
-			return WRC_Abort;
 		pFrom->pSelect = sqlSelectDup(pCte->pSelect, 0);
 		assert(pFrom->pSelect);
 
@@ -4865,7 +4848,7 @@ selectExpander(Walker * pWalker, Select * p)
 	ExprList *pEList;
 	struct SrcList_item *pFrom;
 	Expr *pE, *pRight, *pExpr;
-	u16 selFlags = p->selFlags;
+	u32 selFlags = p->selFlags;
 
 	p->selFlags |= SF_Expanded;
 	if (NEVER(p->pSrc == 0) || (selFlags & SF_Expanded) != 0) {
@@ -4912,8 +4895,6 @@ selectExpander(Walker * pWalker, Select * p)
 			struct space *space =
 				sql_template_space_new(sqlParseToplevel(pParse),
 						       name);
-			if (space == NULL)
-				return WRC_Abort;
 			pFrom->space = space;
 			/*
 			 * Rewrite old name with correct pointer.
@@ -5022,9 +5003,11 @@ selectExpander(Walker * pWalker, Select * p)
 			pNew = sql_expr_list_append(pNew, a[k].pExpr);
 			pNew->a[pNew->nExpr - 1].zName = a[k].zName;
 			pNew->a[pNew->nExpr - 1].zSpan = a[k].zSpan;
+			pNew->a[pNew->nExpr - 1].legacy_name = a[k].legacy_name;
 			a[k].zName = 0;
 			a[k].zSpan = 0;
 			a[k].pExpr = 0;
+			a[k].legacy_name = NULL;
 			continue;
 		}
 		/*
@@ -5065,7 +5048,8 @@ selectExpander(Walker * pWalker, Select * p)
 				assert(zName != NULL);
 				if (zTName != NULL && pSub != NULL &&
 				    sqlMatchSpanName(pSub->pEList->a[j].zSpan,
-						     0, zTName) == 0)
+						     NULL, zTName, NULL,
+						     NULL) == 0)
 					continue;
 				tableSeen = 1;
 
@@ -5517,9 +5501,7 @@ vdbe_code_raise_on_multiple_rows(struct Parse *parser, int limit_reg, int end_ma
 	int r1 = sqlGetTempReg(parser);
 	sqlVdbeAddOp2(v, OP_Integer, 0, r1);
 	sqlVdbeAddOp3(v, OP_Ne, r1, end_mark, limit_reg);
-	const char *error = tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-				       "Expression subquery returned more "\
-				       "than 1 row");
+	const char *error = "Expression subquery returned more than 1 row";
 	sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, error, P4_STATIC);
 	sqlVdbeAddOp1(v, OP_Halt, -1);
 	sqlReleaseTempReg(parser, r1);
@@ -6288,8 +6270,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 			 */
 			sqlVdbeJumpHere(v, addr1);
 			updateAccumulator(pParse, &sAggInfo);
-			if (pParse->is_aborted)
-				goto select_end;
 			sqlVdbeAddOp2(v, OP_Integer, 1, iUseFlag);
 			VdbeComment((v, "indicate data in accumulator"));
 
@@ -6303,6 +6283,8 @@ sqlSelect(Parse * pParse,		/* The parser context */
 				sqlWhereEnd(pWInfo);
 				sqlVdbeChangeToNoop(v, addrSortingIdx);
 			}
+			if (pParse->is_aborted)
+				goto select_end;
 
 			/* Output the final row of result
 			 */

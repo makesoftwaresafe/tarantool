@@ -45,6 +45,7 @@
 #include "salad/stailq.h"
 #include "clock_lowres.h"
 #include "backtrace.h"
+#include "exception.h"
 
 #include <coro/coro.h>
 
@@ -169,6 +170,16 @@ enum {
 	 * This flag idicates, if the fiber can be killed from the Lua world.
 	 */
 	FIBER_IS_SYSTEM         = 1 << 8,
+	/**
+	 * Someone has joined the fiber already. So this fiber can't be joined
+	 * once again nor can its joinability be changed.
+	 */
+	FIBER_JOIN_BEEN_INVOKED = 1 << 9,
+	/**
+	 * Makes sense only for system fibers. If flag is set then fiber
+	 * will be finished on fiber_shutdown().
+	 */
+	FIBER_MANAGED_SHUTDOWN = 1 << 10,
 	FIBER_DEFAULT_FLAGS	= 0
 };
 
@@ -269,6 +280,9 @@ fiber_new_ex(const char *name, const struct fiber_attr *fiber_attr, fiber_func f
 /**
  * Return control to another fiber and wait until it'll be woken.
  *
+ * \note this is not a cancellation point (\sa fiber_testcancel()), but it is
+ * considered a good practice to call fiber_testcancel() after each yield.
+ *
  * \sa fiber_wakeup
  */
 API_EXPORT void
@@ -290,6 +304,7 @@ fiber_start(struct fiber *callee, ...);
  * fiber_start which means no yields.
  *
  * \param f     fiber to set the context for
+ *              if NULL, the current fiber is used
  * \param f_arg context for the fiber function
  */
 API_EXPORT void
@@ -298,6 +313,7 @@ fiber_set_ctx(struct fiber *f, void *f_arg);
 /**
  * Get the context for the fiber which was set via the fiber_set_ctx
  * function. Can be used to avoid calling fiber_start which means no yields.
+ * If \a f is NULL, the current fiber is used.
  *
  * \retval      context for the fiber function set by fiber_set_ctx function
  *
@@ -340,7 +356,13 @@ fiber_set_cancellable(bool yesno);
 
 /**
  * Set fiber to be joinable (false by default).
- * \param fiber to (un)set the joinable property
+ * The fiber must not be joined already nor dead.
+ *
+ * @pre the fiber is not dead (panic if not).
+ * @pre the fiber is not joined yet (panic if not).
+ *
+ * \param fiber to (un)set the joinable property.
+ *              If set to NULL, the current fiber is used.
  * \param yesno status to set
  */
 API_EXPORT void
@@ -350,7 +372,10 @@ fiber_set_joinable(struct fiber *fiber, bool yesno);
  * Wait until the fiber is dead and then move its execution
  * status to the caller.
  * The fiber must not be detached (@sa fiber_set_joinable()).
- * @pre FIBER_IS_JOINABLE flag is set.
+ *
+ * @pre FIBER_IS_JOINABLE flag is set (panic if not).
+ * @pre the fiber is not joined yet (panic if not).
+ * @pre the fiber is different from current (panic if not).
  *
  * \param f fiber to be woken up
  * \return fiber function ret code
@@ -365,7 +390,9 @@ fiber_join(struct fiber *f);
  * Return fiber execution status to the caller or -1
  * if timeout exceeded and set diag.
  * The fiber must not be detached @sa fiber_set_joinable()
+ *
  * @pre FIBER_IS_JOINABLE flag is set.
+ * @pre the fiber is not joined yet (panic if not).
  *
  * \param f fiber to be woken up
  * \param timeout time during which we wait for the fiber completion
@@ -425,13 +452,48 @@ fiber_clock64(void);
 API_EXPORT void
 fiber_reschedule(void);
 
-struct slab_cache;
+/**
+ * Set fiber name.
+ * @param fiber Target fiber, if it's NULL the current fiber is used.
+ * @param name A new name of @a fiber.
+ * @param len Length of the string pointed to by @a name.
+ */
+API_EXPORT void
+fiber_set_name_n(struct fiber *fiber, const char *name, uint32_t len);
 
 /**
- * Return slab_cache suitable to use with tarantool/small library
+ * Get fiber name.
+ * @param fiber Target fiber, if it's NULL the current fiber is used.
+ * @return pointer to a nul-terminated string.
  */
-API_EXPORT struct slab_cache *
-cord_slab_cache(void);
+API_EXPORT const char *
+fiber_name(const struct fiber *fiber);
+
+/**
+ * Get fiber id.
+ * @param fiber Target fiber, if it's NULL the current fiber is used.
+ */
+API_EXPORT uint64_t
+fiber_id(const struct fiber *fiber);
+
+/**
+ * Get number of context switches of the given fiber.
+ * @param fiber Target fiber, if it's NULL the current fiber is used.
+ */
+API_EXPORT uint64_t
+fiber_csw(const struct fiber *fiber);
+
+/**
+ * Get a pointer to a live fiber in the current cord by the given fiber id,
+ * which may be used for getting other info about the fiber (name, csw, etc.).
+ *
+ * @param fid Target fiber id.
+ * @return fiber on success, NULL if fiber was not found.
+ *
+ * @sa fiber_name, fiber_csw, fiber_id
+ */
+API_EXPORT struct fiber *
+fiber_find(uint64_t fid);
 
 /**
  * box region allocator
@@ -627,6 +689,8 @@ struct fiber {
 	 * request, even if they are never destroyed.
 	 */
 	struct rlist on_stop;
+	/** Triggers invoked before fiber is recycled. */
+	struct rlist on_destroy;
 	/**
 	 * The list of fibers awaiting for this fiber's timely
 	 * (or untimely) death.
@@ -792,6 +856,17 @@ struct cord {
 	/** Slice for current fiber execution in seconds. */
 	struct fiber_slice slice;
 	char name[FIBER_NAME_INLINE];
+	/** Cord main fiber started in case of cord_costart. */
+	struct fiber *main_fiber;
+	/** An event triggered to cancel cord main fiber. */
+	ev_async cancel_event;
+	/** Number of alive client (non system) fibers. */
+	int client_fiber_count;
+	/** Fiber calling fiber_shutdown. NULL if there is no such. */
+	struct fiber *shutdown_fiber;
+	/** Whether shutdown is started. */
+	bool is_shutdown;
+
 };
 
 extern __thread struct cord *cord_ptr;
@@ -847,14 +922,15 @@ int
 cord_costart(struct cord *cord, const char *name, fiber_func f, void *arg);
 
 /**
- * Yield until \a cord has terminated.
- *
- * On success:
+ * Yield until \a cord has terminated. If fiber is cancelled
+ * then cancel is progarated to the cord main fiber if cord is started
+ * using cord_costart.
  *
  * If \a cord has terminated with an uncaught exception
  * the exception is moved to the current fiber's diagnostics
  * area, otherwise the current fiber's diagnostics area is
  * cleared.
+ *
  * @param cord cord
  * @sa pthread_join()
  *
@@ -902,13 +978,13 @@ void
 cord_collect_garbage(struct cord *cord);
 
 /**
- * Pthread-cancel the thread and join it in a blocking way, without yielding.
- * That way is the only possible one if the event loop is already destroyed.
- * Should only be used as an emergency, because all the cord resources simply
- * leak.
+ * Return slab_cache suitable to use with tarantool/small library
  */
-void
-cord_cancel_and_join(struct cord *cord);
+static inline struct slab_cache *
+cord_slab_cache(void)
+{
+	return &cord()->slabc;
+}
 
 /**
  * @brief Create a new system fiber.
@@ -952,13 +1028,10 @@ fiber_signal_reset(void);
  * @param fiber Fiber to set name for.
  * @param name A new name of @a fiber.
  */
-void
-fiber_set_name(struct fiber *fiber, const char *name);
-
-static inline const char *
-fiber_name(struct fiber *f)
+static inline void
+fiber_set_name(struct fiber *fiber, const char *name)
 {
-	return f->name;
+	fiber_set_name_n(fiber, name, strlen(name));
 }
 
 /** Helper function to check if slice is valid. */
@@ -1067,9 +1140,6 @@ fiber_check_slice(void)
 	return 0;
 }
 
-bool
-fiber_checkstack(void);
-
 /**
  * @brief yield & check for timeout
  * @return true if timeout exceeded
@@ -1096,9 +1166,6 @@ fiber_destroy_all(struct cord *cord);
 
 void
 fiber_call(struct fiber *callee);
-
-struct fiber *
-fiber_find(uint64_t fid);
 
 void
 fiber_schedule_cb(ev_loop * /* loop */, ev_watcher *watcher, int revents);
@@ -1178,6 +1245,30 @@ fiber_check_gc(void);
  */
 struct lua_State *
 fiber_lua_state(struct fiber *f);
+
+/** Change whether fiber is system or not. */
+void
+fiber_set_system(struct fiber *f, bool yesno);
+
+/**
+ * Turn managed shutdown on for system fiber. See FIBER_MANAGED_SHUTDOWN.
+ * It is should be used after fiber creation. Using it during shutdown does not
+ * work.
+ */
+void
+fiber_set_managed_shutdown(struct fiber *f);
+
+/**
+ * Cancel all client (non system) fibers and wait until they finished.
+ *
+ * If not finished in given timeout then failure result code is returned.
+ *
+ * Return:
+ *   0 - success
+ *  -1 - failure (diag is set)
+ */
+int
+fiber_shutdown(double timeout);
 
 #if defined(__cplusplus)
 } /* extern "C" */

@@ -32,6 +32,8 @@
 #include <small/region.h>
 #include <diag.h>
 #include "error.h"
+#include "watcher.h"
+#include "xrow.h"
 
 struct journal *current_journal = NULL;
 
@@ -46,9 +48,13 @@ void
 diag_set_journal_res_detailed(const char *file, unsigned line, int64_t res)
 {
 	switch(res) {
-	case JOURNAL_ENTRY_ERR_IO:
+	case JOURNAL_ENTRY_ERR_IO: {
+		static uint64_t io_error_count;
+		box_broadcast_fmt("box.wal_error", "{%s%llu}",
+				  "count", ++io_error_count);
 		diag_set_detailed(file, line, ClientError, ER_WAL_IO);
 		return;
+	}
 	case JOURNAL_ENTRY_ERR_CASCADE:
 		diag_set_detailed(file, line, ClientError, ER_CASCADE_ROLLBACK);
 		return;
@@ -101,7 +107,8 @@ journal_queue_wait(void)
 	++journal_queue.waiter_count;
 	rlist_add_tail_entry(&journal_queue.waiters, fiber(), state);
 	/*
-	 * Will be waken up by either queue emptying or a synchronous write.
+	 * Is woken up when this position in the queue should go into the next
+	 * journal batch.
 	 */
 	fiber_yield();
 	--journal_queue.waiter_count;
@@ -117,4 +124,22 @@ journal_queue_flush(void)
 	while (!rlist_empty(list))
 		fiber_wakeup(rlist_first_entry(list, struct fiber, state));
 	journal_queue_wait();
+}
+
+int
+journal_write_row(struct xrow_header *row)
+{
+	char buf[sizeof(struct journal_entry) + sizeof(struct xrow_header *)];
+	struct journal_entry *entry = (struct journal_entry *)buf;
+	entry->rows[0] = row;
+	journal_entry_create(entry, 1, xrow_approx_len(row),
+			     journal_entry_fiber_wakeup_cb, fiber());
+
+	if (journal_write(entry) != 0)
+		return -1;
+	if (entry->res < 0) {
+		diag_set_journal_res(entry->res);
+		return -1;
+	}
+	return 0;
 }

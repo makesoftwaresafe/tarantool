@@ -47,11 +47,15 @@ struct mpstream {
 	void *error_ctx;
 };
 
+/**
+ * Implementation of mpstream_error_f that logs the error and panics.
+ * Supposed to be used when allocation failures are not expected.
+ */
 void
-mpstream_reserve_slow(struct mpstream *stream, size_t size);
+mpstream_panic_cb(void *error_ctx);
 
 void
-mpstream_reset(struct mpstream *stream);
+mpstream_reserve_slow(struct mpstream *stream, size_t size);
 
 /**
  * A streaming API so that it's possible to encode to any output
@@ -65,7 +69,8 @@ mpstream_init(struct mpstream *stream, void *ctx,
 static inline void
 mpstream_flush(struct mpstream *stream)
 {
-	stream->alloc(stream->ctx, stream->pos - stream->buf);
+	if (stream->pos != stream->buf)
+		stream->alloc(stream->ctx, stream->pos - stream->buf);
 	stream->buf = stream->pos;
 }
 
@@ -95,6 +100,15 @@ mpstream_encode_uint(struct mpstream *stream, uint64_t num);
 
 void
 mpstream_encode_int(struct mpstream *stream, int64_t num);
+
+static inline void
+mpstream_encode_int64(struct mpstream *stream, int64_t num)
+{
+	if (num < 0)
+		mpstream_encode_int(stream, num);
+	else
+		mpstream_encode_uint(stream, num);
+}
 
 void
 mpstream_encode_float(struct mpstream *stream, float num);

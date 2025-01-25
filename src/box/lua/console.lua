@@ -19,6 +19,7 @@ ffi.cdef[[
 
 local internal = require('console.lib')
 local session_internal = box.internal.session
+local compat = require('compat')
 local fiber = require('fiber')
 local socket = require('socket')
 local log = require('log')
@@ -27,9 +28,36 @@ local urilib = require('uri')
 local yaml = require('yaml')
 local net_box = require('net.box')
 local help = require('help').help
+local utils = require('internal.utils')
+local tarantool = require('tarantool')
 
 local DEFAULT_CONNECT_TIMEOUT = 10
 local PUSH_TAG_HANDLE = '!push!'
+
+local CONSOLE_SESSION_SCOPE_VARS_BRIEF = [[
+Whether a console session has its own variable scope.
+
+In the old behavior, all the non-local variable assignments from the console
+are written to globals.
+
+In the new behavior, they're written to a variable scope attached to the console
+session.
+
+Also, a couple of built-in modules are added into the initial console variable
+scope in the new behavior.
+
+https://tarantool.io/compat/console_session_scope_vars
+]]
+
+compat.add_option({
+    name = 'console_session_scope_vars',
+    default = 'old',
+    obsolete = nil,
+    brief = CONSOLE_SESSION_SCOPE_VARS_BRIEF,
+    action = function() end,
+})
+
+local M = {}
 
 --
 -- Default output handler set to YAML for backward
@@ -153,7 +181,7 @@ local function parse_output(value)
     return nil, fmt, opts, local_eos
 end
 
-local function set_default_output(value)
+function M.set_default_output(value)
     if value == nil then
         error("Nil output value passed")
     end
@@ -165,7 +193,7 @@ local function set_default_output(value)
     default_output_format["opts"] = opts
 end
 
-local function get_default_output(...)
+function M.get_default_output(...)
     local args = ...
     if args ~= nil then
         error("Arguments provided while prohibited")
@@ -215,7 +243,7 @@ end
 --
 -- Set/get current console EOS value from
 -- currently active output format.
-local function console_eos(eos_value)
+function M.eos(eos_value)
     if not eos_value then
         return tostring(current_eos())
     end
@@ -247,7 +275,7 @@ end
 --
 -- Set delimiter
 --
-local function delimiter(delim)
+function M.delimiter(delim)
     local self = fiber.self().storage.console
     if self == nil then
         error("console.delimiter(): need existing console")
@@ -267,7 +295,7 @@ local function set_delimiter(_storage, value)
         return error('Can not install delimiter for net box sessions')
     end
     value = value or ''
-    return delimiter(value)
+    return M.delimiter(value)
 end
 
 local function set_language(storage, value)
@@ -388,10 +416,124 @@ local function get_command(line)
 end
 
 --
--- return args as table with 'n' set to args number
+-- Create wrapper for a function.
 --
-local function table_pack(...)
-    return {n = select('#', ...), ...}
+-- Without a wrapper function will be called using xpcall and the box.error
+-- trace frame will be at pcall implementation. Thus the trace test will be not
+-- strict enough (it can be any pcall beneath console pcall).
+--
+local function wrapped_call(fn)
+    return function()
+        -- With `return fn()` wrapper does not work due to tail call
+        -- optimization.
+        local res = utils.table_pack(fn())
+        return unpack(res, 1, res.n)
+    end
+end
+
+-- Calculates trace pointing to the fn() in wrapped_call.
+local function get_wrapped_trace()
+    local fun = wrapped_call(function()
+        box.error(box.error.UNKNOWN, 2)
+    end)
+    local _, err = pcall(fun)
+    return err.trace[1]
+end
+
+-- Calculates trace pointing to the fn() in wrapped_call.
+local wrapped_trace = get_wrapped_trace()
+assert(wrapped_trace.file == 'builtin/box/console.lua')
+
+--
+-- This function is intended to be used with xpcall and wrapped_call.
+-- Returns {err, info} where `info` is debug info for frame calling function
+-- wrapped in wrapped_call and `err` is just original error.
+--
+-- `info` is used to find the module that raises an error.
+--
+local function eval_error_handler(err)
+    local level = 2
+    local info = debug.getinfo(level, 'Sl')
+    -- Find place of xpcall.
+    while info ~= nil do
+        if info.short_src == wrapped_trace.file and
+           info.currentline == wrapped_trace.line then
+            break
+        end
+        level = level + 1
+        info = debug.getinfo(level, 'Sl')
+    end
+    -- Corresponds to the frame of function executed in console.
+    info = debug.getinfo(level - 1, 'S')
+    return {err = err, info = info}
+end
+
+local initial_env
+
+-- Get initial console environment.
+--
+-- If the console_session_scope_vars compat option is set to new,
+-- each console session has its own variable scope (environment)
+-- created before execution of a first command.
+--
+-- This environment initially contains a couple of frequently used
+-- built-in modules. A non-local variable assignment within a
+-- command modifies the environment.
+--
+-- The initial environment is returned by console.initial_env().
+-- It is a table that may be modified by a user or completely
+-- replaced with a new table using console.set_initial_env().
+-- These calls don't affect existing console sessions, only ones
+-- that are created afterwards.
+function M.initial_env()
+    if initial_env == nil then
+        initial_env = {
+            clock     = require('clock'),
+            compat    = require('compat'),
+            config    = require('config'),
+            datetime  = require('datetime'),
+            decimal   = require('decimal'),
+            ffi       = require('ffi'),
+            fiber     = require('fiber'),
+            fio       = require('fio'),
+            fun       = require('fun'),
+            json      = require('json'),
+            log       = require('log'),
+            msgpack   = require('msgpack'),
+            popen     = require('popen'),
+            uuid      = require('uuid'),
+            varbinary = require('varbinary'),
+            yaml      = require('yaml'),
+        }
+    end
+    return initial_env
+end
+
+-- Set initial console environment.
+--
+-- Accepts a table or a nil value. If the value is nil, the
+-- initial environment is reset to a default value.
+--
+-- See console.initial_env() for details.
+function M.set_initial_env(env)
+    if type(env) ~= 'table' and type(env) ~= 'nil' then
+        error(('console.set_initial_env: expected table or nil, got %s'):format(
+            type(env)), 2)
+    end
+    initial_env = env
+end
+
+local function create_env_on_demand(storage)
+    if compat.console_session_scope_vars:is_old() then
+        return
+    end
+    if storage.env ~= nil then
+        return
+    end
+    storage.env = setmetatable(table.copy(M.initial_env()), {
+        -- Read from globals if there is no local variable.
+        __index = _G,
+    })
 end
 
 --
@@ -415,16 +557,19 @@ local function local_eval(storage, line)
     -- stack. If the chunk is a statement, it won't compile. In that
     -- case try to run the original string.
     --
-    local fun, errmsg = loadstring("return "..line)
+    create_env_on_demand(storage)
+    local fun, errmsg = loadstring("return "..line, nil, nil, storage.env)
     if not fun then
-        fun, errmsg = loadstring(line)
+        fun, errmsg = loadstring(line, nil, nil, storage.env)
     end
     if not fun then
         return format(false, errmsg)
     end
+    -- Wrapper is required to check error trace. See below.
+    fun = wrapped_call(fun)
     -- box.is_in_txn() is stubbed to throw a error before call to box.cfg{}
     local in_txn_before = ffi.C.box_txn()
-    local res = table_pack(pcall(fun))
+    local res = utils.table_pack(xpcall(fun, eval_error_handler))
     --
     -- Rollback if transaction was began in the failed expression.
     --
@@ -436,12 +581,43 @@ local function local_eval(storage, line)
     if not res[1] and not in_txn_before and ffi.C.box_txn() then
         box.rollback()
     end
+    --
+    -- In case of errors we set box.error trace frame to the place of box API
+    -- call by client (gh-9914). This should be tested. The idea is to use
+    -- existing diff tests that use console for test script execution. Let
+    -- check if trace frame is correct.
+    --
+    -- It is hard to fix box.error trace for all API at once so we will fix it
+    -- per module basis.
+    --
+    if tarantool.build.test_build and not res[1] and
+       tarantool._internal.trace_check_is_required(res[2].info.short_src) then
+        local err = res[2].err
+        if not box.error.is(err) then
+            return format(false, {err, 'Warning, box error expected'})
+        end
+        local trace = err.trace[1]
+        if not table.equals(trace, wrapped_trace) then
+            return format(false, {err, 'Warning, unexpected trace', trace})
+        end
+    end
+    if not res[1] then
+        local err = res[2].err
+        -- Unfortunately due to introduced wrapper (see above) if module
+        -- raises non box error then trace information apperead breaking
+        -- existing tests. Let's temporarily counteract by stripping
+        -- this information.
+        if type(err) == 'string' then
+            err = string.gsub(err, '^builtin/box/console.lua:%d+: ', '')
+        end
+        res[2] = err
+    end
     -- specify length to preserve trailing nils
     return format(unpack(res, 1, res.n))
 end
 
-local function eval(line)
-    return local_eval(box.session, line)
+function M.eval(line)
+    return local_eval(box.session.storage, line)
 end
 
 local text_connection_mt = {
@@ -824,7 +1000,7 @@ local function repl(self)
     fiber.self().storage.console = nil
 end
 
-local function on_start(foo)
+function M.on_start(foo)
     if foo == nil or type(foo) == 'function' then
         repl_mt.__index.on_start = foo
         return
@@ -832,7 +1008,7 @@ local function on_start(foo)
     error('Wrong type of on_start hook: ' .. type(foo))
 end
 
-local function on_client_disconnect(foo)
+function M.on_client_disconnect(foo)
     if foo == nil or type(foo) == 'function' then
         repl_mt.__index.on_client_disconnect = foo
         return
@@ -843,7 +1019,7 @@ end
 --
 --
 --
-local function ac(yes_no)
+function M.ac(yes_no)
     local self = fiber.self().storage.console
     if self == nil then
         error("console.ac(): need existing console")
@@ -855,7 +1031,7 @@ end
 -- Start REPL on stdin
 --
 local started = false
-local function start()
+function M.start()
     if started then
         error("console is already started")
     end
@@ -869,6 +1045,7 @@ local function start()
     session_internal.create(1, "repl") -- stdin fileno
     repl(self)
     started = false
+    internal.console_exited()
 end
 
 --
@@ -899,7 +1076,7 @@ end
 --
 -- Connect to remote instance
 --
-local function connect(uri, opts)
+function M.connect(uri, opts)
     opts = opts or {}
 
     local self = fiber.self().storage.console
@@ -918,11 +1095,7 @@ local function connect(uri, opts)
     -- We don't know if the remote end is binary or Lua console so we first try
     -- to connect to it as binary using net.box and fall back on Lua console if
     -- it fails.
-    local remote = net_box.connect(u.host, u.service, {
-            connect_timeout = opts.timeout,
-            user = u.login,
-            password = u.password,
-    })
+    local remote = net_box.connect(uri, {connect_timeout = opts.timeout})
     if remote.state == 'error' then
         local err = remote.error
         remote = nil
@@ -988,14 +1161,22 @@ local function client_handler(client, _peer)
     state:print(string.format("%-63s\n%-63s\n",
         "Tarantool ".. version.." (Lua console)",
         "type 'help' for interactive help"))
+    local on_shutdown = function()
+        -- Fiber is going to be cancelled on shutdown. Do not report
+        -- cancel induced error to the peer.
+        client:close();
+    end
+    state.fiber = fiber.self()
+    box.ctl.on_shutdown(on_shutdown)
     repl(state)
+    box.ctl.on_shutdown(nil, on_shutdown)
     session_internal.run_on_disconnect()
 end
 
 --
 -- Start admin console
 --
-local function listen(uri)
+function M.listen(uri)
     local host, port
     if uri == nil then
         host = 'unix/'
@@ -1017,17 +1198,6 @@ local function listen(uri)
     return s
 end
 
-return {
-    start = start;
-    eval = eval;
-    delimiter = delimiter;
-    set_default_output = set_default_output;
-    get_default_output = get_default_output;
-    eos = console_eos;
-    ac = ac;
-    connect = connect;
-    listen = listen;
-    on_start = on_start;
-    on_client_disconnect = on_client_disconnect;
-    completion_handler = internal.completion_handler;
-}
+M.completion_handler = internal.completion_handler
+
+return M

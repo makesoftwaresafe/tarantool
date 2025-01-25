@@ -41,8 +41,6 @@
 #include "mp_extension_types.h"
 #include "tt_uuid.h"
 
-#include "lua-yaml/b64.h"
-
 #include "serialize_lua.h"
 
 #if 0
@@ -53,9 +51,6 @@ static_assert(DT_IVAL_TO_STRING_BUFSIZE > FPCONV_G_FMT_BUFSIZE,
 	      "Buffer is too small");
 static_assert(DT_IVAL_TO_STRING_BUFSIZE > DT_TO_STRING_BUFSIZE,
 	      "Buffer is too small");
-
-/* Serializer for Lua output mode */
-static struct luaL_serializer *serializer_lua;
 
 enum {
 	NODE_NONE_BIT		= 0,
@@ -814,16 +809,10 @@ dump_node(struct lua_dumper *d, struct node *nd, int indent)
 		str = buf;
 		break;
 	case MP_STR:
-		nd->mask |= NODE_QUOTE;
-		str = lua_tolstring(d->L, -1, &len);
-		if (utf8_check_printable(str, len) == 1)
-			break;
-		/* fallthrough */
 	case MP_BIN:
 		nd->mask |= NODE_QUOTE;
-		tobase64(d->L, -1);
-		str = lua_tolstring(d->L, -1, &len);
-		lua_pop(d->L, 1);
+		str = field->sval.data;
+		len = field->sval.len;
 		break;
 	case MP_ARRAY:
 		dump_array(d, nd, indent);
@@ -1043,35 +1032,4 @@ lua_parse_opts(lua_State *L, lua_dumper_opts_t *opts)
 	if (lua_isnumber(L, -1))
 		opts->indent_lvl = (int)lua_tonumber(L, -1);
 	lua_pop(L, 1);
-}
-
-/**
- * Initialize Lua serializer.
- */
-void
-lua_serializer_init(struct lua_State *L)
-{
-	/*
-	 * We don't export it as a module
-	 * for a while, so the library
-	 * is kept empty.
-	 */
-	static const luaL_Reg lualib[] = {
-		{
-			.name = NULL,
-		},
-	};
-
-	serializer_lua = luaL_newserializer(L, NULL, lualib);
-	serializer_lua->has_compact		= 1;
-	serializer_lua->encode_invalid_numbers	= 1;
-	serializer_lua->encode_load_metatables	= 1;
-	serializer_lua->encode_use_tostring	= 1;
-	serializer_lua->encode_invalid_as_nil	= 1;
-
-	/*
-	 * Keep a reference to this module so it
-	 * won't be unloaded.
-	 */
-	lua_setfield(L, -2, "formatter_lua");
 }

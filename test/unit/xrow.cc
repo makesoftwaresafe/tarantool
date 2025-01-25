@@ -29,6 +29,7 @@
  * SUCH DAMAGE.
  */
 extern "C" {
+#define UNIT_TAP_COMPATIBLE 1
 #include "unit.h"
 } /* extern "C" */
 #include "trivia/util.h"
@@ -59,9 +60,10 @@ test_iproto_constants()
 	return 0;
 }
 
-int
+void
 test_greeting()
 {
+	header();
 	plan(40);
 
 	char greetingbuf[IPROTO_GREETING_SIZE + 1];
@@ -198,20 +200,22 @@ test_greeting()
 		isnt(rc, 0, "invalid %d", i);
 	}
 
-	return check_plan();
+	check_plan();
+	footer();
 }
 
 void
-test_xrow_header_encode_decode()
+test_xrow_encode_decode()
 {
+	header();
 	/* Test all possible 3-bit combinations. */
 	const int bit_comb_count = 1 << 3;
-	plan(1 + bit_comb_count);
+	plan(1 + bit_comb_count * 15);
 	struct xrow_header header;
 	char buffer[2048];
 	char *pos = mp_encode_uint(buffer, 300);
-	is(xrow_header_decode(&header, (const char **) &pos,
-			      buffer + 100, true), -1, "bad msgpack end");
+	is(xrow_decode(&header, (const char **)&pos, buffer + 100, true), -1,
+	   "bad msgpack end");
 
 	header.type = 100;
 	header.replica_id = 200;
@@ -222,15 +226,13 @@ test_xrow_header_encode_decode()
 	uint64_t sync = 100500;
 	uint64_t stream_id = 1;
 	for (int opt_idx = 0; opt_idx < bit_comb_count; opt_idx++) {
-		plan(13);
 		header.stream_id = stream_id++;
 		header.is_commit = opt_idx & 0x01;
 		header.wait_sync = opt_idx >> 1 & 0x01;
 		header.wait_ack = opt_idx >> 2 & 0x01;
 		int iovcnt;
 		struct iovec vec[1];
-		xrow_header_encode(&header, sync, /*fixheader_len=*/200,
-				   vec, &iovcnt);
+		xrow_encode(&header, sync, /*fixheader_len=*/200, vec, &iovcnt);
 		is(1, iovcnt, "encode");
 		int fixheader_len = 200;
 		pos = (char *)vec[0].iov_base + fixheader_len;
@@ -248,11 +250,12 @@ test_xrow_header_encode_decode()
 		is(size, exp_map_size, "header map size");
 
 		struct xrow_header decoded_header;
-		const char *begin = (const char *)vec[0].iov_base;
-		begin += fixheader_len;
+		const char *pos = (const char *)vec[0].iov_base;
+		pos += fixheader_len;
+		const char *const begin = pos;
 		const char *end = (const char *)vec[0].iov_base;
 		end += vec[0].iov_len;
-		is(xrow_header_decode(&decoded_header, &begin, end, true), 0,
+		is(xrow_decode(&decoded_header, &pos, end, true), 0,
 		   "header decode");
 		is(header.stream_id, decoded_header.stream_id, "decoded stream_id");
 		is(header.is_commit, decoded_header.is_commit, "decoded is_commit");
@@ -264,15 +267,18 @@ test_xrow_header_encode_decode()
 		is(header.tm, decoded_header.tm, "decoded tm");
 		is(decoded_header.sync, sync, "decoded sync");
 		is(decoded_header.bodycnt, 0, "decoded bodycnt");
-		check_plan();
+		is(decoded_header.header, begin);
+		is(decoded_header.header_end, end);
 	}
 
 	check_plan();
+	footer();
 }
 
 void
 test_request_str()
 {
+	header();
 	plan(1);
 	struct xrow_header header;
 	header.replica_id = 5;
@@ -313,6 +319,7 @@ test_request_str()
 		  request_str(&request)), 0, "request_str");
 
 	check_plan();
+	footer();
 }
 
 /**
@@ -322,6 +329,7 @@ test_request_str()
 static void
 test_xrow_fields()
 {
+	header();
 	plan(6);
 
 	struct xrow_header header;
@@ -350,6 +358,7 @@ test_xrow_fields()
 	ok(!header.is_commit && !header.wait_sync && header.wait_ack, "WAIT_ACK -> header.wait_ack");
 
 	check_plan();
+	footer();
 }
 
 /**
@@ -358,6 +367,7 @@ test_xrow_fields()
 static void
 test_xrow_encode_dml(void)
 {
+	header();
 	plan(20);
 
 	struct request r;
@@ -399,16 +409,16 @@ test_xrow_encode_dml(void)
 	is(memcmp(data, r.key, strlen(r.key)), 0, "decoded key");
 	data += strlen(r.key);
 
-	is(mp_decode_uint(&data), IPROTO_OPS, "decoded ops key")
+	is(mp_decode_uint(&data), IPROTO_OPS, "decoded ops key");
 	is(memcmp(data, r.ops, strlen(r.ops)), 0, "decoded ops");
 	data += strlen(r.ops);
 
-	is(mp_decode_uint(&data), IPROTO_TUPLE_META, "decoded meta key")
+	is(mp_decode_uint(&data), IPROTO_TUPLE_META, "decoded meta key");
 	is(memcmp(data, r.tuple_meta, strlen(r.tuple_meta)), 0,
 	   "decoded meta");
 	data += strlen(r.tuple_meta);
 
-	is(mp_decode_uint(&data), IPROTO_TUPLE, "decoded tuple key")
+	is(mp_decode_uint(&data), IPROTO_TUPLE, "decoded tuple key");
 	is(memcmp(data, r.tuple, strlen(r.tuple)), 0, "decoded tuple");
 	data += strlen(r.tuple);
 
@@ -420,6 +430,365 @@ test_xrow_encode_dml(void)
 	is(mp_decode_uint(&data), IPROTO_NEW_TUPLE, "decoded new tuple key");
 	is(memcmp(data, r.new_tuple, strlen(r.new_tuple)), 0,
 	   "decoded new tuple");
+
+	check_plan();
+	footer();
+}
+
+/**
+ * Check that xrow_decode_* functions silently ignore unknown keys.
+ */
+static void
+test_xrow_decode_unknown_key(void)
+{
+	header();
+	plan(16);
+
+	char buf[128];
+
+	const char *p = buf;
+	const char *end = buf + mp_format(buf, sizeof(buf), "{%u%s}",
+					  0xDEAD, "foobar");
+	struct xrow_header header;
+	is(xrow_decode(&header, &p, end, /*end_is_exact=*/true), 0,
+	   "xrow_decode");
+
+	memset(&header, 0, sizeof(header));
+	header.bodycnt = 1;
+	header.body[0].iov_base = buf;
+	header.body[0].iov_len = mp_format(buf, sizeof(buf), "{%u%s}",
+					   0xDEAD, "foobar");
+
+	struct request dml;
+	header.type = IPROTO_SELECT;
+	is(xrow_decode_dml(&header, &dml, /*key_map=*/0), 0, "xrow_decode_dml");
+
+	struct begin_request begin;
+	header.type = IPROTO_BEGIN;
+	is(xrow_decode_begin(&header, &begin), 0, "xrow_decode_begin");
+
+	struct id_request id;
+	header.type = IPROTO_ID;
+	is(xrow_decode_id(&header, &id), 0, "xrow_decode_id");
+
+	struct register_request reg;
+	header.type = IPROTO_REGISTER;
+	is(xrow_decode_register(&header, &reg), 0, "xrow_decode_register");
+
+	struct subscribe_request sub;
+	header.type = IPROTO_SUBSCRIBE;
+	is(xrow_decode_subscribe(&header, &sub), 0, "xrow_decode_subscribe");
+
+	struct join_request join;
+	header.type = IPROTO_JOIN;
+	is(xrow_decode_join(&header, &join), 0, "xrow_decode_join");
+
+	struct relay_heartbeat relay_heartbeat;
+	header.type = IPROTO_OK;
+	is(xrow_decode_relay_heartbeat(&header, &relay_heartbeat), 0,
+	   "xrow_decode_relay_heartbeat");
+
+	struct applier_heartbeat applier_heartbeat;
+	header.type = IPROTO_OK;
+	is(xrow_decode_applier_heartbeat(&header, &applier_heartbeat), 0,
+	   "xrow_decode_applier_heartbeat");
+
+	struct synchro_request synchro;
+	header.type = IPROTO_RAFT_PROMOTE;
+	is(xrow_decode_synchro(&header, &synchro, NULL), 0,
+	   "xrow_decode_synchro");
+
+	struct raft_request raft;
+	header.type = IPROTO_RAFT;
+	header.group_id = GROUP_LOCAL;
+	is(xrow_decode_raft(&header, &raft, /*vclock=*/NULL), 0,
+	   "xrow_decode_raft");
+
+	struct ballot ballot;
+	header.type = IPROTO_OK;
+	header.body[0].iov_len = mp_format(buf, sizeof(buf), "{%u{%u%b}%u%s}",
+					   IPROTO_BALLOT, IPROTO_BALLOT_IS_RO,
+					   true, 0xDEAD, "foobar");
+	is(xrow_decode_ballot(&header, &ballot), 0, "xrow_decode_ballot");
+
+	struct call_request call;
+	header.type = IPROTO_CALL;
+	header.body[0].iov_len = mp_format(buf, sizeof(buf), "{%u%s%u%s}",
+					   IPROTO_FUNCTION_NAME, "foo",
+					   0xDEAD, "foobar");
+	is(xrow_decode_call(&header, &call), 0, "xrow_decode_call");
+
+	struct watch_request watch;
+	header.type = IPROTO_WATCH;
+	header.body[0].iov_len = mp_format(buf, sizeof(buf), "{%u%s%u%s}",
+					   IPROTO_EVENT_KEY, "foo",
+					   0xDEAD, "foobar");
+	is(xrow_decode_watch(&header, &watch), 0, "xrow_decode_watch");
+
+	struct sql_request sql;
+	header.type = IPROTO_EXECUTE;
+	header.body[0].iov_len = mp_format(buf, sizeof(buf), "{%u%s%u%s}",
+					   IPROTO_SQL_TEXT, "SELECT 1",
+					   0xDEAD, "foobar");
+	is(xrow_decode_sql(&header, &sql), 0, "xrow_decode_sql");
+
+	struct auth_request auth;
+	header.type = IPROTO_AUTH;
+	header.body[0].iov_len = mp_format(buf, sizeof(buf), "{%u%s%u[]%u%s}",
+					   IPROTO_USER_NAME, "guest",
+					   IPROTO_TUPLE, 0xDEAD, "foobar");
+	is(xrow_decode_auth(&header, &auth), 0, "xrow_decode_auth");
+
+	check_plan();
+	footer();
+}
+
+static void
+test_xrow_decode_synchro_types(void)
+{
+	header();
+	plan(1);
+
+	char buf[128];
+
+	const char *p = buf;
+	const char *end = buf + mp_format(buf, sizeof(buf), "{%u%s}",
+					  IPROTO_INSTANCE_NAME, "somename");
+	struct xrow_header header;
+	memset(&header, 0, sizeof(header));
+	header.bodycnt = 1;
+	header.body[0].iov_base = buf;
+	header.body[0].iov_len = mp_format(buf, sizeof(buf), "{%u%s}",
+					   IPROTO_INSTANCE_NAME, "somename");
+	struct synchro_request synchro;
+	is(xrow_decode_synchro(&header, &synchro, NULL), 0,
+	   "xrow_decode_synchro correctly handles key types");
+
+	check_plan();
+	footer();
+}
+
+static void
+test_xrow_decode_error_1(void)
+{
+	header();
+	plan(1);
+
+	uint8_t data[] = {
+		0x81, /* MP_MAP of 1 element */
+		0x52, /* IPROTO_ERROR: */
+		0x00  /* MP_INT instead of MP_MAP */
+	};
+
+	struct iovec body;
+	body.iov_base = (void *)data;
+	body.iov_len = sizeof(data);
+
+	struct xrow_header row;
+	row.type = IPROTO_TYPE_ERROR | 111;
+	row.body[0] = body;
+	row.bodycnt = 1;
+
+	xrow_decode_error(&row);
+
+	struct error *e = diag_last_error(diag_get());
+	is(e->code, 111, "xrow_decode_error");
+	diag_destroy(diag_get());
+
+	check_plan();
+	footer();
+}
+
+static void
+test_xrow_decode_error_2(void)
+{
+	header();
+	plan(1);
+
+	uint8_t data[] = {
+		0x81, /* MP_MAP of 1 element */
+		0x52, /* IPROTO_ERROR: */
+		0x81, /* MP_MAP of 1 element */
+		0xa1  /* MP_STR instead of MP_UINT */
+	};
+
+	struct iovec body;
+	body.iov_base = (void *)data;
+	body.iov_len = sizeof(data);
+
+	struct xrow_header row;
+	row.type = IPROTO_TYPE_ERROR | 222;
+	row.body[0] = body;
+	row.bodycnt = 1;
+
+	xrow_decode_error(&row);
+
+	struct error *e = diag_last_error(diag_get());
+	is(e->code, 222, "xrow_decode_error");
+	diag_destroy(diag_get());
+
+	check_plan();
+	footer();
+}
+
+static void
+test_xrow_decode_error_3(void)
+{
+	header();
+	plan(1);
+
+	uint8_t data[] = {
+		0x81, /* MP_MAP of 1 element */
+		0x52, /* IPROTO_ERROR: */
+		0x81, /* MP_MAP of 1 element */
+		0x00, /* MP_ERROR_STACK: */
+		0x00  /* MP_INT instead of MP_ARRAY */
+	};
+
+	struct iovec body;
+	body.iov_base = (void *)data;
+	body.iov_len = sizeof(data);
+
+	struct xrow_header row;
+	row.type = IPROTO_TYPE_ERROR | 333;
+	row.body[0] = body;
+	row.bodycnt = 1;
+
+	xrow_decode_error(&row);
+
+	struct error *e = diag_last_error(diag_get());
+	is(e->code, 333, "xrow_decode_error");
+	diag_destroy(diag_get());
+
+	check_plan();
+	footer();
+}
+
+static void
+test_xrow_decode_error_4(void)
+{
+	header();
+	plan(1);
+
+	uint8_t data[] = {
+		0x81, /* MP_MAP of 1 element */
+		0x52, /* IPROTO_ERROR: */
+		0x81, /* MP_MAP of 1 element */
+		0x00, /* MP_ERROR_STACK: */
+		0x93, /* MP_ARRAY of 3 elements */
+		0x83, /* MP_MAP of 3 elements */
+		0x00, 0xa1, 0x00, /* MP_ERROR_TYPE: "" */
+		0x01, 0xa1, 0x00, /* MP_ERROR_FILE: "" */
+		0x03, 0xa1, 0x00, /* MP_ERROR_MESSAGE: "" */
+		0x83, /* MP_MAP of 3 elements */
+		0x00, 0xa1, 0x00, /* MP_ERROR_TYPE: "" */
+		0x01, 0xa1, 0x00, /* MP_ERROR_FILE: "" */
+		0x03, 0xa1, 0x00, /* MP_ERROR_MESSAGE: "" */
+		0x00 /* MP_INT instead of MP_MAP */
+	};
+
+	struct iovec body;
+	body.iov_base = (void *)data;
+	body.iov_len = sizeof(data);
+
+	struct xrow_header row;
+	row.type = IPROTO_TYPE_ERROR | 444;
+	row.body[0] = body;
+	row.bodycnt = 1;
+
+	xrow_decode_error(&row);
+
+	struct error *e = diag_last_error(diag_get());
+	is(e->code, 444, "xrow_decode_error");
+	diag_destroy(diag_get());
+
+	check_plan();
+	footer();
+}
+
+static void
+test_xrow_decode_error_gh_9098(void)
+{
+	header();
+	plan(1);
+
+	uint8_t data[] = {
+		0x81, /* MP_MAP of 1 element */
+		0x52, /* IPROTO_ERROR: */
+		0x81, /* MP_MAP of 1 element */
+		0x00, /* MP_ERROR_STACK: */
+		0x91, /* MP_ARRAY of 1 element */
+		0x84, /* MP_MAP of 4 elements */
+		0x00, 0xa1, 0x00, /* MP_ERROR_TYPE: "" */
+		0x01, 0xa1, 0x00, /* MP_ERROR_FILE: "" */
+		0x03, 0xa1, 0x00, /* MP_ERROR_MESSAGE: "" */
+		0x06, /* MP_ERROR_FIELDS: */
+		0x81, /* MP_MAP of 1 element */
+		0xa1, 0x78, 0x2a /* "x": 42 */
+	};
+
+	struct iovec body;
+	body.iov_base = (void *)data;
+	body.iov_len = sizeof(data);
+
+	struct xrow_header row;
+	row.type = IPROTO_TYPE_ERROR;
+	row.body[0] = body;
+	row.bodycnt = 1;
+
+	xrow_decode_error(&row);
+
+	uint64_t payload_value;
+	struct error *e = diag_last_error(diag_get());
+	error_get_uint(e, "x", &payload_value);
+	is(payload_value, 42, "decoded payload");
+	diag_destroy(diag_get());
+
+	check_plan();
+	footer();
+}
+
+static void
+test_xrow_decode_error_gh_9136(void)
+{
+	header();
+	plan(1);
+
+	uint8_t data[] = {
+		0x81, /* MP_MAP of 1 element */
+		0x52, /* IPROTO_ERROR: */
+		0x82, /* MP_MAP of 2 elements */
+		0x00, /* MP_ERROR_STACK: */
+		0x91, /* MP_ARRAY of 1 element */
+		0x83, /* MP_MAP of 3 elements */
+		0x00, 0xa1, 0x00, /* MP_ERROR_TYPE: "" */
+		0x01, 0xa1, 0x00, /* MP_ERROR_FILE: "" */
+		0x03, 0xa1, 0x00, /* MP_ERROR_MESSAGE: "" */
+		0x00, /* MP_ERROR_STACK: */
+		0x91, /* MP_ARRAY of 1 element */
+		0x83, /* MP_MAP of 3 elements */
+		0x00, 0xa1, 0x00, /* MP_ERROR_TYPE: "" */
+		0x01, 0xa1, 0x00, /* MP_ERROR_FILE: "" */
+		0x03, 0xa1, 0x00, /* MP_ERROR_MESSAGE: "" */
+	};
+
+	struct iovec body;
+	body.iov_base = (void *)data;
+	body.iov_len = sizeof(data);
+
+	struct xrow_header row;
+	row.type = IPROTO_TYPE_ERROR | 9136;
+	row.body[0] = body;
+	row.bodycnt = 1;
+
+	xrow_decode_error(&row);
+
+	struct error *e = diag_last_error(diag_get());
+	is(e->code, 9136, "xrow_decode_error");
+	diag_destroy(diag_get());
+
+	check_plan();
+	footer();
 }
 
 int
@@ -427,20 +796,31 @@ main(void)
 {
 	memory_init();
 	fiber_init(fiber_c_invoke);
-	plan(5);
+	header();
+	plan(13);
 
 	random_init();
 
 	test_iproto_constants();
 	test_greeting();
-	test_xrow_header_encode_decode();
+	test_xrow_encode_decode();
 	test_request_str();
 	test_xrow_fields();
 	test_xrow_encode_dml();
+	test_xrow_decode_unknown_key();
+	test_xrow_decode_error_1();
+	test_xrow_decode_error_2();
+	test_xrow_decode_error_3();
+	test_xrow_decode_error_4();
+	test_xrow_decode_error_gh_9098();
+	test_xrow_decode_error_gh_9136();
+	test_xrow_decode_synchro_types();
 
 	random_free();
 	fiber_free();
 	memory_free();
 
-	return check_plan();
+	int rc = check_plan();
+	footer();
+	return rc;
 }

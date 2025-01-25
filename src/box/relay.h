@@ -42,6 +42,7 @@ struct relay;
 struct replica;
 struct tt_uuid;
 struct vclock;
+struct checkpoint_cursor;
 
 enum relay_state {
 	/**
@@ -61,10 +62,6 @@ enum relay_state {
 /** Create a relay which is not running. object. */
 struct relay *
 relay_new(struct replica *replica);
-
-/** Cancel a running relay. Called on shutdown. */
-void
-relay_cancel(struct relay *relay);
 
 /** Destroy and delete the relay */
 void
@@ -115,6 +112,19 @@ relay_trigger_vclock_sync(struct relay *relay, uint64_t *vclock_sync,
 void
 relay_push_raft(struct relay *relay, const struct raft_request *req);
 
+/**
+ * Cancel the relay.
+ */
+void
+relay_cancel(struct relay *relay);
+
+/**
+ * Change group_id of the raft request row, if needed. Old versions expect
+ * GROUP_LOCAL, new ones - GROUP_DEFAULT.
+ */
+void
+relay_filter_raft(struct xrow_header *packet, uint32_t version_id);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif /* defined(__cplusplus) */
@@ -126,10 +136,12 @@ relay_push_raft(struct relay *relay, const struct raft_request *req);
  * @param sync      sync from incoming JOIN request
  * @param vclock[out] vclock of the read view sent to the replica
  * @param replica_version_id peer's version
+ * @param cursor    cursor for checkpoint join, if NULL - read-view join.
  */
 void
 relay_initial_join(struct iostream *io, uint64_t sync, struct vclock *vclock,
-		   uint32_t replica_version_id);
+		   uint32_t replica_version_id,
+		   struct checkpoint_cursor *cursor);
 
 /**
  * Send final JOIN rows to the replica.
@@ -138,8 +150,9 @@ relay_initial_join(struct iostream *io, uint64_t sync, struct vclock *vclock,
  * @param sync      sync from incoming JOIN request
  */
 void
-relay_final_join(struct iostream *io, uint64_t sync,
-		 struct vclock *start_vclock, struct vclock *stop_vclock);
+relay_final_join(struct replica *replica, struct iostream *io, uint64_t sync,
+		 const struct vclock *start_vclock,
+		 const struct vclock *stop_vclock);
 
 /**
  * Subscribe a replica to updates.
@@ -148,7 +161,7 @@ relay_final_join(struct iostream *io, uint64_t sync,
  */
 void
 relay_subscribe(struct replica *replica, struct iostream *io, uint64_t sync,
-		struct vclock *replica_vclock, uint32_t replica_version_id,
+		const struct vclock *start_vclock, uint32_t replica_version_id,
 		uint32_t replica_id_filter, uint64_t sent_raft_term);
 
 #endif /* TARANTOOL_REPLICATION_RELAY_H_INCLUDED */

@@ -3,6 +3,7 @@
 local compat = require('compat')
 local fiber = require('fiber')
 local ffi = require('ffi')
+local tarantool = require('tarantool')
 ffi.cdef[[
 double
 fiber_time(void);
@@ -24,19 +25,26 @@ Sets the default value for the max fiber slice. The old value is infinity
 https://tarantool.io/compat/fiber_slice_default
 ]]
 
+-- ASAN build is slow. Turn slice check off to suppress noisy failures
+-- on exceeding slice limit in this case.
+local max_slice_default
+if tarantool.build.asan then
+    max_slice_default = TIMEOUT_INFINITY
+else
+    max_slice_default = { warn = 0.5, err = 1.0 }
+end
+
 compat.add_option({
     name = 'fiber_slice_default',
-    default = 'old',
+    default = 'new',
     obsolete = nil,
     brief = FIBER_SLICE_DEFAULT_BRIEF,
     action = function(is_new)
-        local slice = {}
+        local slice
         if is_new then
-            slice.warn = 0.5
-            slice.err = 1.0
+            slice = max_slice_default
         else
-            slice.warn = TIMEOUT_INFINITY
-            slice.err = TIMEOUT_INFINITY
+            slice = TIMEOUT_INFINITY
         end
         fiber.set_max_slice(slice)
     end,
@@ -65,7 +73,11 @@ fiber.clock = fiber_clock
 fiber.clock64 = fiber_clock64
 
 local stall = fiber.stall
+local fiber_set_system = fiber.set_system
+local fiber_set_managed_shutdown = fiber.set_managed_shutdown
 fiber.stall = nil
+fiber.set_system = nil
+fiber.set_managed_shutdown = nil
 
 local worker_next_task = nil
 local worker_last_task
@@ -88,20 +100,17 @@ local function worker_f()
             stall()
         end
         worker_next_task = task.next
-        task.f(task.arg)
+        pcall(task.f, task.arg)
         fiber.sleep(0)
     end
 end
 
-local function worker_safe_f()
-    pcall(worker_f)
-    -- Worker_f never returns. If the execution is here, this
-    -- fiber is probably canceled and now is not able to sleep.
-    -- Create a new one.
-    worker_fiber = fiber.new(worker_safe_f)
-end
+local worker_name = 'tasks_worker_fiber'
 
-worker_fiber = fiber.new(worker_safe_f)
+worker_fiber = fiber.new(worker_f)
+fiber_set_system(worker_fiber)
+fiber_set_managed_shutdown(worker_fiber)
+worker_fiber:name(worker_name)
 
 local function worker_schedule_task(f, arg)
     local task = {f = f, arg = arg}
@@ -111,12 +120,17 @@ local function worker_schedule_task(f, arg)
         worker_last_task.next = task
     end
     worker_last_task = task
-    worker_fiber:wakeup()
+    -- Fiber is finished on shutdown as it has managed shutdown.
+    if worker_fiber:status() ~= 'dead' then
+        worker_fiber:wakeup()
+    end
 end
 
 -- Start from '_' to hide it from auto completion.
 fiber._internal = fiber._internal or {}
 fiber._internal.schedule_task = worker_schedule_task
+fiber._internal.set_system = fiber_set_system
+fiber._internal.set_managed_shutdown = fiber_set_managed_shutdown
 
 setmetatable(fiber, {__serialize = function(self)
     local res = table.copy(self)
