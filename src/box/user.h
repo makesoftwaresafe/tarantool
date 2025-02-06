@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include "user_def.h"
 #include "small/region.h"
+#include "diag.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -42,6 +43,12 @@ extern "C" {
 struct universe {
 	/** Global privileges this user has on the universe. */
 	struct access access[BOX_USER_MAX];
+	/** Privileges to execute any global Lua function with IPROTO_CALL. */
+	struct access access_lua_call[BOX_USER_MAX];
+	/** Privileges to execute any Lua expression with IPROTO_EVAL. */
+	struct access access_lua_eval[BOX_USER_MAX];
+	/** Privileges to execute SQL requests with IPROTO_EXECUTE. */
+	struct access access_sql[BOX_USER_MAX];
 };
 
 /** A single instance of the universe. */
@@ -98,9 +105,6 @@ struct user
 	struct access access[BOX_USER_MAX];
 };
 
-struct access *
-access_find(enum schema_object_type object_type, uint32_t object_id);
-
 /** Find user by id. */
 struct user *
 user_by_id(uint32_t uid);
@@ -155,6 +159,13 @@ credentials_reset(struct credentials *cr, struct user *new_user)
  * objects, such as spaces and functions.
  */
 extern struct user *guest_user, *admin_user;
+
+/**
+ * Returns cached runtime access information for the given Lua function name.
+ * If it doesn't exist, returns NULL.
+ */
+struct access *
+access_lua_call_find(const char *name, uint32_t name_len);
 
 #if defined(__cplusplus)
 } /* extern "C" */
@@ -221,12 +232,13 @@ int
 role_revoke(struct user *grantee, struct user *role);
 
 /**
- * Grant or revoke a single privilege to a user or role
- * and re-evaluate effective access of all users of this
- * role if this role.
+ * Grant or revoke a single privilege to a user or role and re-evaluate
+ * effective access of all users of this role if this role. For the purpose of
+ * the rolled back statement, please refer to `user_reload_privs`.
  */
 int
-priv_grant(struct user *grantee, struct priv_def *priv);
+priv_grant(struct user *grantee, struct priv_def *priv,
+	   struct txn_stmt *rolled_back_stmt);
 
 int
 priv_def_create_from_tuple(struct priv_def *priv, struct tuple *tuple);

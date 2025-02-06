@@ -72,15 +72,6 @@ cancel_dead_f(va_list ap)
 	return 0;
 }
 
-static int
-usleep_f(va_list ap)
-{
-	(void)ap;
-	while (true)
-		usleep(1000);
-	return 0;
-}
-
 static void NOINLINE
 stack_expand(unsigned long *ret, unsigned long nr_calls)
 {
@@ -138,6 +129,25 @@ waker_f(va_list ap)
 	return 0;
 }
 
+static int
+canceller_f(va_list ap)
+{
+	struct fiber *main_fiber = (struct fiber *)fiber()->f_arg;
+	fiber_cancel(main_fiber);
+	return 0;
+}
+
+static int
+watcher_f(va_list ap)
+{
+	fiber_sleep(1);
+	if (fiber_is_cancelled())
+		return 0;
+
+	fail("watcher timeout", "triggered");
+	unreachable();
+}
+
 static void
 fiber_join_test()
 {
@@ -191,6 +201,20 @@ fiber_join_test()
 	fiber_cancel(fiber);
 	fiber_join(fiber);
 
+	note("Can change the joinability in safe cases.");
+	fiber = fiber_new_xc("alive_not_joinable", noop_f);
+	/* Non-joinable not dead fiber.  */
+	fiber_set_joinable(fiber, true);
+	fail_unless((fiber->flags & FIBER_IS_JOINABLE) != 0);
+	/* Joinable not dead and not joined fiber. */
+	fiber_set_joinable(fiber, false);
+	fail_unless((fiber->flags & FIBER_IS_JOINABLE) == 0);
+	/* The same as the first case , just to be sure. */
+	fiber_set_joinable(fiber, true);
+	fail_unless((fiber->flags & FIBER_IS_JOINABLE) != 0);
+	fiber_wakeup(fiber);
+	fiber_join(fiber);
+
 	footer();
 }
 
@@ -216,7 +240,7 @@ fiber_stack_test()
 	 * Test a fiber with a custom stack size.
 	 */
 	int fiber_count = fiber_count_total();
-	size_t used1 = slabc->allocated.stats.used;
+	size_t used1 = slab_cache_used(slabc);
 	fiber_attr = fiber_attr_new();
 	fiber_attr_setstacksize(fiber_attr, default_attr.stack_size * 2);
 	stack_expand_limit = default_attr.stack_size * 3 / 2;
@@ -229,7 +253,7 @@ fiber_stack_test()
 	fiber_sleep(0);
 	cord_collect_garbage(cord());
 	fail_unless(fiber_count == fiber_count_total());
-	size_t used2 = slabc->allocated.stats.used;
+	size_t used2 = slab_cache_used(slabc);
 	fail_unless(used2 == used1);
 	note("big-stack fiber not crashed");
 
@@ -386,24 +410,27 @@ cord_cojoin_test(void)
 }
 
 static void
-cord_cancel_and_join_test(void)
+cord_cojoin_cancel_test(void)
 {
 	header();
-	struct cord tcord;
 
-	/* Join an exited but not yet joined thread. */
-	memset(&tcord, 0, sizeof(tcord));
-	fail_if(cord_costart(&tcord, "test", noop_f, NULL) != 0);
-	/* Give the thread some time to exit. */
-	fiber_sleep(0.01);
-	cord_cancel_and_join(&tcord);
+	struct cord cord;
+	fail_if(cord_costart(&cord, "cord", wait_cancel_f, NULL) != 0);
 
-	/* Cancel and join a hanging thread. */
-	memset(&tcord, 0, sizeof(tcord));
-	fail_if(cord_costart(&tcord, "test", usleep_f, NULL) != 0);
-	/* Give the thread some time to start. */
-	fiber_sleep(0.01);
-	cord_cancel_and_join(&tcord);
+	struct fiber *canceller_fiber = fiber_new("canceller", canceller_f);
+	fail_if(canceller_fiber == NULL);
+	canceller_fiber->f_arg = fiber();
+	fiber_wakeup(canceller_fiber);
+
+	struct fiber *watcher_fiber = fiber_new("watcher", watcher_f);
+	fail_if(watcher_fiber == NULL);
+	fiber_set_joinable(watcher_fiber, true);
+	fiber_wakeup(watcher_fiber);
+
+	fail_if(cord_cojoin(&cord) != 0);
+
+	fiber_cancel(watcher_fiber);
+	fiber_join(watcher_fiber);
 
 	footer();
 }
@@ -522,6 +549,183 @@ fiber_test_leak_modes()
 	say_logger_free();
 }
 
+static void
+fiber_test_client_fiber_count(void)
+{
+	header();
+
+	int count = cord()->client_fiber_count;
+
+	struct fiber *fiber1 = fiber_new("fiber1", wait_cancel_f);
+	fail_unless(fiber1 != NULL);
+	fail_unless(++count == cord()->client_fiber_count);
+
+	struct fiber *fiber2 = fiber_new("fiber2", wait_cancel_f);
+	fail_unless(fiber2 != NULL);
+	fail_unless(++count == cord()->client_fiber_count);
+
+	struct fiber *fiber3 = fiber_new_system("fiber3", wait_cancel_f);
+	fail_unless(fiber3 != NULL);
+	fail_unless(count == cord()->client_fiber_count);
+
+	struct fiber *fiber4 = fiber_new_system("fiber4", wait_cancel_f);
+	fail_unless(fiber4 != NULL);
+	fail_unless(count == cord()->client_fiber_count);
+
+	fiber_set_joinable(fiber1, true);
+	fiber_cancel(fiber1);
+	fiber_join(fiber1);
+	fail_unless(--count == cord()->client_fiber_count);
+
+	fiber_set_joinable(fiber4, true);
+	fiber_cancel(fiber4);
+	fiber_join(fiber4);
+	fail_unless(count == cord()->client_fiber_count);
+
+	fiber_set_joinable(fiber2, true);
+	fiber_cancel(fiber2);
+	fiber_join(fiber2);
+	fail_unless(--count == cord()->client_fiber_count);
+
+	fiber_set_joinable(fiber3, true);
+	fiber_cancel(fiber3);
+	fiber_join(fiber3);
+	fail_unless(count == cord()->client_fiber_count);
+
+	footer();
+}
+
+static void
+fiber_test_set_system(void)
+{
+	header();
+
+	struct fiber *fiber1 = fiber_new("fiber1", wait_cancel_f);
+	fail_unless(fiber1 != NULL);
+	int count = cord()->client_fiber_count;
+
+	fiber_set_system(fiber1, true);
+	fail_unless(--count == cord()->client_fiber_count);
+	fail_unless((fiber1->flags & FIBER_IS_SYSTEM) != 0);
+
+	fiber_set_system(fiber1, true);
+	fail_unless(count == cord()->client_fiber_count);
+	fail_unless((fiber1->flags & FIBER_IS_SYSTEM) != 0);
+
+	fiber_set_system(fiber1, false);
+	fail_unless(++count == cord()->client_fiber_count);
+	fail_unless((fiber1->flags & FIBER_IS_SYSTEM) == 0);
+
+	fiber_set_system(fiber1, false);
+	fail_unless(count == cord()->client_fiber_count);
+	fail_unless((fiber1->flags & FIBER_IS_SYSTEM) == 0);
+
+	struct fiber *fiber2 = fiber_new_system("fiber2", wait_cancel_f);
+	fail_unless(fiber2 != NULL);
+	count = cord()->client_fiber_count;
+
+	fiber_set_system(fiber2, false);
+	fail_unless(++count == cord()->client_fiber_count);
+	fail_unless((fiber2->flags & FIBER_IS_SYSTEM) == 0);
+
+	fiber_set_system(fiber2, false);
+	fail_unless(count == cord()->client_fiber_count);
+	fail_unless((fiber2->flags & FIBER_IS_SYSTEM) == 0);
+
+	fiber_set_system(fiber2, true);
+	fail_unless(--count == cord()->client_fiber_count);
+	fail_unless((fiber2->flags & FIBER_IS_SYSTEM) != 0);
+
+	fiber_set_system(fiber2, true);
+	fail_unless(count == cord()->client_fiber_count);
+	fail_unless((fiber2->flags & FIBER_IS_SYSTEM) != 0);
+
+	fiber_set_joinable(fiber1, true);
+	fiber_cancel(fiber1);
+	fiber_join(fiber1);
+	fiber_set_joinable(fiber2, true);
+	fiber_cancel(fiber2);
+	fiber_join(fiber2);
+
+	footer();
+}
+
+static int
+hang_on_cancel_f(va_list ap)
+{
+	while (!fiber_is_cancelled())
+		fiber_yield();
+	fiber_set_system(fiber(), true);
+	while (true)
+		fiber_yield();
+	return 0;
+}
+
+static int
+new_fiber_on_shudown_f(va_list ap)
+{
+	while (!fiber_is_cancelled())
+		fiber_yield();
+	struct fiber *fiber = fiber_new("fiber_on_shutdown", wait_cancel_f);
+	fail_unless(fiber == NULL);
+	fail_unless(!diag_is_empty(diag_get()));
+	fail_unless(strcmp(diag_last_error(diag_get())->errmsg,
+			   "fiber is cancelled") == 0);
+	struct fiber *system_fiber =
+			fiber_new_system("system_fiber_on_shutdown", noop_f);
+	fail_unless(system_fiber != NULL);
+	fiber_set_joinable(system_fiber, true);
+	fiber_start(system_fiber);
+	fiber_join(system_fiber);
+	return 0;
+}
+
+static void
+fiber_test_shutdown(void)
+{
+	footer();
+
+	struct fiber *fiber1 = fiber_new("fiber1", wait_cancel_f);
+	fail_unless(fiber1 != NULL);
+	fiber_set_joinable(fiber1, true);
+	struct fiber *fiber2 = fiber_new_system("fiber2", wait_cancel_f);
+	fail_unless(fiber2 != NULL);
+	struct fiber *fiber3 = fiber_new("fiber3", hang_on_cancel_f);
+	fail_unless(fiber3 != NULL);
+	struct fiber *fiber4 = fiber_new("fiber4", new_fiber_on_shudown_f);
+	fail_unless(fiber4 != NULL);
+	fiber_set_joinable(fiber4, true);
+	struct fiber *fiber6 = fiber_new_system("fiber6", wait_cancel_f);
+	fail_unless(fiber6 != NULL);
+	fiber_set_managed_shutdown(fiber6);
+	fiber_set_joinable(fiber6, true);
+
+	int rc = fiber_shutdown(1000.0);
+	fail_unless(rc == 0);
+
+	fail_unless((fiber1->flags & FIBER_IS_DEAD) != 0);
+	fail_unless((fiber2->flags & FIBER_IS_DEAD) == 0);
+	fail_unless((fiber3->flags & FIBER_IS_DEAD) == 0);
+	fail_unless((fiber4->flags & FIBER_IS_DEAD) != 0);
+	fail_unless((fiber6->flags & FIBER_IS_DEAD) != 0);
+
+	fiber_join(fiber1);
+	fiber_join(fiber4);
+	fiber_join(fiber6);
+
+	fiber_set_joinable(fiber2, true);
+	fiber_cancel(fiber2);
+	fiber_join(fiber2);
+
+	struct fiber *fiber5 = fiber_new("fiber5", wait_cancel_f);
+	fail_unless(fiber5 == NULL);
+	fail_unless(!diag_is_empty(diag_get()));
+	fail_unless(strcmp(diag_last_error(diag_get())->errmsg,
+			   "fiber is cancelled") == 0);
+
+	header();
+}
+
 static int
 main_f(va_list ap)
 {
@@ -534,9 +738,12 @@ main_f(va_list ap)
 	fiber_flags_respect_test();
 	fiber_wait_on_deadline_test();
 	cord_cojoin_test();
-	cord_cancel_and_join_test();
+	cord_cojoin_cancel_test();
 	fiber_test_defaults();
 	fiber_test_leak_modes();
+	fiber_test_client_fiber_count();
+	fiber_test_set_system();
+	fiber_test_shutdown();
 	ev_break(loop(), EVBREAK_ALL);
 	return 0;
 }
@@ -551,7 +758,7 @@ int main()
 	memory_init();
 	fiber_init(fiber_cxx_invoke);
 	fiber_attr_create(&default_attr);
-	struct fiber *main = fiber_new_xc("main", main_f);
+	struct fiber *main = fiber_new_system_xc("main", main_f);
 	fiber_wakeup(main);
 	ev_run(loop(), 0);
 	fiber_free();

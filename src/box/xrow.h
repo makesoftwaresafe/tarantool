@@ -37,6 +37,7 @@
 
 #include "diag.h"
 #include "iproto_features.h"
+#include "iproto_constants.h"
 #include "node_name.h"
 #include "tt_uuid.h"
 #include "vclock/vclock.h"
@@ -51,7 +52,6 @@ enum {
 	XROW_IOVMAX = XROW_HEADER_IOVMAX + XROW_BODY_IOVMAX,
 	XROW_HEADER_LEN_MAX = 52,
 	XROW_BODY_LEN_MAX = 512,
-	XROW_SYNCHRO_BODY_LEN_MAX = 32,
 	IPROTO_HEADER_LEN = 32,
 	/** 7 = sizeof(iproto_body_bin). */
 	IPROTO_SELECT_HEADER_LEN = IPROTO_HEADER_LEN + 7,
@@ -117,6 +117,16 @@ struct xrow_header {
 	/* See `IPROTO_SCHEMA_VERSION`. */
 	uint64_t schema_version;
 	struct iovec body[XROW_BODY_IOVMAX];
+	/**
+	 * A pointer to the beginning of xrow header, is set on decoding.
+	 * Is NULL by default.
+	 */
+	const char *header;
+	/**
+	 * A pointer to the end of xrow header, is set on decoding.
+	 * Is NULL by default.
+	 */
+	const char *header_end;
 };
 
 /**
@@ -145,8 +155,20 @@ xrow_approx_len(const struct xrow_header *row)
  * @post iovcnt <= XROW_IOVMAX
  */
 void
-xrow_header_encode(const struct xrow_header *header, uint64_t sync,
-		   size_t fixheader_len, struct iovec *out, int *iovcnt);
+xrow_encode(const struct xrow_header *header, uint64_t sync,
+	    size_t fixheader_len, struct iovec *out, int *iovcnt);
+
+/**
+ * Encode xrow header into a given buffer.
+ *
+ * @param header xrow.
+ * @param sync request sync number.
+ * @param data buffer. When set to NULL, simply count the needed data size.
+ *
+ * @return the exact space taken for encoding.
+ */
+size_t
+xrow_header_encode(const struct xrow_header *header, uint64_t sync, char *data);
 
 /**
  * Decode xrow from a binary packet
@@ -162,8 +184,8 @@ xrow_header_encode(const struct xrow_header *header, uint64_t sync,
  * @post *pos == end on success if @end_is_exact is set
  */
 int
-xrow_header_decode(struct xrow_header *header, const char **pos,
-		   const char *end, bool end_is_exact);
+xrow_decode(struct xrow_header *header, const char **pos,
+	    const char *end, bool end_is_exact);
 
 /**
  * DML request.
@@ -190,6 +212,14 @@ struct request {
 	/** Insert/replace/upsert tuple or proc argument or update operations. */
 	const char *tuple;
 	const char *tuple_end;
+	/** The data in in-memory Arrow format. */
+	struct ArrowArray *arrow_array;
+	/** Arrow schema for @arrow_array. */
+	struct ArrowSchema *arrow_schema;
+	/** The data in serialized Arrow format. */
+	const char *arrow_ipc;
+	/** End of @arrow_ipc. */
+	const char *arrow_ipc_end;
 	/** Upsert operations. */
 	const char *ops;
 	const char *ops_end;
@@ -345,9 +375,14 @@ struct synchro_request {
 	int64_t lsn;
 	/**
 	 * The new term the instance issuing this request is in. Only used for
-	 * PROMOTE request.
+	 * PROMOTE and DEMOTE requests.
 	 */
 	uint64_t term;
+	/**
+	 * Confirmed lsns of all the previous limbo owners. Only used for
+	 * PROMOTE and DEMOTE requests.
+	 */
+	struct vclock *confirmed_vclock;
 };
 
 /**
@@ -364,11 +399,13 @@ xrow_encode_synchro(struct xrow_header *row, char *body,
  * Decode synchronous replication request.
  * @param row xrow header.
  * @param[out] req Request parameters.
+ * @param[out] vclock Storage for request vclock.
  * @retval -1 on error.
  * @retval 0 success.
  */
 int
-xrow_decode_synchro(const struct xrow_header *row, struct synchro_request *req);
+xrow_decode_synchro(const struct xrow_header *row, struct synchro_request *req,
+		    struct vclock *vclock);
 
 /**
  * Raft request. It repeats Raft message to the letter, but can be extended in
@@ -381,6 +418,8 @@ struct raft_request {
 	bool is_leader_seen;
 	uint64_t state;
 	const struct vclock *vclock;
+	/** Replication group identifier. 0 - replicaset, 1 - replica-local. */
+	enum group_id group_id;
 };
 
 void
@@ -402,6 +441,10 @@ struct call_request {
 	/** CALL/EVAL parameters. MessagePack Array. */
 	const char *args;
 	const char *args_end;
+	/** Tuple formats of CALL/EVAL parameters. MessagePack Map. */
+	const char *tuple_formats;
+	/** End of tuple formats of CALL/EVAL parameters. */
+	const char *tuple_formats_end;
 };
 
 /**
@@ -509,6 +552,8 @@ struct ballot {
 	struct vclock gc_vclock;
 	/** The uuid of the instance this node considers a bootstrap leader. */
 	struct tt_uuid bootstrap_leader_uuid;
+	/** The name of this node. */
+	char instance_name[NODE_NAME_SIZE_MAX];
 	/** Replica uuids registered in the replica set. */
 	struct tt_uuid registered_replica_uuids[VCLOCK_MAX];
 	/** Number of replicas registered in the replica set. */
@@ -645,6 +690,29 @@ xrow_encode_join(struct xrow_header *row, const struct join_request *req);
 int
 xrow_decode_join(const struct xrow_header *row, struct join_request *req);
 
+struct fetch_snapshot_request {
+	/** Replica's version. */
+	uint32_t version_id;
+	/** Flag indicating whether checkpoint join should be done. */
+	bool is_checkpoint_join;
+	/** Checkpoint's vclock, signature of the snapshot. */
+	struct vclock checkpoint_vclock;
+	/** Checkpoint's lsn, the row number to start from. */
+	uint64_t checkpoint_lsn;
+	/** Replica's UUID. */
+	struct tt_uuid instance_uuid;
+};
+
+/** Encode FETCH_SNAPSHOT request. */
+void
+xrow_encode_fetch_snapshot(struct xrow_header *row,
+			   const struct fetch_snapshot_request *req);
+
+/** Decode FETCH_SNAPSHOT request. */
+int
+xrow_decode_fetch_snapshot(const struct xrow_header *row,
+			   struct fetch_snapshot_request *req);
+
 /**
  * Heartbeat from relay to applier. Follows the replication stream. Same
  * direction.
@@ -690,13 +758,35 @@ int
 xrow_decode_applier_heartbeat(const struct xrow_header *row,
 			      struct applier_heartbeat *req);
 
+/** Encode vclock including 0th component. */
+/** Return the number of bytes an encoded vclock takes. */
+uint32_t
+mp_sizeof_vclock_ignore0(const struct vclock *vclock);
+
+/** Encode a vclock to a buffer as MP_MAP. Never fails. */
+char *
+mp_encode_vclock_ignore0(char *data, const struct vclock *vclock);
+
+/**
+ * Decode a vclock from MsgPack data, it should be MP_MAP.
+ * Returns -1 on error, diag is NOT set.
+ */
+int
+mp_decode_vclock_ignore0(const char **data, struct vclock *vclock);
+
+/** Encode vclock ignoring 0th component. */
+void
+xrow_encode_vclock_ignore0(struct xrow_header *row,
+			   const struct vclock *vclock);
+
 /** Encode vclock. */
 void
 xrow_encode_vclock(struct xrow_header *row, const struct vclock *vclock);
 
-/** Decode vclock. */
+/** Decode vclock ignoring 0th component. */
 int
-xrow_decode_vclock(const struct xrow_header *row, struct vclock *vclock);
+xrow_decode_vclock_ignore0(const struct xrow_header *row,
+			   struct vclock *vclock);
 
 /**
  * Encode any bodyless message.
@@ -708,7 +798,7 @@ xrow_encode_type(struct xrow_header *row, uint16_t type);
 
 /**
  * Fast encode xrow header using the specified header fields.
- * It is faster than the xrow_header_encode, because uses
+ * It is faster than the xrow_encode, because uses
  * the predefined values for all fields of the header, defined
  * in the struct iproto_header_bin in iproto_port.cc. Because of
  * it, the implementation is placed in the same
@@ -722,7 +812,7 @@ xrow_encode_type(struct xrow_header *row, uint16_t type);
  * @param schema_version Schema version.
  * @param body_length Length of the body of the iproto message.
  *        Please, pass it without IPROTO_HEADER_LEN.
- * @see xrow_header_encode()
+ * @see xrow_encode()
  */
 void
 iproto_header_encode(char *data, uint16_t type, uint64_t sync,
@@ -735,21 +825,18 @@ struct obuf_svp;
  * Reserve obuf space for the header, which depends on the
  * response size.
  */
-int
+void
 iproto_prepare_header(struct obuf *buf, struct obuf_svp *svp, size_t size);
 
 /**
  * Prepare the iproto header for a select result set.
  * @param buf Out buffer.
  * @param svp Savepoint of the header beginning.
- *
- * @retval  0 Success.
- * @retval -1 Memory error.
  */
-static inline int
+static inline void
 iproto_prepare_select(struct obuf *buf, struct obuf_svp *svp)
 {
-	return iproto_prepare_header(buf, svp, IPROTO_SELECT_HEADER_LEN);
+	iproto_prepare_header(buf, svp, IPROTO_SELECT_HEADER_LEN);
 }
 
 /**
@@ -758,43 +845,38 @@ iproto_prepare_select(struct obuf *buf, struct obuf_svp *svp)
  * code readability.
  * @param buf Out buffer.
  * @param svp Savepoint of the header beginning.
- *
- * @retval  0 Success.
- * @retval -1 Memory error.
  */
-static inline int
+static inline void
 iproto_prepare_select_with_position(struct obuf *buf, struct obuf_svp *svp)
 {
-	return iproto_prepare_select(buf, svp);
+	iproto_prepare_select(buf, svp);
 }
 
 /**
  * Write select header to a preallocated buffer.
- * This function doesn't throw (and we rely on this in iproto.cc).
  */
 void
 iproto_reply_select(struct obuf *buf, struct obuf_svp *svp, uint64_t sync,
-		    uint64_t schema_version, uint32_t count);
+		    uint64_t schema_version, uint32_t count,
+		    bool box_tuple_as_ext);
 
 /**
  * Write extended select header to a preallocated buffer.
  */
-int
+void
 iproto_reply_select_with_position(struct obuf *buf, struct obuf_svp *svp,
 				  uint64_t sync, uint32_t schema_version,
 				  uint32_t count, const char *packed_pos,
-				  const char *packed_pos_end);
+				  const char *packed_pos_end,
+				  bool box_tuple_as_ext);
 
 /**
  * Encode iproto header with IPROTO_OK response code.
  * @param out Encode to.
  * @param sync Request sync.
  * @param schema_version.
- *
- * @retval  0 Success.
- * @retval -1 Memory error.
  */
-int
+void
 iproto_reply_ok(struct obuf *out, uint64_t sync, uint64_t schema_version);
 
 /**
@@ -804,11 +886,8 @@ iproto_reply_ok(struct obuf *out, uint64_t sync, uint64_t schema_version);
  * @param auth_type Authentication type.
  * @param sync Request sync.
  * @param schema_version.
- *
- * @retval  0 Success.
- * @retval -1 Memory error.
  */
-int
+void
 iproto_reply_id(struct obuf *out, const char *auth_type,
 		uint64_t sync, uint64_t schema_version);
 
@@ -819,11 +898,8 @@ iproto_reply_id(struct obuf *out, const char *auth_type,
  * @param vclock Vclock to encode.
  * @param sync Request sync.
  * @param schema_version.
- *
- * @retval  0 Success.
- * @retval -1 Memory error.
  */
-int
+void
 iproto_reply_vclock(struct obuf *out, const struct vclock *vclock,
 		    uint64_t sync, uint64_t schema_version);
 
@@ -833,24 +909,20 @@ iproto_reply_vclock(struct obuf *out, const struct vclock *vclock,
  * @param ballot Ballot to encode.
  * @param sync Request sync.
  * @param schema_version Actual schema version.
- *
- * @retval  0 Success.
- * @retval -1 Memory error.
  */
-int
+void
 iproto_reply_vote(struct obuf *out, const struct ballot *ballot,
 		  uint64_t sync, uint64_t schema_version);
 
-/**
- * Write an error packet int output buffer. Doesn't throw if out
- * of memory
- */
-int
+/** Write an error packet int output buffer. */
+void
 iproto_reply_error(struct obuf *out, const struct error *e, uint64_t sync,
 		   uint64_t schema_version);
 
 /** EXECUTE/PREPARE request. */
 struct sql_request {
+	/** True for EXECUTE, false for PREPARE. */
+	bool execute;
 	/** SQL statement text. */
 	const char *sql_text;
 	/** MessagePack array of parameters. */
@@ -864,7 +936,7 @@ struct sql_request {
  * @param row Encoded data.
  * @param[out] request Request to decode to.
  *
- * @retval  0 Sucess.
+ * @retval  0 Success.
  * @retval -1 Format or memory error.
  */
 int
@@ -901,11 +973,8 @@ iproto_reply_chunk(struct obuf *buf, struct obuf_svp *svp, uint64_t sync,
  * @param key_len Length of the notification key name.
  * @param data Notification data (MsgPack).
  * @param data_end End of notification data.
- *
- * @retval  0 Success.
- * @retval -1 Memory error.
  */
-int
+void
 iproto_send_event(struct obuf *out, uint64_t sync,
 		  const char *key, size_t key_len,
 		  const char *data, const char *data_end);
@@ -1005,6 +1074,10 @@ struct begin_request {
 	 * Must be ono of enum txn_isolation_level values.
 	 */
 	uint32_t txn_isolation;
+	/**
+	 * is_sync that determines the synchronism of transactions.
+	 */
+	bool is_sync;
 };
 
 /**
@@ -1012,11 +1085,33 @@ struct begin_request {
  * @param row Encoded data.
  * @param[out] request Request to decode to.
  *
- * @retval  0 Sucess.
+ * @retval  0 Success.
  * @retval -1 Format error.
  */
 int
 xrow_decode_begin(const struct xrow_header *row, struct begin_request *request);
+
+/**
+ * COMMIT request.
+ */
+struct commit_request {
+	/**
+	 * is_sync that determines the synchronism of transactions.
+	 */
+	bool is_sync;
+};
+
+/**
+ * Parse the COMMIT request.
+ * @param row Encoded data.
+ * @param[out] request Request to decode to.
+ *
+ * @retval  0 Success.
+ * @retval -1 Format error.
+ */
+int
+xrow_decode_commit(const struct xrow_header *row,
+		   struct commit_request *request);
 
 /**
  * Update vclock with the next LSN value for given replica id.
@@ -1052,12 +1147,12 @@ vclock_follow_xrow(struct vclock* vclock, const struct xrow_header *row)
 #if defined(__cplusplus)
 } /* extern "C" */
 
-/** @copydoc xrow_header_decode. */
+/** @copydoc xrow_decode. */
 static inline void
-xrow_header_decode_xc(struct xrow_header *header, const char **pos,
-		      const char *end, bool end_is_exact)
+xrow_decode_xc(struct xrow_header *header, const char **pos,
+	       const char *end, bool end_is_exact)
 {
-	if (xrow_header_decode(header, pos, end, end_is_exact) < 0)
+	if (xrow_decode(header, pos, end, end_is_exact) < 0)
 		diag_raise();
 }
 
@@ -1147,6 +1242,15 @@ xrow_decode_join_xc(const struct xrow_header *row, struct join_request *req)
 		diag_raise();
 }
 
+/** @copydoc xrow_decode_fetch_snapshot. */
+static inline void
+xrow_decode_fetch_snapshot_xc(const struct xrow_header *row,
+			      struct fetch_snapshot_request *req)
+{
+	if (xrow_decode_fetch_snapshot(row, req) != 0)
+		diag_raise();
+}
+
 /** @copydoc xrow_decode_register. */
 static inline void
 xrow_decode_register_xc(const struct xrow_header *row,
@@ -1174,11 +1278,12 @@ xrow_decode_relay_heartbeat_xc(const struct xrow_header *row,
 		diag_raise();
 }
 
-/** @copydoc xrow_decode_vclock. */
+/** @copydoc xrow_decode_vclock_ignore0. */
 static inline void
-xrow_decode_vclock_xc(const struct xrow_header *row, struct vclock *vclock)
+xrow_decode_vclock_ignore0_xc(const struct xrow_header *row,
+			      struct vclock *vclock)
 {
-	if (xrow_decode_vclock(row, vclock) != 0)
+	if (xrow_decode_vclock_ignore0(row, vclock) != 0)
 		diag_raise();
 }
 
@@ -1188,41 +1293,6 @@ xrow_decode_subscribe_response_xc(const struct xrow_header *row,
 				  struct subscribe_response *rsp)
 {
 	if (xrow_decode_subscribe_response(row, rsp) != 0)
-		diag_raise();
-}
-
-/** @copydoc iproto_reply_ok. */
-static inline void
-iproto_reply_ok_xc(struct obuf *out, uint64_t sync, uint64_t schema_version)
-{
-	if (iproto_reply_ok(out, sync, schema_version) != 0)
-		diag_raise();
-}
-
-/** @copydoc iproto_reply_id. */
-static inline void
-iproto_reply_id_xc(struct obuf *out, const char *auth_type,
-		   uint64_t sync, uint64_t schema_version)
-{
-	if (iproto_reply_id(out, auth_type, sync, schema_version) != 0)
-		diag_raise();
-}
-
-/** @copydoc iproto_reply_vclock. */
-static inline void
-iproto_reply_vclock_xc(struct obuf *out, const struct vclock *vclock,
-		       uint64_t sync, uint64_t schema_version)
-{
-	if (iproto_reply_vclock(out, vclock, sync, schema_version) != 0)
-		diag_raise();
-}
-
-/** @copydoc iproto_reply_vote. */
-static inline void
-iproto_reply_vote_xc(struct obuf *out, const struct ballot *ballot,
-		       uint64_t sync, uint64_t schema_version)
-{
-	if (iproto_reply_vote(out, ballot, sync, schema_version) != 0)
 		diag_raise();
 }
 

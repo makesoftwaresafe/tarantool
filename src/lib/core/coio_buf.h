@@ -46,11 +46,11 @@ struct iostream;
 static inline ssize_t
 coio_bread(struct iostream *io, struct ibuf *buf, size_t sz)
 {
-	ibuf_reserve_xc(buf, sz);
+	xibuf_reserve(buf, sz);
 	ssize_t n = coio_read_ahead(io, buf->wpos, sz, ibuf_unused(buf));
 	if (n < 0)
 		diag_raise();
-	buf->wpos += n;
+	VERIFY(ibuf_alloc(buf, n) != NULL);
 	return n;
 }
 
@@ -63,12 +63,12 @@ static inline ssize_t
 coio_bread_timeout(struct iostream *io, struct ibuf *buf, size_t sz,
 		   ev_tstamp timeout)
 {
-	ibuf_reserve_xc(buf, sz);
+	xibuf_reserve(buf, sz);
 	ssize_t n = coio_read_ahead_timeout(io, buf->wpos, sz, ibuf_unused(buf),
 			                    timeout);
 	if (n < 0)
 		diag_raise();
-	buf->wpos += n;
+	VERIFY(ibuf_alloc(buf, n) != NULL);
 	return n;
 }
 
@@ -76,11 +76,11 @@ coio_bread_timeout(struct iostream *io, struct ibuf *buf, size_t sz,
 static inline ssize_t
 coio_breadn(struct iostream *io, struct ibuf *buf, size_t sz)
 {
-	ibuf_reserve_xc(buf, sz);
+	xibuf_reserve(buf, sz);
 	ssize_t n = coio_readn_ahead(io, buf->wpos, sz, ibuf_unused(buf));
 	if (n < 0)
 		diag_raise();
-	buf->wpos += n;
+	VERIFY(ibuf_alloc(buf, n) != NULL);
 	return n;
 }
 
@@ -94,12 +94,12 @@ static inline ssize_t
 coio_breadn_timeout(struct iostream *io, struct ibuf *buf, size_t sz,
 		    ev_tstamp timeout)
 {
-	ibuf_reserve_xc(buf, sz);
+	xibuf_reserve(buf, sz);
 	ssize_t n = coio_readn_ahead_timeout(io, buf->wpos, sz, ibuf_unused(buf),
 			                     timeout);
 	if (n < 0)
 		diag_raise();
-	buf->wpos += n;
+	VERIFY(ibuf_alloc(buf, n) != NULL);
 	return n;
 }
 

@@ -24,11 +24,11 @@ for k = 1, box.schema.FORMAT_ID_MAX, 1 do
     table.insert(spaces, s)
 end;
 ---
-- error: 'Tuple format limit reached: 65536'
+- error: 'Tuple format limit reached: 65535'
 ...
-#spaces;
+#spaces > 65000;
 ---
-- 65499
+- true
 ...
 -- cleanup
 for k, v in pairs(spaces) do

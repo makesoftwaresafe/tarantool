@@ -1,3 +1,5 @@
+include(cmake/utils.cmake)
+
 #
 # Check if the same compile family is used for both C and CXX
 #
@@ -64,18 +66,6 @@ if((NOT HAVE_STD_C11 AND NOT HAVE_STD_GNU99) OR
         "${CMAKE_CXX_COMPILER} should support -std=c++11 or -std=gnu++0x. "
         "Please consider upgrade to gcc 4.5+ or clang 3.2+.")
 endif()
-
-#
-# Check for an omp support
-#
-set(CMAKE_REQUIRED_FLAGS "-fopenmp -Werror")
-check_cxx_source_compiles("int main(void) {
-#pragma omp parallel
-    {
-    }
-    return 0;
-}" HAVE_OPENMP)
-set(CMAKE_REQUIRED_FLAGS "")
 
 #
 # GCC started to warn for unused result starting from 4.2, and
@@ -146,8 +136,9 @@ check_c_source_compiles(
 set(ENABLE_BACKTRACE_DEFAULT OFF)
 # Disabled backtraces support on FreeBSD by default, because of
 # gh-4278.
-if(NOT TARGET_OS_FREEBSD AND HAVE_FORCE_ALIGN_ARG_POINTER_ATTR
-    AND HAVE_CFI_ASM)
+# Disabled backtraces support on AArch64 Linux by default, because of gh-8791.
+if(NOT TARGET_OS_FREEBSD AND HAVE_FORCE_ALIGN_ARG_POINTER_ATTR AND HAVE_CFI_ASM
+        AND NOT (TARGET_OS_LINUX AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64"))
     set(ENABLE_BACKTRACE_DEFAULT ON)
 endif()
 
@@ -164,10 +155,10 @@ endif()
 option(ENABLE_BUNDLED_LIBUNWIND "Bundled libunwind will be built"
        ${ENABLE_BUNDLED_LIBUNWIND_DEFAULT})
 
-# On macOS there is no '-static-libstdc++' flag and it's use will
-# raise following error:
-# error: argument unused during compilation: '-static-libstdc++'
-if(BUILD_STATIC AND NOT TARGET_OS_DARWIN)
+# In Clang there is no '-static-libstdc++' flag and its use will raise
+# the following error:
+#     clang: error: argument unused during compilation: '-static-libstdc++'
+if(BUILD_STATIC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     # Static linking for c++ routines
     add_compile_flags("C;CXX" "-static-libstdc++")
 endif()
@@ -192,8 +183,10 @@ endif()
 
 add_compile_flags("C;CXX" "-fno-common")
 
-if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-# Remove VALGRIND code and assertions in *any* type of release build.
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_definitions("-Wp,-U_FORTIFY_SOURCE")
+else()
+    # Remove VALGRIND code and assertions in *any* type of release build.
     add_definitions("-DNDEBUG" "-DNVALGRIND")
 endif()
 
@@ -231,51 +224,53 @@ macro(enable_tnt_compile_flags)
     endif()
 
     if (ENABLE_UB_SANITIZER)
-        if (NOT CMAKE_COMPILER_IS_CLANG)
-            message(FATAL_ERROR "Undefined behaviour sanitizer only available for clang")
-        else()
-            string(JOIN "," SANITIZE_FLAGS
-                alignment bool bounds builtin enum float-cast-overflow
-                float-divide-by-zero function integer-divide-by-zero return
-                shift unreachable vla-bound
-            )
-
-            # Exclude "object-size".
+        # UndefinedBehaviourSanitizer has been added to GCC since
+        # version 4.9.0, see https://gcc.gnu.org/gcc-4.9/changes.html.
+        if(CMAKE_COMPILER_IS_GNUCC AND
+            CMAKE_C_COMPILER_VERSION VERSION_LESS 4.9.0)
+            message(FATAL_ERROR "UndefinedBehaviourSanitizer is unsupported in GCC ${CMAKE_C_COMPILER_VERSION}")
+        endif()
+        # Use all needed checks from the UndefinedBehaviorSanitizer
+        # documentation:
+        # https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html.
+        string(JOIN "," UBSAN_IGNORE_OPTIONS
             # Gives compilation warnings when -O0 is used, which is always,
             # because some tests build with -O0.
-
-            # Exclude "pointer-overflow".
-            # Stailq data structure subtracts a positive value from NULL.
-
-            # Exclude "vptr".
-            # Intrusive data structures may abuse '&obj->member' on pointer
-            # 'obj' which is not really a pointer at an object of its type.
-            # For example, rlist uses '&item->member' expression in macro cycles
-            # to check end of cycle, but on the last iteration 'item' points at
-            # the list metadata head, not at an object of type stored in this
-            # list.
-
-            # Exclude "implicit-signed-integer-truncation",
-            # "implicit-integer-sign-change", "signed-integer-overflow".
-            # Integer overflow and truncation are disabled due to extensive
-            # usage of this UB in SQL code to 'implement' some kind of int65_t.
-
-            # Exclude "null", "nonnull-attribute", "nullability-arg",
-            # "returns-nonnull-attribute", "nullability-assign",
-            # "nullability-return".
+            object-size
+            # See https://github.com/tarantool/tarantool/issues/10742.
+            pointer-overflow
             # NULL checking is disabled, because this is not a UB and raises
             # lots of false-positive fails such as typeof(*obj) with
-            # obj == NULL, or memcpy() with NULL argument and 0 size. All
-            # nullability sanitations are disabled, because from the tests it
-            # seems they implicitly turn each other on, when one is used. For
-            # example, having "returns-nonnull-attribute" may lead to fail in
-            # the typeof(*obj) when obj is NULL, even though there is nothing
-            # related to return.
-
-            set(SANITIZE_FLAGS "-fsanitize=${SANITIZE_FLAGS} -fno-sanitize-recover=${SANITIZE_FLAGS}")
-
-            add_compile_flags("C;CXX" "${SANITIZE_FLAGS}")
+            # obj == NULL, or memcpy() with NULL argument and 0 size.
+            # "UBSan: check null is globally suppressed",
+            # https://github.com/tarantool/tarantool/issues/10741
+            null
+            # "UBSan: check nonnull-attribute is globally suppressed",
+            # https://github.com/tarantool/tarantool/issues/10740
+            nonnull-attribute
+        )
+        # GCC has no "function" UB check. See details here:
+        # https://gcc.gnu.org/onlinedocs/gcc/Instrumentation-Options.html#index-fsanitize_003dundefined
+        if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU")
+            string(JOIN "," UBSAN_IGNORE_OPTIONS
+                ${UBSAN_IGNORE_OPTIONS}
+                # Not interested in function type mismatch errors.
+                function
+            )
         endif()
+        # XXX: To get nicer stack traces in error messages.
+        set(SANITIZE_FLAGS "${SANITIZE_FLAGS} -fno-omit-frame-pointer")
+        # Enable UndefinedBehaviorSanitizer support.
+        # This flag enables all supported options (the documentation
+        # on site is not correct about that moment, unfortunately)
+        # except float-divide-by-zero. Floating point division by zero
+        # behaviour is defined without -ffast-math and uses the
+        # IEEE 754 standard on which all NaN tagging is based.
+        set(SANITIZE_FLAGS "${SANITIZE_FLAGS} -fsanitize=undefined")
+        set(SANITIZE_FLAGS "${SANITIZE_FLAGS} -fno-sanitize=${UBSAN_IGNORE_OPTIONS}")
+        # Print a verbose error report and exit the program.
+        set(SANITIZE_FLAGS "${SANITIZE_FLAGS} -fno-sanitize-recover=undefined")
+        add_compile_flags("C;CXX" "${SANITIZE_FLAGS}")
     endif()
 
     if (CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_GNUCXX)
@@ -321,10 +316,6 @@ macro(enable_tnt_compile_flags)
         add_compile_flags("C;CXX" "-Werror")
     endif()
 endmacro(enable_tnt_compile_flags)
-
-if (HAVE_OPENMP)
-    add_compile_flags("C;CXX" "-fopenmp")
-endif()
 
 if (CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_GNUCC)
     set(HAVE_BUILTIN_CTZ 1)

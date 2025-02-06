@@ -12,7 +12,10 @@
 
 uint64_t schema_version;
 uint32_t space_cache_version;
-struct space *space_by_id(uint32_t id) { return NULL; }
+uint32_t prev_space_cache_version;
+struct space *prev_space;
+struct space *
+space_by_id_slow(uint32_t id) { return NULL; }
 struct vy_lsm *vy_lsm(struct index *index) { return NULL; }
 void index_delete(struct index *index) { unreachable(); }
 
@@ -91,24 +94,25 @@ test_basic()
 
 	struct index_opts index_opts = index_opts_default;
 	struct index_def *index_def =
-		index_def_new(512, 0, "primary", sizeof("primary") - 1, TREE,
+		index_def_new(512, 0, "primary", sizeof("primary") - 1,
+			      NULL, NULL, TREE,
 			      &index_opts, key_def, NULL);
 
 	struct vy_lsm *pk = vy_lsm_new(&lsm_env, &cache_env, &mem_env,
 				       index_def, format, NULL, 0);
-	isnt(pk, NULL, "lsm is not NULL")
+	isnt(pk, NULL, "lsm is not NULL");
 
 	struct vy_range *range = vy_range_new(1, vy_entry_none(),
 					      vy_entry_none(), pk->cmp_def);
 
-	isnt(pk, NULL, "range is not NULL")
+	isnt(pk, NULL, "range is not NULL");
 	vy_lsm_add_range(pk, range);
 
 	struct rlist read_views = RLIST_HEAD_INITIALIZER(read_views);
 
 	char dir_tmpl[] = "./vy_point_test.XXXXXX";
 	char *dir_name = mkdtemp(dir_tmpl);
-	isnt(dir_name, NULL, "temp dir name is not NULL")
+	isnt(dir_name, NULL, "temp dir name is not NULL");
 	char path[PATH_MAX];
 	strcpy(path, dir_name);
 	strcat(path, "/512");

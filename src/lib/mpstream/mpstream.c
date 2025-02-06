@@ -19,25 +19,21 @@
 #include "mp_interval.h"
 
 void
-mpstream_reserve_slow(struct mpstream *stream, size_t size)
+mpstream_panic_cb(void *error_ctx)
 {
-	stream->alloc(stream->ctx, stream->pos - stream->buf);
-	stream->buf = stream->reserve(stream->ctx, &size);
-	if (stream->buf == NULL) {
-		diag_set(OutOfMemory, size, "mpstream", "reserve");
-		stream->error(stream->error_ctx);
-	}
-	stream->pos = stream->buf;
-	stream->end = stream->pos + size;
+	(void)error_ctx;
+	diag_log();
+	panic("Out of memory");
 }
 
 void
-mpstream_reset(struct mpstream *stream)
+mpstream_reserve_slow(struct mpstream *stream, size_t size)
 {
-	size_t size = 0;
+	if (stream->pos != stream->buf)
+		stream->alloc(stream->ctx, stream->pos - stream->buf);
 	stream->buf = stream->reserve(stream->ctx, &size);
 	if (stream->buf == NULL) {
-		diag_set(OutOfMemory, size, "mpstream", "reset");
+		diag_set(OutOfMemory, size, "mpstream", "reserve");
 		stream->error(stream->error_ctx);
 	}
 	stream->pos = stream->buf;
@@ -58,7 +54,9 @@ mpstream_init(struct mpstream *stream, void *ctx,
 	stream->alloc = alloc;
 	stream->error = error;
 	stream->error_ctx = error_ctx;
-	mpstream_reset(stream);
+	stream->buf = NULL;
+	stream->pos = NULL;
+	stream->end = NULL;
 }
 
 void

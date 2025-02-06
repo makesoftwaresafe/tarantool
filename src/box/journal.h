@@ -180,10 +180,6 @@ struct journal {
 	/** Asynchronous write */
 	int (*write_async)(struct journal *journal,
 			   struct journal_entry *entry);
-
-	/** Synchronous write */
-	int (*write)(struct journal *journal,
-		     struct journal_entry *entry);
 };
 
 /** Wake the journal queue up. */
@@ -263,19 +259,9 @@ journal_async_complete(struct journal_entry *entry)
  */
 extern struct journal *current_journal;
 
-/**
- * Write a single entry to the journal in synchronous way.
- *
- * @return 0 if write was processed by a backend or -1 in case of an error.
- */
-static inline int
-journal_write(struct journal_entry *entry)
-{
-	journal_queue_flush();
-	journal_queue_on_append(entry);
-
-	return current_journal->write(current_journal, entry);
-}
+/** Write a single row in a blocking way. */
+int
+journal_write_row(struct xrow_header *row);
 
 /**
  * Queue a single entry to the journal in asynchronous way.
@@ -283,12 +269,30 @@ journal_write(struct journal_entry *entry)
  * @return 0 if write was queued to a backend or -1 in case of an error.
  */
 static inline int
-journal_write_try_async(struct journal_entry *entry)
+journal_write_submit(struct journal_entry *entry)
 {
 	journal_queue_wait();
+	/*
+	 * We cannot account entry after write. If journal is synchronous
+	 * the journal_queue_on_complete() is called in write_async().
+	 */
 	journal_queue_on_append(entry);
+	if (current_journal->write_async(current_journal, entry) != 0) {
+		journal_queue_on_complete(entry);
+		return -1;
+	}
+	return 0;
+}
 
-	return current_journal->write_async(current_journal, entry);
+/** Write a single entry to the journal in synchronous way. */
+static inline int
+journal_write(struct journal_entry *entry)
+{
+	if (journal_write_submit(entry) != 0)
+		return -1;
+	while (!entry->is_complete)
+		fiber_yield();
+	return 0;
 }
 
 /**
@@ -321,18 +325,15 @@ journal_set(struct journal *new_journal)
 static inline void
 journal_create(struct journal *journal,
 	       int (*write_async)(struct journal *journal,
-				  struct journal_entry *entry),
-	       int (*write)(struct journal *journal,
-			    struct journal_entry *entry))
+				  struct journal_entry *entry))
 {
-	journal->write_async	= write_async;
-	journal->write		= write;
+	journal->write_async = write_async;
 }
 
 static inline bool
 journal_is_initialized(struct journal *journal)
 {
-	return journal->write != NULL;
+	return journal->write_async != NULL;
 }
 
 #if defined(__cplusplus)

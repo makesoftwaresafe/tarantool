@@ -1,16 +1,13 @@
+local fio = require('fio')
 local t = require('luatest')
 local g = t.group('gh-8445')
 
-g.before_all(function(cg)
-    -- TODO(gh-8572)
-    t.skip_if(jit.arch == 'arm64' and jit.os == 'Linux',
-              'Disabled on AArch64 Linux due to #8572')
-    local server = require('luatest.server')
-    cg.server = server:new({alias = 'gh-8445'})
+g.before_each(function(cg)
+    cg.tempdir = fio.tempdir()
 end)
 
-g.after_all(function(cg)
-    cg.server:drop()
+g.after_each(function(cg)
+    fio.rmtree(cg.tempdir)
 end)
 
 -- Check that forked Tarantool doesn't crash when preparing a crash report.
@@ -20,11 +17,16 @@ g.test_crash_during_crash_report = function(cg)
 
     -- Use `cd' and `shell = true' due to lack of cwd option in popen (gh-5633).
     local exe = arg[-1]
-    local dir = cg.server.workdir
-    local cmd = [[
-        cd %s && %s -e "box.cfg{} require('log').info('pid = ' .. box.info.pid)"
+    local dir = cg.tempdir
+    local script = [[
+        local tweaks = require('internal.tweaks')
+        local log = require('log')
+        box.cfg{}
+        tweaks.crash_produce_coredump = false
+        log.info('pid = ' .. box.info.pid)
     ]]
-    local ph = popen.new({string.format(cmd, dir, exe)},
+    local ph = popen.new({string.format('cd %s && %s -e "%s"',
+                                         dir, exe, script)},
                          {stdout = popen.opts.DEVNULL,
                           stderr = popen.opts.PIPE, shell = true})
     t.assert(ph)

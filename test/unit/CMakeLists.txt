@@ -1,3 +1,5 @@
+set(TEST_SUITE_PREFIX "test/unit")
+
 add_compile_flags("C;CXX" "-Wno-unused" "-Wno-unused-result")
 if(CC_HAS_WNO_TAUTOLOGICAL_COMPARE)
     add_compile_flags("C;CXX" "-Wno-tautological-compare")
@@ -18,20 +20,66 @@ include_directories(${CURL_INCLUDE_DIRS})
 
 include_directories(${EXTRA_CORE_INCLUDE_DIRS})
 
+set(TEST_SUITE_NAME "tarantool-unit")
+
+# XXX: The call produces both test and target
+# <${TEST_SUITE_NAME}.test-deps> as a side effect.
+_add_test_suite_target(${TEST_SUITE_NAME}
+  LABELS ${TEST_SUITE_NAME}
+  DEPENDS ${UNIT_TEST_TARGETS}
+)
+
 include(CMakeParseArguments)
+message(STATUS "Add test suite ${TEST_SUITE_NAME}")
 
 function(create_unit_test)
   cmake_parse_arguments(
     UNIT
     ""
     "PREFIX"
-    "SOURCES;LIBRARIES"
+    "SOURCES;LIBRARIES;COMPILE_DEFINITIONS"
     ${ARGN}
   )
-  message(STATUS "Creating unit test ${UNIT_PREFIX}.test")
   add_executable(${UNIT_PREFIX}.test ${UNIT_SOURCES})
+  target_compile_definitions(${UNIT_PREFIX}.test PRIVATE ${UNIT_COMPILE_DEFINITIONS})
   target_link_libraries(${UNIT_PREFIX}.test ${UNIT_LIBRARIES})
+  add_dependencies(${TEST_SUITE_NAME}-deps ${UNIT_PREFIX}.test)
   set(UNIT_TEST_TARGETS "${UNIT_TEST_TARGETS} ${UNIT_PREFIX}.test" PARENT_SCOPE)
+  # Every unit test is a self-contained program without
+  # dependencies that does not require a special test environment.
+  # Historically unit tests are running using test-run.py because
+  # some Tarantool unit tests produce a TAP output that is not
+  # actually a TAP-compliant and test-run.py cannot parse output
+  # from these tests. That's why we maintain .result files for
+  # unit tests and use diff-based approach here: it is needed
+  # a special tool for comparing actual test output and expected
+  # test output saved to .result file.
+  # However it is not required to have a special tools for running
+  # TAP-compliant tests and CTest is more than enough.
+  # There is an open issue for fixing such unit tests and make
+  # output TAP-compliant,
+  # see https://github.com/tarantool/tarantool/issues/5000.
+  set(result_file ${CMAKE_CURRENT_SOURCE_DIR}/${UNIT_PREFIX}.result)
+  set(test_path ${CMAKE_CURRENT_BINARY_DIR}/${UNIT_PREFIX}.test)
+  if (EXISTS "${result_file}")
+    set(test_command ${PROJECT_SOURCE_DIR}/test/test-run.py
+                     --builddir=${PROJECT_BINARY_DIR}
+                     # Print TAP13 test output.
+                     --verbose
+                     --jobs -1
+                     --vardir ${VARDIR}/${UNIT_PREFIX}
+                     unit/${UNIT_PREFIX}.test)
+  else()
+    set(test_command ${test_path})
+  endif()
+  set(test_title ${TEST_SUITE_PREFIX}/${UNIT_PREFIX}.test)
+  add_test(NAME ${test_title}
+           COMMAND ${test_command})
+  set_tests_properties(${test_title} PROPERTIES
+    LABELS ${TEST_SUITE_NAME}
+    DEPENDS ${TEST_SUITE_NAME}-deps
+    FAIL_REGULAR_EXPRESSION "${CTEST_FAIL_REGEXP}"
+  )
 endfunction()
 
 add_library(unit STATIC unit.c)
@@ -82,7 +130,7 @@ create_unit_test(PREFIX rope_avl
 )
 create_unit_test(PREFIX rope_stress
                  SOURCES rope_stress.c
-                 LIBRARIES salad
+                 LIBRARIES salad unit
 )
 create_unit_test(PREFIX rope
                  SOURCES rope.c
@@ -130,7 +178,7 @@ create_unit_test(PREFIX datetime
 )
 create_unit_test(PREFIX error
                  SOURCES error.c core_test_utils.c
-                 LIBRARIES unit core box_error
+                 LIBRARIES unit core tuple box_error
 )
 create_unit_test(PREFIX interval
                  SOURCES interval.c core_test_utils.c
@@ -138,15 +186,58 @@ create_unit_test(PREFIX interval
 )
 create_unit_test(PREFIX bps_tree
                  SOURCES bps_tree.cc
-                 LIBRARIES small misc
+                 LIBRARIES unit small misc
+                 COMPILE_DEFINITIONS TEST_DEFAULT
+)
+create_unit_test(PREFIX bps_tree_inner_card
+                 SOURCES bps_tree.cc
+                 LIBRARIES unit small misc
+                 COMPILE_DEFINITIONS TEST_INNER_CARD
+)
+create_unit_test(PREFIX bps_tree_inner_child_cards
+                 SOURCES bps_tree.cc
+                 LIBRARIES unit small misc
+                 COMPILE_DEFINITIONS TEST_INNER_CHILD_CARDS
 )
 create_unit_test(PREFIX bps_tree_iterator
                  SOURCES bps_tree_iterator.cc
-                 LIBRARIES small misc
+                 LIBRARIES unit small misc
+                 COMPILE_DEFINITIONS TEST_DEFAULT
+)
+create_unit_test(PREFIX bps_tree_iterator_inner_card
+                 SOURCES bps_tree_iterator.cc
+                 LIBRARIES unit small misc
+                 COMPILE_DEFINITIONS TEST_INNER_CARD
+)
+create_unit_test(PREFIX bps_tree_iterator_inner_child_cards
+                 SOURCES bps_tree_iterator.cc
+                 LIBRARIES unit small misc
+                 COMPILE_DEFINITIONS TEST_INNER_CHILD_CARDS
 )
 create_unit_test(PREFIX bps_tree_view
                  SOURCES bps_tree_view.c
                  LIBRARIES small unit
+                 COMPILE_DEFINITIONS TEST_DEFAULT
+)
+create_unit_test(PREFIX bps_tree_view_inner_card
+                 SOURCES bps_tree_view.c
+                 LIBRARIES small unit
+                 COMPILE_DEFINITIONS TEST_INNER_CARD
+)
+create_unit_test(PREFIX bps_tree_view_inner_child_cards
+                 SOURCES bps_tree_view.c
+                 LIBRARIES small unit
+                 COMPILE_DEFINITIONS TEST_INNER_CHILD_CARDS
+)
+create_unit_test(PREFIX bps_tree_offset_api_inner_card
+                 SOURCES bps_tree_offset_api.cc
+                 LIBRARIES small unit
+                 COMPILE_DEFINITIONS TEST_INNER_CARD
+)
+create_unit_test(PREFIX bps_tree_offset_api_inner_child_cards
+                 SOURCES bps_tree_offset_api.cc
+                 LIBRARIES small unit
+                 COMPILE_DEFINITIONS TEST_INNER_CHILD_CARDS
 )
 create_unit_test(PREFIX rtree
                  SOURCES rtree.cc
@@ -161,8 +252,8 @@ create_unit_test(PREFIX rtree_multidim
                  LIBRARIES salad small
 )
 create_unit_test(PREFIX light
-                 SOURCES light.cc
-                 LIBRARIES small
+                 SOURCES light.cc core_test_utils.c
+                 LIBRARIES core small
 )
 create_unit_test(PREFIX light_view
                  SOURCES light_view.c
@@ -173,8 +264,8 @@ create_unit_test(PREFIX bloom
                  LIBRARIES salad
 )
 create_unit_test(PREFIX vclock
-                 SOURCES vclock.cc
-                 LIBRARIES vclock unit
+                 SOURCES vclock.cc core_test_utils.c
+                 LIBRARIES vclock xrow unit
 )
 create_unit_test(PREFIX xrow
                  SOURCES xrow.cc core_test_utils.c
@@ -248,27 +339,23 @@ create_unit_test(PREFIX fiber_channel_stress
 
 create_unit_test(PREFIX cbus_stress
                  SOURCES cbus_stress.c core_test_utils.c
-                 LIBRARIES core stat
+                 LIBRARIES core
 )
 
 create_unit_test(PREFIX cbus
                  SOURCES cbus.c core_test_utils.c
-                 LIBRARIES core unit stat
+                 LIBRARIES core unit
+)
+
+create_unit_test(PREFIX tnt_thread
+                 SOURCES tnt_thread.c core_test_utils.c
+                 LIBRARIES core unit
 )
 
 create_unit_test(PREFIX cbus_call
                  SOURCES cbus_call.c core_test_utils.c
-                 LIBRARIES core unit stat
+                 LIBRARIES core unit
 )
-
-include(CheckSymbolExists)
-check_symbol_exists(__GLIBC__ features.h GLIBC_USED)
-if (GLIBC_USED)
-    create_unit_test(PREFIX cbus_hang
-                     SOURCES cbus_hang.c core_test_utils.c
-                     LIBRARIES core unit stat
-    )
-endif ()
 
 create_unit_test(PREFIX coio
                  SOURCES coio.cc core_test_utils.c
@@ -339,12 +426,12 @@ create_unit_test(PREFIX http_parser
 
 create_unit_test(PREFIX rmean
                  SOURCES rmean.cc core_test_utils.c
-                 LIBRARIES stat unit
+                 LIBRARIES core unit
 )
 
 create_unit_test(PREFIX histogram
                  SOURCES histogram.c core_test_utils.c
-                 LIBRARIES stat unit
+                 LIBRARIES core unit
 )
 
 create_unit_test(PREFIX ratelimit
@@ -480,13 +567,15 @@ create_unit_test(PREFIX swim_proto
                  LIBRARIES unit fakesys swim
 )
 
-if(NOT ${CMAKE_BUILD_TYPE} EQUAL "Release")
-    create_unit_test(PREFIX swim_errinj
-                     SOURCES swim_errinj.c swim_test_transport.c swim_test_ev.c
-                             swim_test_utils.c ${PROJECT_SOURCE_DIR}/src/version.c
-                             core_test_utils.c
-                     LIBRARIES unit fakesys swim
-    )
+create_unit_test(PREFIX swim_errinj
+                 SOURCES swim_errinj.c swim_test_transport.c swim_test_ev.c
+                         swim_test_utils.c ${PROJECT_SOURCE_DIR}/src/version.c
+                         core_test_utils.c
+                 LIBRARIES unit fakesys swim
+)
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set_tests_properties(${TEST_SUITE_PREFIX}/swim_errinj.test
+                       PROPERTIES DISABLED True)
 endif()
 
 create_unit_test(PREFIX merger
@@ -498,6 +587,14 @@ create_unit_test(PREFIX snap_quorum_delay
                  SOURCES snap_quorum_delay.cc box_test_utils.c
                  LIBRARIES box core unit
 )
+# The commit 8c50e069e31
+# ("txn: remove TXN_IS_DONE check from txn_commit()") disables
+# snap_quorum_delay.test, which uses internal API of replication
+# and txn modules assuming the journal is initialized somewhere
+# inside. But now it is not, and it can't be fixed in a sane way
+# inside the test. It will be deleted/rewritten later.
+set_tests_properties(${TEST_SUITE_PREFIX}/snap_quorum_delay.test
+                     PROPERTIES DISABLED True)
 
 create_unit_test(PREFIX raft
                  SOURCES raft.c raft_test_utils.c core_test_utils.c
@@ -513,6 +610,9 @@ create_unit_test(PREFIX popen
                  LIBRARIES misc unit core
 )
 add_dependencies(popen.test popen-child)
+set_tests_properties(${TEST_SUITE_PREFIX}/popen.test PROPERTIES
+  ENVIRONMENT "BUILDDIR=${PROJECT_BINARY_DIR}"
+)
 
 create_unit_test(PREFIX serializer
                  SOURCES serializer.c box_test_utils.c
@@ -531,7 +631,7 @@ create_unit_test(PREFIX grp_alloc
 
 create_unit_test(PREFIX latch
                  SOURCES latch.c core_test_utils.c
-                 LIBRARIES core unit stat
+                 LIBRARIES core unit
 )
 
 create_unit_test(PREFIX memtx_allocator
@@ -554,13 +654,38 @@ create_unit_test(PREFIX qsort_arg
                  LIBRARIES misc unit
 )
 
+create_unit_test(PREFIX tt_sort
+                 SOURCES tt_sort.cc core_test_utils.c
+                 LIBRARIES unit core
+)
+
 create_unit_test(PREFIX iterator_position
                  SOURCES iterator_position.c box_test_utils.c
                  LIBRARIES unit box core
 )
 
 create_unit_test(PREFIX key_def
-                 SOURCES key_def.c box_test_utils.c
+                 SOURCES key_def.cc box_test_utils.c
+                 LIBRARIES unit box core
+)
+
+create_unit_test(PREFIX tuple_builder
+                 SOURCES tuple_builder.c box_test_utils.c
+                 LIBRARIES unit box core
+)
+
+create_unit_test(PREFIX tuple_format
+                 SOURCES tuple_format.c box_test_utils.c
+                 LIBRARIES unit box core
+)
+
+create_unit_test(PREFIX tuple_format_map
+                 SOURCES tuple_format_map.c box_test_utils.c
+                 LIBRARIES unit box core
+)
+
+create_unit_test(PREFIX mp_tuple
+                 SOURCES mp_tuple.c box_test_utils.c
                  LIBRARIES unit box core
 )
 
@@ -571,6 +696,15 @@ create_unit_test(PREFIX getenv_safe
 
 create_unit_test(PREFIX lua_utils
                  SOURCES lua_utils.c
+                 LIBRARIES unit core server
+                           ${LUAJIT_LIBRARIES}
+                           ${CURL_LIBRARIES}
+                           ${LIBYAML_LIBRARIES}
+                           ${READLINE_LIBRARIES}
+)
+
+create_unit_test(PREFIX lua_error
+                 SOURCES lua_error.c
                  LIBRARIES unit core server
                            ${LUAJIT_LIBRARIES}
                            ${CURL_LIBRARIES}
@@ -604,4 +738,34 @@ create_unit_test(PREFIX lua_tweaks
 create_unit_test(PREFIX node_name
                  SOURCES node_name.c core_test_utils.c
                  LIBRARIES core unit node_name
+)
+
+create_unit_test(PREFIX lua_func_adapter
+                 SOURCES lua_func_adapter.c box_test_utils.c
+                 LIBRARIES unit box server core misc
+                           ${CURL_LIBRARIES}
+                           ${LIBYAML_LIBRARIES}
+                           ${READLINE_LIBRARIES}
+                           ${ICU_LIBRARIES}
+                           ${LUAJIT_LIBRARIES}
+)
+
+create_unit_test(PREFIX event
+                 SOURCES event.c core_test_utils.c
+                 LIBRARIES core unit
+)
+
+create_unit_test(PREFIX port
+                 SOURCES port.cc box_test_utils.c
+                 LIBRARIES unit box server core misc
+                           ${CURL_LIBRARIES}
+                           ${LIBYAML_LIBRARIES}
+                           ${READLINE_LIBRARIES}
+                           ${ICU_LIBRARIES}
+                           ${LUAJIT_LIBRARIES}
+)
+
+create_unit_test(PREFIX func_adapter_func
+                 SOURCES func_adapter_func.c box_test_utils.c
+                 LIBRARIES box unit
 )

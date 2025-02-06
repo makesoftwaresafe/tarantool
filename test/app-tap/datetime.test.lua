@@ -4,9 +4,13 @@ local tap = require('tap')
 local test = tap.test('errno')
 local date = require('datetime')
 local ffi = require('ffi')
+local json = require('json')
+local msgpack = require('msgpack')
 local TZ = date.TZ
 
-test:plan(39)
+test:plan(43)
+
+local INT_MAX = 2147483647
 
 -- minimum supported date - -5879610-06-22
 local MIN_DATE_YEAR = -5879610
@@ -23,19 +27,25 @@ local MAX_DAY_RANGE = MAX_YEAR_RANGE * AVERAGE_DAYS_YEAR
 local MAX_HOUR_RANGE = MAX_DAY_RANGE * 24
 local MAX_MIN_RANGE = MAX_HOUR_RANGE * 60
 local MAX_SEC_RANGE = MAX_DAY_RANGE * SECS_PER_DAY
+local MAX_NSEC_RANGE = INT_MAX
+local MAX_USEC_RANGE = math.floor(MAX_NSEC_RANGE / 1e3)
+local MAX_MSEC_RANGE = math.floor(MAX_NSEC_RANGE / 1e6)
 
 local incompat_types = 'incompatible types for datetime comparison'
 local only_integer_ts = 'only integer values allowed in timestamp'..
                         ' if nsec, usec, or msecs provided'
+local only_integer_msg = function(key)
+    return key .. ': integer value expected, but received number'
+end
 local only_one_of = 'only one of nsec, usec or msecs may be defined'..
                     ' simultaneously'
-local int_ival_exp = 'sec: integer value expected, but received number'
 local timestamp_and_ymd = 'timestamp is not allowed if year/month/day provided'
 local timestamp_and_hms = 'timestamp is not allowed if hour/min/sec provided'
 local str_or_num_exp = 'tzoffset: string or number expected, but received'
 local numeric_exp = 'numeric value expected, but received '
 local expected_interval_but = 'expected interval or table, but received'
 local expected_datetime_but = 'expected datetime, interval or table, but received'
+local ambiguous_timezone = 'ambiguous timezone: both tzoffset and tz are specified'
 
 -- various error message generators
 local function exp_datetime(name, value)
@@ -96,6 +106,43 @@ local function assert_raises_like(test, error_msg, func, ...)
                    ('"%s" received, "%s" expected'):format(err_tail, error_msg))
 end
 
+-- Basic interval string representation generator for interval arguments.
+local fields_str = {
+    { 'year', 'years' },
+    { 'month', 'months' },
+    { 'week', 'weeks' },
+    { 'day', 'days' },
+    { 'hour', 'hours' },
+    { 'min', 'minutes' },
+    { 'sec', 'seconds' },
+    { 'msec', 'nanoseconds', 1e6 },
+    { 'usec', 'nanoseconds', 1e3 },
+    { 'nsec', 'nanoseconds' },
+}
+
+local function iv_str_repr(tab_iv)
+    local iv_repr = ''
+
+    for _, field in ipairs(fields_str) do
+        local name, field_repr, mult = unpack(field)
+        local value = tab_iv[name]
+        if value ~= nil then
+            if mult ~= nil then
+                value = value * mult
+            end
+            if iv_repr == '' then
+                iv_repr = ('%+d %s'):format(value, field_repr)
+            else
+                iv_repr = iv_repr .. (', %d %s'):format(value, field_repr)
+            end
+        elseif (name == 'sec') and (iv_repr == '') then
+            iv_repr = ('%+d %s'):format(0, field_repr)
+        end
+    end
+
+    return iv_repr
+end
+
 test:test("Datetime API checks", function(test)
     test:plan(12)
     local ts = date.new()
@@ -107,7 +154,7 @@ test:test("Datetime API checks", function(test)
     local table_expected = {
         sec =  0, min = 0, wday = 5, day = 1, nsec = 0,
         isdst = false, yday = 1, tzoffset = 0, month = 1,
-        year = 1970, hour = 0
+        year = 1970, hour = 0, tz = '', timestamp = 0
     }
     test:is_deeply(local_totable(ts), table_expected, "correct :totable")
     local date_expected = date.new()
@@ -227,7 +274,7 @@ test:test("Simple date creation by attributes", function(test)
 end)
 
 test:test("Simple date creation by attributes - check failed", function(test)
-    test:plan(83)
+    test:plan(93)
 
     local boundary_checks = {
         {'year', {MIN_DATE_YEAR, MAX_DATE_YEAR}},
@@ -295,6 +342,16 @@ test:test("Simple date creation by attributes - check failed", function(test)
         {only_one_of, { nsec = 123456, msec = 123}},
         {only_one_of, { usec = 123, msec = 123}},
         {only_one_of, { nsec = 123456, usec = 123, msec = 123}},
+        {only_integer_msg('nsec'), { nsec = 1.1 }},
+        {only_integer_msg('msec'), { msec = 1.1 }},
+        {only_integer_msg('usec'), { usec = 1.1 }},
+        {only_integer_msg('tzoffset'), { tzoffset = 1.1 }},
+        {only_integer_msg('year'), { year = 1.1 }},
+        {only_integer_msg('month'), { month = 1.1 }},
+        {only_integer_msg('day'), { day = 1.1 }},
+        {only_integer_msg('hour'), { hour = 1.1 }},
+        {only_integer_msg('min'), { min = 1.1 }},
+        {only_integer_msg('sec'), { sec = 1.1 }},
         {only_integer_ts, { timestamp = 12345.125, usec = 123}},
         {only_integer_ts, { timestamp = 12345.125, msec = 123}},
         {only_integer_ts, { timestamp = 12345.125, nsec = 123}},
@@ -368,7 +425,7 @@ test:test("Formatting limits", function(test)
 end)
 
 test:test("Simple tests for parser", function(test)
-    test:plan(12)
+    test:plan(19)
     test:ok(date.parse("1970-01-01T01:00:00Z") ==
             date.new{year=1970, mon=1, day=1, hour=1, min=0, sec=0})
     test:ok(date.parse("1970-01-01T01:00:00Z", {format = 'iso8601'}) ==
@@ -379,6 +436,8 @@ test:test("Simple tests for parser", function(test)
             date.parse("2020-01-01T01:00:00+00:00", {format = 'iso8601'}))
     test:ok(date.parse("1970-01-01T02:00:00+02:00") ==
             date.new{year=1970, mon=1, day=1, hour=2, min=0, sec=0, tzoffset=120})
+
+    -- Testcases with override timezone by setting tzoffset.
     test:ok(date.parse("1970-01-01T01:00:00", {tzoffset = 120}) ==
             date.new{year=1970, mon=1, day=1, hour=1, min=0, sec=0, tzoffset=120})
     test:ok(date.parse("1970-01-01T01:00:00", {tzoffset = '+0200'}) ==
@@ -389,6 +448,37 @@ test:test("Simple tests for parser", function(test)
             date.new{year=1970, mon=1, day=1, hour=1, min=0, sec=0, tzoffset=0})
     test:ok(date.parse("1970-01-01T01:00:00+01:00", {tzoffset = '+02:00'}) ==
             date.new{year=1970, mon=1, day=1, hour=1, min=0, sec=0, tzoffset=60})
+    test:ok(date.parse('1998-11-25', { format = '%Y-%m-%d', tzoffset = 180 }) ==
+            date.new({ year = 1998, month = 11, day = 25, tzoffset = 180 }))
+    test:ok(date.parse('1998', { format = '%Y', tzoffset = '+03:00' }) ==
+            date.new({ year = 1998, tzoffset = 180 }))
+
+    -- Testcases with override timezone by setting tz.
+    -- Timezone is not specified in a parsed string.
+    test:ok(date.parse("1970-01-01T01:00:00", {tz = "MSK"}) ==
+            date.new{year = 1970, mon = 1, day = 1,
+                     hour = 1, min = 0, sec = 0, tzoffset=180,
+                    })
+    -- Timezone is specified in a parsed string as a military timezone.
+    test:ok(date.parse("1970-01-01T01:00:00Z", {tz = "Europe/Moscow"}) ==
+            date.new{
+                year = 1970, mon = 1, day = 1,
+                hour = 1, min = 0, sec = 0, tzoffset = 0
+            })
+    -- Timezone is specified in a parsed string as an offset.
+    test:ok(date.parse("1970-01-01T01:00:00+01:00", {tz = "Asia/Omsk"}) ==
+            date.new{
+                year = 1970, mon = 1, day = 1,
+                hour = 1, min = 0, sec = 0, tzoffset = 60,
+            })
+    -- Timezone is not specified in a parsed string and format is passed.
+    test:ok(date.parse("1998-11-25", { format = "%Y-%m-%d", tz = "MSK" }) ==
+            date.new{year = 1998, month = 11, day = 25, tzoffset = 180})
+
+    -- Both tz and tzoffset are passed.
+    assert_raises(test, ambiguous_timezone, function()
+                      date.parse('1998-11-25', { tzoffset = 100, tz = 'MSK'})
+                  end)
 
     test:ok(date.parse("1970-01-01T02:00:00Z") <
             date.new{year=1970, mon=1, day=1, hour=2, min=0, sec=1})
@@ -397,7 +487,7 @@ test:test("Simple tests for parser", function(test)
 end)
 
 test:test("Multiple tests for parser (with nanoseconds)", function(test)
-    test:plan(211)
+    test:plan(273)
     -- borrowed from
     -- github.com/chansen/p5-time-moment/blob/master/t/180_from_string.t
     local tests =
@@ -469,7 +559,8 @@ test:test("Multiple tests for parser (with nanoseconds)", function(test)
     for _, value in ipairs(tests) do
         local str, epoch, nsec, tzoffset, check
         str, epoch, nsec, tzoffset, check = unpack(value)
-        local dt = date.parse(str)
+        local dt, parsed_syms = date.parse(str)
+        test:is(parsed_syms, #str, 'all characters are parsed')
         test:is(dt.epoch, epoch, ('%s: dt.epoch == %d'):format(str, epoch))
         test:is(dt.nsec, nsec, ('%s: dt.nsec == %d'):format(str, nsec))
         test:is(dt.tzoffset, tzoffset, ('%s: dt.tzoffset == %d'):format(str, tzoffset))
@@ -487,7 +578,7 @@ local function create_date_string(date)
 end
 
 test:test("Check parsing of full supported years range", function(test)
-    test:plan(63)
+    test:plan(84)
     local valid_years = {
         -5879610, -5879000, -5800000, -2e6, -1e5, -1e4, -9999, -2000, -1000,
         0, 1, 1000, 1900, 1970, 2000, 9999,
@@ -496,7 +587,8 @@ test:test("Check parsing of full supported years range", function(test)
     local fmt = '%FT%T%z'
     for _, y in ipairs(valid_years) do
         local txt = ('%04d-06-22'):format(y)
-        local dt = date.parse(txt)
+        local dt, parsed_syms = date.parse(txt)
+        test:is(parsed_syms, #txt, 'all characters are parsed')
         test:isnt(dt, nil, dt)
         local out_txt = tostring(dt)
         local out_dt = date.parse(out_txt)
@@ -513,7 +605,7 @@ local function couldnt_parse(txt)
 end
 
 test:test("Check parsing of dates with invalid attributes", function(test)
-    test:plan(32)
+    test:plan(33)
 
     local boundary_checks = {
         {'month', {1, 12}},
@@ -545,6 +637,17 @@ test:test("Check parsing of dates with invalid attributes", function(test)
         txt = create_date_string{[attr_name] = right + 50}
         assert_raises(test, couldnt_parse(txt),
                       function() dt, len = date.parse(txt) end)
+    end
+
+    local specific_errors = {
+        {
+            only_integer_msg('tzoffset'),
+            { '1998-11-25', { format = '%Y-%m-%d', tzoffset = 1.1 } }
+        },
+    }
+    for _, row in pairs(specific_errors) do
+        local err_msg, attribs = unpack(row)
+        assert_raises(test, err_msg, function() date.parse(unpack(attribs)) end)
     end
 end)
 
@@ -1125,9 +1228,9 @@ test:test("Time interval operations", function(test)
         {only_one_of, { nsec = 123456, msec = 123}},
         {only_one_of, { usec = 123, msec = 123}},
         {only_one_of, { nsec = 123456, usec = 123, msec = 123}},
-        {int_ival_exp, { sec = 12345.125, usec = 123}},
-        {int_ival_exp, { sec = 12345.125, msec = 123}},
-        {int_ival_exp, { sec = 12345.125, nsec = 123}},
+        {only_integer_msg('sec'), { sec = 12345.125, usec = 123}},
+        {only_integer_msg('sec'), { sec = 12345.125, msec = 123}},
+        {only_integer_msg('sec'), { sec = 12345.125, nsec = 123}},
     }
     for _, row in pairs(specific_errors) do
         local err_msg, obj = unpack(row)
@@ -1269,7 +1372,7 @@ test:test("Time interval operations - different timezones", function(test)
 end)
 
 test:test("Time intervals creation - range checks", function(test)
-    test:plan(23)
+    test:plan(83)
 
     local inew = date.interval.new
 
@@ -1278,9 +1381,9 @@ test:test("Time intervals creation - range checks", function(test)
         {only_one_of, { nsec = 123456, msec = 123}},
         {only_one_of, { usec = 123, msec = 123}},
         {only_one_of, { nsec = 123456, usec = 123, msec = 123}},
-        {int_ival_exp, { sec = 12345.125, usec = 123}},
-        {int_ival_exp, { sec = 12345.125, msec = 123}},
-        {int_ival_exp, { sec = 12345.125, nsec = 123}},
+        {only_integer_msg('sec'), { sec = 12345.125, usec = 123}},
+        {only_integer_msg('sec'), { sec = 12345.125, msec = 123}},
+        {only_integer_msg('sec'), { sec = 12345.125, nsec = 123}},
         {table_expected('interval.new()', '2001-01-01'), '2001-01-01'},
         {table_expected('interval.new()', 20010101), 20010101},
         {range_check_error('year', 1e21, {-MAX_YEAR_RANGE, MAX_YEAR_RANGE}),
@@ -1315,6 +1418,49 @@ test:test("Time intervals creation - range checks", function(test)
     for _, row in pairs(specific_errors) do
         local err_msg, attribs = unpack(row)
         assert_raises(test, err_msg, function() return inew(attribs) end)
+    end
+
+    local range_boundary = {
+        year = MAX_YEAR_RANGE,
+        month = MAX_MONTH_RANGE,
+        week = MAX_WEEK_RANGE,
+        day =  MAX_DAY_RANGE,
+        hour = MAX_HOUR_RANGE,
+        min = MAX_MIN_RANGE,
+        sec = MAX_SEC_RANGE,
+        msec = MAX_MSEC_RANGE,
+        usec = MAX_USEC_RANGE,
+        nsec = MAX_NSEC_RANGE,
+    }
+
+    for name, range_max in pairs(range_boundary) do
+        local val_max = math.floor(range_max)
+
+        local attrib_min = {[name] = -val_max}
+        local iv_min = inew(attrib_min)
+        test:is(tostring(iv_min), iv_str_repr(attrib_min),
+                ('interval %s is allowed'):format(json.encode(attrib_min)))
+        test:is(msgpack.decode(msgpack.encode(iv_min)), iv_min,
+                ('msgpack can process interval %s'):format(json.encode(attrib_min)))
+
+        local attrib_max = {[name] = val_max}
+        local iv_max = inew(attrib_max)
+        test:is(tostring(iv_max), iv_str_repr(attrib_max),
+                ('interval %s is allowed'):format(json.encode(attrib_max)))
+        test:is(msgpack.decode(msgpack.encode(iv_max)), iv_max,
+                ('msgpack can process interval %s'):format(json.encode(attrib_max)))
+
+        local attrib_over_min = {[name] = -val_max - 1}
+        assert_raises(
+            test,
+            range_check_error(name, attrib_over_min[name], {-range_max, range_max}),
+            function() inew(attrib_over_min) end)
+
+        local attrib_over_max = {[name] = val_max + 1}
+        assert_raises(
+            test,
+            range_check_error(name, attrib_over_max[name], {-range_max, range_max}),
+            function() inew(attrib_over_max) end)
     end
 end)
 
@@ -1741,11 +1887,838 @@ test:test("Parse strptime format", function(test)
     end
 end)
 
+-- Parse string with a custom format, then format datetime object
+-- to a string with the same format and compare initial and
+-- resulted strings:
+--
+--   dt = datetime.parse(<str>, { format = <fmt> })
+--   dt:format(<fmt>) == <str>
+--
+test:test("Parse with a custom format and format back to string", function(test)
+    local formats = {
+        -- %a is replaced by national representation of the
+        -- abbreviated weekday name.
+        -- Note, works for 'Thu' only when date is not complete,
+        -- see tarantool/tarantool#10470.
+        {
+            buf = 'Thu',
+            fmt = '%a',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '19-08-2023 Sat',
+            fmt = '%d-%m-%Y %a',
+            dt = date.new({year = 2023, month = 08, day = 19}),
+        },
+        {
+            buf = '20-08-2023 Sun',
+            fmt = '%d-%m-%Y %a',
+            dt = date.new({year = 2023, month = 08, day = 20}),
+        },
+        {
+            buf = '21-08-2023 Mon',
+            fmt = '%d-%m-%Y %a',
+            dt = date.new({year = 2023, month = 08, day = 21}),
+        },
+        {
+            buf = '22-08-2023 Tue',
+            fmt = '%d-%m-%Y %a',
+            dt = date.new({year = 2023, month = 08, day = 22}),
+        },
+        {
+            buf = '23-08-2023 Wed',
+            fmt = '%d-%m-%Y %a',
+            dt = date.new({year = 2023, month = 08, day = 23}),
+        },
+        {
+            buf = '24-08-2023 Thu',
+            fmt = '%d-%m-%Y %a',
+            dt = date.new({year = 2023, month = 08, day = 24}),
+        },
+        {
+            buf = '25-08-2023 Fri',
+            fmt = '%d-%m-%Y %a',
+            dt = date.new({year = 2023, month = 08, day = 25}),
+        },
+        -- %A is replaced by national representation of the full
+        -- weekday name.
+        -- Note, works for 'Thursday' only when date is not
+        -- complete, see tarantool/tarantool#10470.
+        {
+            buf = 'Thursday',
+            fmt  = '%A',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '19-08-2023 Saturday',
+            fmt = '%d-%m-%Y %A',
+            dt = date.new({year = 2023, month = 08, day = 19}),
+        },
+        {
+            buf = '20-08-2023 Sunday',
+            fmt = '%d-%m-%Y %A',
+            dt = date.new({year = 2023, month = 08, day = 20}),
+        },
+        {
+            buf = '21-08-2023 Monday',
+            fmt = '%d-%m-%Y %A',
+            dt = date.new({year = 2023, month = 08, day = 21}),
+        },
+        {
+            buf = '22-08-2023 Tuesday',
+            fmt = '%d-%m-%Y %A',
+            dt = date.new({year = 2023, month = 08, day = 22}),
+        },
+        {
+            buf = '23-08-2023 Wednesday',
+            fmt = '%d-%m-%Y %A',
+            dt = date.new({year = 2023, month = 08, day = 23}),
+        },
+        {
+            buf = '24-08-2023 Thursday',
+            fmt = '%d-%m-%Y %A',
+            dt = date.new({year = 2023, month = 08, day = 24}),
+        },
+        {
+            buf = '25-08-2023 Friday',
+            fmt = '%d-%m-%Y %A',
+            dt = date.new({year = 2023, month = 08, day = 25}),
+        },
+        -- %b is replaced by national representation of the
+        -- abbreviated month name.
+        {
+            buf = 'Jan',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = 'Feb',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 02, day = 01}),
+        },
+        {
+            buf = 'Mar',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 03, day = 01}),
+        },
+        {
+            buf = 'Apr',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 04, day = 01}),
+        },
+        {
+            buf = 'May',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 05, day = 01}),
+        },
+        {
+            buf = 'Jun',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 06, day = 01}),
+        },
+        {
+            buf = 'Jul',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 07, day = 01}),
+        },
+        {
+            buf = 'Aug',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 08, day = 01}),
+        },
+        {
+            buf = 'Sep',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 09, day = 01}),
+        },
+        {
+            buf = 'Oct',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 10, day = 01}),
+        },
+        {
+            buf = 'Nov',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 11, day = 01}),
+        },
+        {
+            buf = 'Dec',
+            fmt = '%b',
+            dt = date.new({year = 1970, month = 12, day = 01}),
+        },
+        -- %B is replaced by national representation of the full
+        -- month name.
+        {
+            buf = 'January',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = 'February',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 02, day = 01}),
+        },
+        {
+            buf = 'March',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 03, day = 01}),
+        },
+        {
+            buf = 'April',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 04, day = 01}),
+        },
+        {
+            buf = 'May',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 05, day = 01}),
+        },
+        {
+            buf = 'June',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 06, day = 01}),
+        },
+        {
+            buf = 'July',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 07, day = 01}),
+        },
+        {
+            buf = 'August',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 08, day = 01}),
+        },
+        {
+            buf = 'September',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 09, day = 01}),
+        },
+        {
+            buf = 'October',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 10, day = 01}),
+        },
+        {
+            buf = 'November',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 11, day = 01}),
+        },
+        {
+            buf = 'December',
+            fmt = '%B',
+            dt = date.new({year = 1970, month = 12, day = 01}),
+        },
+        -- %c is replaced by national representation of time and
+        -- date.
+        {
+            buf = 'Thu Jan  1 03:00:00 1970',
+            fmt = '%c',
+            dt = date.new({year = 1970, month = 01, day = 01, hour = 3}),
+        },
+        -- %C is replaced by (year / 100) as decimal number;
+        -- single digits are preceded by a zero.
+        {
+            buf = '26-08-2024 20',
+            fmt = '%d-%m-%Y %C',
+            dt = date.new({year = 2024, month = 08, day = 26}),
+        },
+        {
+            buf = '20',
+            fmt = '%C',
+            dt = date.new({year = 2000, month = 01, day = 01}),
+        },
+        -- %d is replaced by the day of the month as a decimal
+        -- number (01-31).
+        {
+            buf = '01',
+            fmt = '%d',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '31',
+            fmt = '%d',
+            dt = date.new({year = 1970, month = 01, day = 31}),
+        },
+        -- %D is equivalent to "%m/%d/%y".
+        {
+            buf = '09/09/04',
+            fmt = '%D',
+            dt = date.new({year = 2004, month = 09, day = 09}),
+        },
+        -- %e is replaced by the day of the month as a decimal
+        -- number (1-31); single digits are preceded by a blank.
+        {
+            buf = '30',
+            fmt = '%e',
+            dt = date.new({year = 1970, month = 01, day = 30}),
+        },
+        {
+            buf = ' 1',
+            fmt = '%e',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '30',
+            fmt = '%e',
+            dt = date.new({year = 1970, month = 01, day = 30}),
+        },
+        -- %E is a POSIX locale extensions. The sequences %Ec %EC
+        -- %Ex %EX  %Ey %EY %Od %Oe %OH %OI %Om %OM %OS %Ou %OU
+        -- %OV %Ow %OW %Oy are supposed to provide alternate
+        -- representations.
+        -- %F is equivalent to "%Y-%m-%d".
+        {
+            buf = '1970-01-01T03:00:00.125+0300',
+            fmt = '%FT%T.%f%z',
+            dt = date.new({hour = 3, nsec = 125000000, tzoffset = 180}),
+        },
+        {
+            buf = '1970-01-01',
+            fmt = '%F',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        -- %f is replaced by the fractional seconds,
+        -- Tarantool-specific.
+        {
+            buf = '100',
+            fmt = '%f',
+            -- See https://github.com/tarantool/tarantool/issues/8569.
+            dt = date.new({
+                year = 1970, month = 01, day = 01, nsec = 100000000,
+            }),
+        },
+        -- %G is replaced by a year as a decimal number with
+        -- century. This year is the one that contains the greater
+        -- part of the week (Monday as the first day of the week).
+        {
+            buf = '2024',
+            fmt = '%G',
+            dt = date.new({year = 2024, month = 01, day = 01}),
+        },
+        -- %g is replaced by the same year as in "%G", but as
+        -- a decimal number without century (00-99).
+        -- Skipped, it is not possible to roundtrip.
+        -- %h, same as %b
+        {
+            buf = 'Jan',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = 'Feb',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 02, day = 01}),
+        },
+        {
+            buf = 'Mar',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 03, day = 01}),
+        },
+        {
+            buf = 'Apr',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 04, day = 01}),
+        },
+        {
+            buf = 'May',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 05, day = 01}),
+        },
+        {
+            buf = 'Jun',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 06, day = 01}),
+        },
+        {
+            buf = 'Jul',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 07, day = 01}),
+        },
+        {
+            buf = 'Aug',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 08, day = 01}),
+        },
+        {
+            buf = 'Sep',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 09, day = 01}),
+        },
+        {
+            buf = 'Oct',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 10, day = 01}),
+        },
+        {
+            buf = 'Nov',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 11, day = 01}),
+        },
+        {
+            buf = 'Dec',
+            fmt = '%h',
+            dt = date.new({year = 1970, month = 12, day = 01}),
+        },
+        -- %H, is replaced by the hour (24-hour clock) as
+        -- a decimal number (00-23).
+        {
+            buf = '00',
+            fmt = '%H',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '23',
+            fmt = '%H',
+            dt = date.new({year = 1970, month = 01, day = 01, hour = 23}),
+        },
+        -- %I is replaced by the hour (12-hour clock) as
+        -- a decimal number (01-12).
+        {
+            buf = '01',
+            fmt = '%I',
+            dt = date.new({year = 1970, month = 01, day = 01, hour = 01}),
+        },
+        {
+            buf = '12',
+            fmt = '%I',
+            dt = date.new({year = 1970, month = 01, day = 01, hour = 12}),
+        },
+        -- %j is replaced by the day of the year as a decimal
+        -- number (001-366).
+        {
+            buf = '001',
+            fmt = '%j',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '31-12-2024 366',
+            fmt = '%d-%m-%Y %j',
+            dt = date.new({year = 2024, month = 12, day = 31}),
+        },
+        -- %k is replaced by the hour (24-hour clock) as
+        -- a decimal number (0-23); single digits are preceded
+        -- by a blank.
+        {
+            buf = ' 0',
+            fmt = '%k',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '23',
+            fmt = '%k',
+            dt = date.new({year = 1970, month = 01, day = 01, hour = 23}),
+        },
+        -- %l is replaced by the hour (12-hour clock) as
+        -- a decimal number (1-12); single digits are preceded
+        -- by a blank.
+        {
+            buf = ' 1',
+            fmt = '%l',
+            dt = date.new({year = 1970, month = 01, day = 01, hour = 01}),
+        },
+        {
+            buf = '12',
+            fmt = '%l',
+            dt = date.new({year = 1970, month = 01, day = 01, hour = 12}),
+        },
+        -- %m is replaced by the month as a decimal number
+        -- (01-12).
+        {
+            buf = '01',
+            fmt = '%m',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '12',
+            fmt = '%m',
+            dt = date.new({year = 1970, month = 12, day = 01}),
+        },
+        -- %M is replaced by the minute as a decimal number
+        -- (00-59).
+        {
+            buf = '00',
+            fmt = '%M',
+            dt = date.new({}),
+        },
+        {
+            buf = '59',
+            fmt = '%M',
+            dt = date.new({min = 59}),
+        },
+        -- %n is replaced by a newline.
+        {
+            buf = '\n',
+            fmt = '%n',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '2025\n01\n13',
+            fmt = '%Y%n%m%n%d',
+            dt = date.new({year = 2025, month = 01, day = 13}),
+        },
+        -- %O the same as %E*, skipped.
+        -- %p is replaced by national representation of either
+        -- "ante meridiem" (a.m.) or "post meridiem" (p.m.) as
+        -- appropriate.
+        {
+            buf = 'PM',
+            fmt = '%p',
+            dt = date.new({year = 1970, month = 01, day = 01, hour = 12}),
+        },
+        {
+            buf = 'AM',
+            fmt = '%p',
+            dt = date.new({year = 1970, month = 01, day = 01, hour = 00}),
+        },
+        -- %r, same as "%I:%M:%S %p".
+        {
+            buf = '12:32:01 AM',
+            fmt = '%r',
+            dt = date.new({hour = 00, min = 32, sec = 01}),
+        },
+        {
+            buf = '12:32:01 PM',
+            fmt = '%r',
+            dt = date.new({hour = 12, min = 32, sec = 01}),
+        },
+        -- %R, same as "%H:%M".
+        {
+            buf = '23:59',
+            fmt = '%R',
+            dt = date.new({hour = 23, min = 59}),
+        },
+        {
+            buf = '00:00',
+            fmt = '%R',
+            dt = date.new({hour = 00, min = 00}),
+        },
+        -- %s is replaced by the number of seconds since the
+        -- Epoch, UTC (see mktime(3)).
+        {
+            buf = '26-08-2024 1724630400',
+            fmt = '%d-%m-%Y %s',
+            dt = date.new({year = 2024, month = 08, day = 26}),
+        },
+        -- %S is replaced by the second as a decimal number
+        -- (00-60).
+        {
+            buf = '00',
+            fmt = '%S',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '59',
+            fmt = '%S',
+            dt = date.new({year = 1970, month = 01, day = 01, sec = 59}),
+        },
+        -- %t is replaced by a tab.
+        {
+            buf = '26-08-2024 \t',
+            fmt = '%d-%m-%Y %t',
+            dt = date.new({year = 2024, month = 08, day = 26}),
+        },
+        {
+            buf = '26\t08\t2024',
+            fmt = '%d%t%m%t%Y',
+            dt = date.new({year = 2024, month = 08, day = 26}),
+        },
+        -- %T, same as "%H:%M:%S".
+        {
+            buf = '00:00:00',
+            fmt = '%T',
+            dt = date.new({}),
+        },
+        {
+            buf = '23:59:59',
+            fmt = '%T',
+            dt = date.new({hour = 23, min = 59, sec = 59}),
+        },
+        -- %u is replaced by the weekday (Monday as the first day
+        -- of the week) as a decimal number (1-7).
+        -- Note, works for 4 ('Thursday') only when date is not
+        -- complete, see tarantool/tarantool#10470.
+        {
+            buf = '4',
+            fmt = '%u',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '12-08-2024 1',
+            fmt = '%d-%m-%Y %u',
+            dt = date.new({year = 2024, month = 08, day = 12}),
+        },
+        {
+            buf = '13-08-2024 2',
+            fmt = '%d-%m-%Y %u',
+            dt = date.new({year = 2024, month = 08, day = 13}),
+        },
+        {
+            buf = '14-08-2024 3',
+            fmt = '%d-%m-%Y %u',
+            dt = date.new({year = 2024, month = 08, day = 14}),
+        },
+        {
+            buf = '15-08-2024 4',
+            fmt = '%d-%m-%Y %u',
+            dt = date.new({year = 2024, month = 08, day = 15}),
+        },
+        {
+            buf = '16-08-2024 5',
+            fmt = '%d-%m-%Y %u',
+            dt = date.new({year = 2024, month = 08, day = 16}),
+        },
+        {
+            buf = '17-08-2024 6',
+            fmt = '%d-%m-%Y %u',
+            dt = date.new({year = 2024, month = 08, day = 17}),
+        },
+        {
+            buf = '18-08-2024 7',
+            fmt = '%d-%m-%Y %u',
+            dt = date.new({year = 2024, month = 08, day = 18}),
+        },
+        -- %U is replaced by the week number of the year (Sunday
+        -- as the first day of the week) as a decimal number
+        -- (00-53).
+        {
+            buf = '01-01-2024 00',
+            fmt = '%d-%m-%Y %U',
+            dt = date.new({year = 2024, month = 01, day = 01}),
+        },
+        {
+            buf = '31-12-2023 53',
+            fmt = '%d-%m-%Y %U',
+            dt = date.new({year = 2023, month = 12, day = 31}),
+        },
+        -- %v, same as "%e-%b-%Y".
+        {
+            buf = ' 1-Jan-1970',
+            fmt = '%v',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        -- %V, unsupported by strptime(3).
+        -- %w is replaced by the weekday (Sunday as the first day
+        -- of the week) as a decimal number (0-6).
+        -- Note, works for 4 (Thursday) only when date is not
+        -- complete, see tarantool/tarantool#10470.
+        {
+            buf = '4',
+            fmt = '%w',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        {
+            buf = '25-08-2024 0',
+            fmt = '%d-%m-%Y %w',
+            dt = date.new({year = 2024, month = 08, day = 25}),
+        },
+        {
+            buf = '26-08-2024 1',
+            fmt = '%d-%m-%Y %w',
+            dt = date.new({year = 2024, month = 08, day = 26}),
+        },
+        {
+            buf = '27-08-2024 2',
+            fmt = '%d-%m-%Y %w',
+            dt = date.new({year = 2024, month = 08, day = 27}),
+        },
+        {
+            buf = '28-08-2024 3',
+            fmt = '%d-%m-%Y %w',
+            dt = date.new({year = 2024, month = 08, day = 28}),
+        },
+        {
+            buf = '29-08-2024 4',
+            fmt = '%d-%m-%Y %w',
+            dt = date.new({year = 2024, month = 08, day = 29}),
+        },
+        {
+            buf = '30-08-2024 5',
+            fmt = '%d-%m-%Y %w',
+            dt = date.new({year = 2024, month = 08, day = 30}),
+        },
+        {
+            buf = '31-08-2024 6',
+            fmt = '%d-%m-%Y %w',
+            dt = date.new({year = 2024, month = 08, day = 31}),
+        },
+        -- %W is replaced by the week number of the year (Monday
+        -- as the first day of the week) as a decimal number
+        -- (00-53).
+        -- Note, week number is not supported,
+        -- see tarantool/tarantool#10575.
+        -- First day of the first week of the year.
+        {
+            buf = '01-01-2024 01',
+            fmt = '%d-%m-%Y %W',
+            dt = date.new({year = 2024, month = 01, day = 01}),
+        },
+        -- Last day of the first week of the year.
+        {
+            buf = '07-01-2024 01',
+            fmt = '%d-%m-%Y %W',
+            dt = date.new({year = 2024, month = 01, day = 07}),
+        },
+        -- First day of the second week of the year.
+        {
+            buf = '08-01-2024 02',
+            fmt = '%d-%m-%Y %W',
+            dt = date.new({year = 2024, month = 01, day = 08}),
+        },
+        -- First day of the last week of the year.
+        {
+            buf = '23-12-2024 52',
+            fmt = '%d-%m-%Y %W',
+            dt = date.new({year = 2024, month = 12, day = 23}),
+        },
+        -- Last day of the last week of the year.
+        {
+            buf = '29-12-2024 52',
+            fmt = '%d-%m-%Y %W',
+            dt = date.new({year = 2024, month = 12, day = 29}),
+        },
+        -- Last day of the year.
+        {
+            buf = '31-12-2024 53',
+            fmt = '%d-%m-%Y %W',
+            dt = date.new({year = 2024, month = 12, day = 31}),
+        },
+        -- %x is replaced by national representation of the date.
+        {
+            buf = '01/01/70',
+            fmt = '%x',
+            dt = date.new({year = 1970, month = 01, day = 01}),
+        },
+        -- %X is replaced by national representation of the time.
+        {
+            buf = '00:00:00',
+            fmt = '%X',
+            dt = date.new({}),
+        },
+        {
+            buf = '23:59:59',
+            fmt = '%X',
+            dt = date.new({hour = 23, min = 59, sec = 59}),
+        },
+        -- %y is replaced by the year without century as a decimal
+        -- number (00-99).
+        {
+            buf = '00',
+            fmt = '%y',
+            dt = date.new({year = 2000, month = 01, day = 01}),
+        },
+        {
+            buf = '99',
+            fmt = '%y',
+            dt = date.new({year = 1999, month = 01, day = 01}),
+        },
+        -- %Y is replaced by the year with century as a decimal
+        -- number.
+        {
+            buf = '0000',
+            fmt = '%Y',
+            dt = date.new({year = 0000, month = 01, day = 01}),
+        },
+        {
+            buf = '3000',
+            fmt = '%Y',
+            dt = date.new({year = 3000, month = 01, day = 01}),
+        },
+        -- %z is replaced by the time zone offset from UTC;
+        -- a leading plus sign stands for east of UTC, a minus
+        -- sign for west of UTC, hours and minutes follow with
+        -- two digits each and no delimiter between them
+        -- (common form for RFC 822 date headers).
+        {
+            buf = '+0403',
+            fmt = '%z',
+            dt = date.new({tzoffset = 243}),
+        },
+        {
+            buf = '-0403',
+            fmt = '%z',
+            dt = date.new({tzoffset = -243}),
+        },
+        -- %Z is replaced by the time zone name.
+        {
+            buf = 'MSK',
+            fmt = '%Z',
+            dt = date.new({tzoffset = 180}),
+        },
+        -- %+ is replaced by national representation of the date
+        -- and time (the format is similar to that produced by
+        -- date(1)).
+        {
+            buf = 'Mon Aug 26 00:00:00  2024',
+            fmt = '%+',
+            dt = date.new({year = 2024, month = 08, day = 26}),
+        },
+        -- %% is replaced by `%'.
+        {
+            buf = '26%08%2024',
+            fmt = '%d%%%m%%%Y',
+            dt = date.new({year = 2024, month = 08, day = 26}),
+        },
+        -- Mixed.
+        {
+            buf = '26-08-24',
+            fmt = '%d-%m-%y',
+            dt = date.new({year = 2024, month = 08, day = 26}),
+        },
+        {
+            buf = '26-08-2024 \n',
+            fmt = '%d-%m-%Y %n',
+            dt = date.new({year = 2024, month = 08, day = 26}),
+        },
+        {
+            buf = '26-08-2024  6',
+            fmt = '%d-%m-%Y %l',
+            dt = date.new({year = 2024, month = 08, day = 26, hour = 6}),
+        },
+        {
+            buf = '26-08-2024  9',
+            fmt = '%d-%m-%Y %k',
+            dt = date.new({year = 2024, month = 08, day = 26, hour = 9}),
+        },
+        {
+            buf = '01/01/70',
+            fmt = '%m/%d/%y',
+            dt = date.new({}),
+        },
+        {
+            buf = '1970-01-01',
+            fmt = '%Y-%m-%d',
+            dt = date.new({}),
+        },
+        {
+            buf = '1970-01-01T0300+0300',
+            fmt = '%Y-%m-%dT%H%M%z',
+            dt = date.new({hour = 3, tzoffset = 180}),
+        },
+        {
+            buf = '1970-01-01T03:00:00+0300',
+            fmt = '%Y-%m-%dT%H:%M:%S%z',
+            dt = date.new({hour = 3, tzoffset = 180}),
+        },
+    }
+    test:plan(#formats * 3)
+    for _, tc in pairs(formats) do
+        local dt, parsed_syms = date.parse(tc.buf, {format = tc.fmt})
+        test:is(parsed_syms, #tc.buf,
+                ('%s: parse buffer is ok'):format(tc.fmt))
+        test:is(dt, tc.dt, ('%s, resulted dt is ok'):format(tc.fmt))
+        local dt_formatted = dt:format(tc.fmt)
+        local buf = tc.buf
+        test:is(dt_formatted, buf,
+                ('%s: format to %s'):format(tc.fmt, dt_formatted))
+    end
+end)
+
 test:test("totable{}", function(test)
-    test:plan(78)
+    test:plan(79)
     local exp = {sec = 0, min = 0, wday = 5, day = 1,
                  nsec = 0, isdst = false, yday = 1,
-                 tzoffset = 0, month = 1, year = 1970, hour = 0}
+                 tzoffset = 0, month = 1, year = 1970, hour = 0,
+                 tz = '', timestamp = 0}
     local ts = date.new()
     local totable = ts:totable()
     test:is_deeply(totable, exp, 'date:totable()')
@@ -1777,6 +2750,56 @@ test:test("totable{}", function(test)
     for _, key in pairs({'wday', 'day', 'yday', 'month', 'year'}) do
         test:is(ts[key], osdate[key],
                 ('[%s]: %s == %s'):format(key, ts[key], osdate[key]))
+    end
+
+    local dt = date.new({ timestamp = 100 })
+    test:is(dt:totable().timestamp, 100, 'date:totable() with timestamp')
+end)
+
+test:test('totable() with timezone', function(test)
+    local DEFAULT_TZOFFSET = 0
+    local DEFAULT_TZ = ''
+
+    local MOSCOW_TZOFFSET = 180
+    local MOSCOW_TZ = 'Europe/Moscow'
+
+    local test_cases = {
+        -- Empty datetime value except the timezone.
+        {
+            dt = {tz = MOSCOW_TZ},
+            expected = {
+                tzoffset = MOSCOW_TZOFFSET,
+                tz = MOSCOW_TZ,
+            }
+        },
+        -- Empty datetime value except the tzoffset.
+        {
+            dt = {tzoffset = MOSCOW_TZOFFSET},
+            expected = {
+                tzoffset = MOSCOW_TZOFFSET,
+                tz = '',
+            }
+        },
+        -- Empty datetime value.
+        {
+            dt = {},
+            expected = {
+                tz = DEFAULT_TZ,
+                tzoffset = DEFAULT_TZOFFSET,
+            },
+        },
+    }
+
+    test:plan(#test_cases * 2)
+
+    for _, tc in pairs(test_cases) do
+        local dtab = date.new(tc.dt):totable()
+        local expected = tc.expected
+        test:is(dtab.tzoffset, expected.tzoffset,
+                ('[tzoffset]: %q == %q'):format(dtab.tzoffset,
+                                                expected.tzoffset))
+        test:is(dtab.tz, expected.tz,
+                ('[tz]: %q == %q'):format(dtab.tz, expected.tz))
     end
 end)
 
@@ -1859,7 +2882,7 @@ end)
 
 
 test:test("Time invalid :set{} operations", function(test)
-    test:plan(84)
+    test:plan(94)
 
     local boundary_checks = {
         {'year', {MIN_DATE_YEAR, MAX_DATE_YEAR}},
@@ -1928,6 +2951,16 @@ test:test("Time invalid :set{} operations", function(test)
         {only_one_of, { nsec = 123456, msec = 123}},
         {only_one_of, { usec = 123, msec = 123}},
         {only_one_of, { nsec = 123456, usec = 123, msec = 123}},
+        {only_integer_msg('nsec'), { nsec = 1.1 }},
+        {only_integer_msg('msec'), { msec = 1.1 }},
+        {only_integer_msg('usec'), { usec = 1.1 }},
+        {only_integer_msg('tzoffset'), { tzoffset = 1.1 }},
+        {only_integer_msg('year'), { year = 1.1 }},
+        {only_integer_msg('month'), { month = 1.1 }},
+        {only_integer_msg('day'), { day = 1.1 }},
+        {only_integer_msg('hour'), { hour = 1.1 }},
+        {only_integer_msg('min'), { min = 1.1 }},
+        {only_integer_msg('sec'), { sec = 1.1 }},
         {only_integer_ts, { timestamp = 12345.125, usec = 123}},
         {only_integer_ts, { timestamp = 12345.125, msec = 123}},
         {only_integer_ts, { timestamp = 12345.125, nsec = 123}},
@@ -2015,6 +3048,30 @@ test:test("Time :set{day = -1} operations", function(test)
     test:is(tostring(ts:set{month = 3, day = 2}), '1904-03-02T00:00:00Z',
             '2 March')
     test:is(tostring(ts:set{day = -1}), '1904-03-31T00:00:00Z', '31 March')
+end)
+
+test:test("Parse datetime with specified seconds", function(test)
+    test:plan(12)
+    local dt = date.parse('01', {format = '%S'})
+    test:is(dt.isdst, false, 'unspecified isdst')
+    test:is(dt.nsec, 0, 'unspecified nsec')
+    test:is(dt.sec, 1, 'specified seconds')
+    test:is(dt.min, 0, 'unspecified minutes')
+    test:is(dt.yday, 1, 'unspecified yday')
+    test:is(dt.day, 1, 'unspecified day')
+    test:is(dt.wday, 5, 'unspecified wday')
+    test:is(dt.tzoffset, 0, 'unspecified tzoffset')
+    test:is(dt.month, 1, 'unspecified month')
+    test:is(dt.year, 1970, 'unspecified year')
+    test:is(dt.hour, 0, 'unspecified hours')
+    test:is(dt.timestamp, 1, 'timestamp')
+end)
+
+test:test("Parse datetime with unspecified seconds", function(test)
+    test:plan(2)
+    local dt = date.parse('01', {format = '%H'})
+    test:is(dt.sec, 0, 'uspecified sec')
+    test:is(dt.timestamp, 3600, 'timestamp')
 end)
 
 os.exit(test:check() and 0 or 1)

@@ -5,10 +5,6 @@ local uri = require('uri')
 local os = require('os')
 local t = require('luatest')
 
--- FIXME(gh-8718): The test fails if Lua JIT is enabled.
-jit.off()
-jit.flush()
-
 local g = t.group('http_client', {
     {sock_family = 'AF_INET'},
     {sock_family = 'AF_UNIX'},
@@ -28,8 +24,8 @@ local function merge(...)
 end
 
 local function start_server(sock_family)
-    if not sock_family == 'AF_INET' and
-       not sock_family == 'AF_UNIX' then
+    if sock_family ~= 'AF_INET' and
+       sock_family ~= 'AF_UNIX' then
         error(string.format('invalid socket family: %s', sock_family))
     end
     local url
@@ -63,6 +59,7 @@ local function start_server(sock_family)
 end
 
 g.before_each(function(cg)
+    t.skip_if(cg.params.sock_family == 'AF_UNIX', "gh-9854")
     local sock_family = cg.params.sock_family
     cg.server, cg.url, cg.opts = start_server(sock_family)
 end)
@@ -193,6 +190,19 @@ g.test_http_client_headers_redefine = function(cg)
                     'Redefined Accept header')
     t.assert_equals(r.headers['connection'], 'Keep-Alive',
                     'Redefined Connection header')
+end
+
+g.test_http_client_content_length_invalid = function(cg)
+    local url = cg.url
+    local expected = "Content%-Length header " ..
+        "value must be a non%-negative integer"
+    for _, length in ipairs({"asd", "-1", "1asd"}) do
+        local opts = table.deepcopy(cg.opts)
+        opts.headers = {['Content-Length'] = length}
+        local ok, err = pcall(client.post, url, nil, opts)
+        t.assert_equals(ok, false, 'an error expected')
+        t.assert_str_contains(json.encode(err), expected, 'digit')
+    end
 end
 
 g.test_cancel_and_errinj = function(cg)
@@ -1103,7 +1113,7 @@ g.test_http_client_io_read_invalid_arg = function(cg)
 
     local ok, err = pcall(io.read, io, -1)
     t.assert_not(ok, 'an error expected', 'first arg error')
-    t.assert_str_contains(err, 'chunk can not be negative')
+    t.assert_str_contains(err, 'chunk size can not be negative')
 
     local ok, err = pcall(io.read, io, function() end)
     t.assert_not(ok, 'an error expected')
@@ -1111,7 +1121,7 @@ g.test_http_client_io_read_invalid_arg = function(cg)
 
     local ok, err = pcall(io.read, io, {chunk = -1})
     t.assert_not(ok, 'an error expected')
-    t.assert_str_contains(err, 'chunk can not be negative')
+    t.assert_str_contains(err, 'chunk size can not be negative')
     io:finish()
 end
 
@@ -1238,6 +1248,34 @@ g.test_http_client_io_post = function(cg)
     t.assert_equals(read, data, 'read == post')
     t.assert_equals(io.status, 200, 'io')
     t.assert_equals(io.reason, 'Ok', '200 - Ok')
+
+end
+
+g.test_http_client_io_post_encoding_chunked = function(cg)
+    local url, opts = cg.url, table.deepcopy(cg.opts)
+    local endpoint = 'encoding'
+    local data = 'any data'
+    opts.chunked = true
+
+    local io = client.post(url .. endpoint, data, opts)
+    io:finish()
+
+    local encoding = io:read(1024)
+    t.assert_equals(encoding, 'chunked', 'enconding == chunked')
+end
+
+g.test_http_client_io_post_content_length_no_encoding = function(cg)
+    local url, opts = cg.url, table.deepcopy(cg.opts)
+    local endpoint = 'encoding'
+    local data = 'any data'
+    opts.chunked = true
+    opts.headers = {['Content-Length'] = tostring(string.len(data))}
+
+    local io = client.post(url .. endpoint, data, opts)
+    io:finish()
+
+    local encoding = io:read(1024)
+    t.assert_equals(encoding, 'none', 'encoding == none')
 end
 
 g.test_http_client_io_post_more_than_content_length = function(cg)
@@ -1250,11 +1288,11 @@ g.test_http_client_io_post_more_than_content_length = function(cg)
     local written = io:write(data, 1)
     t.assert_equals(written, string.len(data), 'written')
     written = io:write(data, 1)
-    t.assert_equals(written, string.len(data), 'written')
+    t.assert_equals(written, 0, 'written')
     io:finish()
 
     local read = io:read(string.len(data) * 2)
-    t.assert_equals(read, data .. data, 'read == post')
+    t.assert_equals(read, data, 'read == post')
     t.assert_equals(io.status, 200, 'io')
     t.assert_equals(io.reason, 'Ok', '200 - Ok')
 end
@@ -1290,6 +1328,9 @@ g.test_http_client_io_post_post_read = function(cg)
     local ok, err = pcall(io.read, io, 1, 0.0001)
     t.assert_equals(ok, false, 'an error expected')
     t.assert_str_contains(json.encode(err), 'timed out', 'timeout')
+
+    local written = io:write(data)
+    t.assert_equals(written, string.len(data), "written")
     io:finish()
     t.assert_equals(io.status, 200, 'io')
     t.assert_equals(io.reason, 'Ok', '200 - Ok')
@@ -1311,4 +1352,50 @@ g.test_http_client_io_post_parts = function(cg)
     t.assert_equals(read, first_part .. second_part, 'read == post')
     t.assert_equals(io.status, 200, 'io')
     t.assert_equals(io.reason, 'Ok', '200 - Ok')
+end
+
+-- GH-9453: GC had collected HTTP client object
+-- when HTTP IO object is alive.
+-- Symptom: A message "IllegalParams: io: request must be io"
+-- is happened on calling HTTP IO methods.
+g.test_http_client_gc_finalizer_gh_9453 = function(cg)
+    local url, opts = cg.url, table.deepcopy(cg.opts)
+    local client = client.new()
+    opts.chunked = true
+
+    local http_io = client:get(url, opts)
+
+    -- GC collect HTTP client object.
+    client = nil -- luacheck: no unused
+    collectgarbage()
+    collectgarbage()
+
+    -- HTTP IO object is alive.
+    local ok, res = pcall(http_io.read, http_io, 4)
+    t.assert_equals(ok, true)
+    t.assert_equals(res, 'hell')
+
+    -- Teardown.
+    http_io = nil -- luacheck: no unused
+    collectgarbage()
+    collectgarbage()
+end
+
+g.test_gh_9346_httpc_io_cleanup = function(cg)
+    local url, opts = cg.url, table.deepcopy(cg.opts)
+    local client = client.new()
+    opts.chunked = true
+
+    local http_io = client:get(url, opts) -- luacheck: no unused
+
+    collectgarbage()
+    collectgarbage()
+
+    -- Teardown.
+    client = nil -- luacheck: no unused
+    collectgarbage()
+    collectgarbage()
+    http_io = nil -- luacheck: no unused
+    collectgarbage()
+    collectgarbage()
 end

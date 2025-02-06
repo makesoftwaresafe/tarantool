@@ -246,7 +246,7 @@ sql_get_prepare_common_keys(struct Vdbe *stmt, struct obuf *out, int keys)
  * @retval -1 Memory error.
  */
 static int
-port_sql_dump_msgpack(struct port *port, struct obuf *out)
+port_sql_dump_msgpack(struct port *port, struct obuf *out, struct mp_ctx *ctx)
 {
 	assert(port->vtab == &port_sql_vtab);
 	struct port_sql *sql_port = (struct port_sql *)port;
@@ -270,8 +270,7 @@ port_sql_dump_msgpack(struct port *port, struct obuf *out)
 			return -1;
 		}
 		pos = mp_encode_uint(pos, IPROTO_DATA);
-		if (port_c_vtab.dump_msgpack(port, out) < 0)
-			return -1;
+		port_c_dump_msgpack_wrapped(port, out, ctx);
 		break;
 	}
 	case DML_EXECUTE: {
@@ -345,7 +344,17 @@ port_sql_dump_msgpack(struct port *port, struct obuf *out)
 		 */
 		int keys = 3;
 		return sql_get_prepare_common_keys(stmt, out, keys);
+	}
+	case UNPREPARE: {
+		int size = mp_sizeof_map(0);
+		char *pos = obuf_alloc(out, size);
+		if (pos == NULL) {
+			diag_set(OutOfMemory, size, "obuf_alloc", "pos");
+			return -1;
 		}
+		mp_encode_map(pos, 0);
+		break;
+	}
 	default: {
 		unreachable();
 	}

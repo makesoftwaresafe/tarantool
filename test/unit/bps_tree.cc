@@ -1,16 +1,35 @@
-#include <stdint.h>
-#include <stdio.h>
-#include <stdbool.h>
-#include <inttypes.h>
-#include <time.h>
+#include <cstdint>
+#include <cstdio>
+#include <cinttypes>
+#include <ctime>
+#include <climits>
 
-#include "unit.h"
 #include "sptree.h"
 #include "qsort_arg.h"
+#include "trivia/util.h"
 
-#ifndef MAX
-#define MAX(a,b) (((a)>(b))?(a):(b))
-#endif //#ifndef MAX
+#define UNIT_TAP_COMPATIBLE 1
+#include "unit.h"
+
+/* Select the tree flavor to test. */
+#if defined(TEST_DEFAULT)
+# define SMALL_BLOCK_SIZE 128
+#elif defined(TEST_INNER_CARD)
+# define BPS_INNER_CARD
+# define SMALL_BLOCK_SIZE 128
+#elif defined(TEST_INNER_CHILD_CARDS)
+# define BPS_INNER_CHILD_CARDS
+/*
+ * Some branches lead to dummy rebalancing (moving data of zero size) when
+ * the block size is small because of integer arithmetic on reballancing.
+ * This raises assertions, because some data movement routines are designed
+ * to only move non-zero amount of data. Let's make the block size greater
+ * for this tree flavor to prevent this.
+ */
+# define SMALL_BLOCK_SIZE 256
+#else
+# error "Please define TEST_DEFAULT, TEST_INNER_CARD or TEST_INNER_CHILD_CARDS."
+#endif
 
 SPTREE_DEF(test, realloc, qsort_arg);
 
@@ -43,7 +62,7 @@ compare(type_t a, type_t b);
 
 /* true tree with true settings */
 #define BPS_TREE_NAME test
-#define BPS_TREE_BLOCK_SIZE 128 /* value is to low specially for tests */
+#define BPS_TREE_BLOCK_SIZE SMALL_BLOCK_SIZE /* small value for tests */
 #define BPS_TREE_EXTENT_SIZE 2048 /* value is to low specially for tests */
 #define BPS_TREE_IS_IDENTICAL(a, b) (a == b)
 #define BPS_TREE_COMPARE(a, b, arg) compare(a, b)
@@ -85,7 +104,7 @@ static int compare_key(const elem_t &a, long b)
 }
 
 #define BPS_TREE_NAME struct_tree
-#define BPS_TREE_BLOCK_SIZE 128 /* value is to low specially for tests */
+#define BPS_TREE_BLOCK_SIZE SMALL_BLOCK_SIZE /* small value for tests */
 #define BPS_TREE_EXTENT_SIZE 2048 /* value is to low specially for tests */
 #define BPS_TREE_IS_IDENTICAL(a, b) equal(a, b)
 #define BPS_TREE_COMPARE(a, b, arg) compare(a, b)
@@ -106,7 +125,7 @@ static int compare_key(const elem_t &a, long b)
 
 /* tree for approximate_count test */
 #define BPS_TREE_NAME approx
-#define BPS_TREE_BLOCK_SIZE 128 /* value is to low specially for tests */
+#define BPS_TREE_BLOCK_SIZE SMALL_BLOCK_SIZE /* small value for tests */
 #define BPS_TREE_EXTENT_SIZE 2048 /* value is to low specially for tests */
 #define BPS_TREE_IS_IDENTICAL(a, b) (a == b)
 #define BPS_TREE_COMPARE(a, b, arg) ((a) < (b) ? -1 : (a) > (b) ? 1 : 0)
@@ -115,6 +134,15 @@ static int compare_key(const elem_t &a, long b)
 #define bps_tree_key_t uint32_t
 #define bps_tree_arg_t int
 #include "salad/bps_tree.h"
+
+#define debug_check(tree) do { \
+	int result = test_debug_check((tree)); \
+	if (result) { \
+		test_print((tree), TYPE_F); \
+		printf("debug check = %08x", result); \
+		fail("debug check nonzero", "true"); \
+	} \
+} while (false)
 
 #define bps_insert_and_check(tree_name, tree, elem, replaced) \
 {\
@@ -130,6 +158,7 @@ static int compare_key(const elem_t &a, long b)
 			fail("elem != check_value", "true");\
 		}\
 	}\
+	debug_check((tree));\
 }
 
 static int
@@ -147,26 +176,27 @@ compare(type_t a, type_t b)
 static int extents_count = 0;
 
 static void *
-extent_alloc(void *ctx)
+extent_alloc(struct matras_allocator *allocator)
 {
-	int *p_extents_count = (int *)ctx;
-	assert(p_extents_count == &extents_count);
-	++*p_extents_count;
-	return malloc(BPS_TREE_EXTENT_SIZE);
+	(void)allocator;
+	++extents_count;
+	return xmalloc(BPS_TREE_EXTENT_SIZE);
 }
 
 static void
-extent_free(void *ctx, void *extent)
+extent_free(struct matras_allocator *allocator, void *extent)
 {
-	int *p_extents_count = (int *)ctx;
-	assert(p_extents_count == &extents_count);
-	--*p_extents_count;
+	(void)allocator;
+	--extents_count;
 	free(extent);
 }
+
+struct matras_allocator allocator;
 
 static void
 simple_check()
 {
+	plan(4);
 	header();
 
 	struct matras_stats stats;
@@ -175,19 +205,14 @@ simple_check()
 
 	const unsigned int rounds = 2000;
 	test tree;
-	test_create(&tree, 0, extent_alloc, extent_free, &extents_count,
-		    &stats);
+	test_create(&tree, 0, &allocator, &stats);
 
-	printf("Insert 1..X, remove 1..X\n");
 	for (unsigned int i = 0; i < rounds; i++) {
 		type_t v = i;
 		if (test_find(&tree, v) != NULL)
 			fail("element already in tree (1)", "true");
 		test_insert(&tree, v, 0, 0);
-		if (test_debug_check(&tree)) {
-			test_print(&tree, TYPE_F);
-			fail("debug check nonzero", "true");
-		}
+		debug_check(&tree);
 	}
 	if (test_size(&tree) != rounds)
 		fail("Tree count mismatch (1)", "true");
@@ -198,27 +223,22 @@ simple_check()
 		type_t v = i;
 		if (test_find(&tree, v) == NULL)
 			fail("element in tree (1)", "false");
-		test_delete(&tree, v);
-		if (test_debug_check(&tree)) {
-			test_print(&tree, TYPE_F);
-			fail("debug check nonzero", "true");
-		}
+		test_delete(&tree, v, NULL);
+		debug_check(&tree);
 	}
 	if (test_size(&tree) != 0)
 		fail("Tree count mismatch (2)", "true");
 	if ((int)stats.extent_count != extents_count)
 		fail("Extent count mismatch (2)", "true");
 
-	printf("Insert 1..X, remove X..1\n");
+	ok(true, "Insert 1..X, remove 1..X");
+
 	for (unsigned int i = 0; i < rounds; i++) {
 		type_t v = i;
 		if (test_find(&tree, v) != NULL)
 			fail("element already in tree (2)", "true");
 		test_insert(&tree, v, 0, 0);
-		if (test_debug_check(&tree)) {
-			test_print(&tree, TYPE_F);
-			fail("debug check nonzero", "true");
-		}
+		debug_check(&tree);
 	}
 	if (test_size(&tree) != rounds)
 		fail("Tree count mismatch (3)", "true");
@@ -229,27 +249,22 @@ simple_check()
 		type_t v = rounds - 1 - i;
 		if (test_find(&tree, v) == NULL)
 			fail("element in tree (2)", "false");
-		test_delete(&tree, v);
-		if (test_debug_check(&tree)) {
-			test_print(&tree, TYPE_F);
-			fail("debug check nonzero", "true");
-		}
+		test_delete(&tree, v, NULL);
+		debug_check(&tree);
 	}
 	if (test_size(&tree) != 0)
 		fail("Tree count mismatch (4)", "true");
 	if ((int)stats.extent_count != extents_count)
 		fail("Extent count mismatch (4)", "true");
 
-	printf("Insert X..1, remove 1..X\n");
+	ok(true, "Insert 1..X, remove X..1");
+
 	for (unsigned int i = 0; i < rounds; i++) {
 		type_t v = rounds - 1 - i;
 		if (test_find(&tree, v) != NULL)
 			fail("element already in tree (3)", "true");
 		test_insert(&tree, v, 0, 0);
-		if (test_debug_check(&tree)) {
-			test_print(&tree, TYPE_F);
-			fail("debug check nonzero", "true");
-		}
+		debug_check(&tree);
 	}
 	if (test_size(&tree) != rounds)
 		fail("Tree count mismatch (5)", "true");
@@ -260,27 +275,22 @@ simple_check()
 		type_t v = i;
 		if (test_find(&tree, v) == NULL)
 			fail("element in tree (3)", "false");
-		test_delete(&tree, v);
-		if (test_debug_check(&tree)) {
-			test_print(&tree, TYPE_F);
-			fail("debug check nonzero", "true");
-		}
+		test_delete(&tree, v, NULL);
+		debug_check(&tree);
 	}
 	if (test_size(&tree) != 0)
 		fail("Tree count mismatch (6)", "true");
 	if ((int)stats.extent_count != extents_count)
 		fail("Extent count mismatch (6)", "true");
 
-	printf("Insert X..1, remove X..1\n");
+	ok(true, "Insert X..1, remove 1..X");
+
 	for (unsigned int i = 0; i < rounds; i++) {
 		type_t v = rounds - 1 - i;
 		if (test_find(&tree, v) != NULL)
 			fail("element already in tree (4)", "true");
 		test_insert(&tree, v, 0, 0);
-		if (test_debug_check(&tree)) {
-			fail("debug check nonzero", "true");
-			test_print(&tree, TYPE_F);
-		}
+		debug_check(&tree);
 	}
 	if (test_size(&tree) != rounds)
 		fail("Tree count mismatch (7)", "true");
@@ -291,20 +301,20 @@ simple_check()
 		type_t v = rounds - 1 - i;
 		if (test_find(&tree, v) == NULL)
 			fail("element in tree (4)", "false");
-		test_delete(&tree, v);
-		if (test_debug_check(&tree)) {
-			test_print(&tree, TYPE_F);
-			fail("debug check nonzero", "true");
-		}
+		test_delete(&tree, v, NULL);
+		debug_check(&tree);
 	}
 	if (test_size(&tree) != 0)
 		fail("Tree count mismatch (8)", "true");
 	if ((int)stats.extent_count != extents_count)
 		fail("Extent count mismatch (8)", "true");
 
+	ok(true, "Insert X..1, remove X..1");
+
 	test_destroy(&tree);
 
 	footer();
+	check_plan();
 }
 
 static bool
@@ -331,13 +341,11 @@ check_trees_are_identical(test *tree, sptree_test *spt_test)
 static void
 compare_with_sptree_check()
 {
-	header();
-
 	sptree_test spt_test;
 	sptree_test_init(&spt_test, sizeof(type_t), 0, 0, 0, &node_comp, 0, 0);
 
 	test tree;
-	test_create(&tree, 0, extent_alloc, extent_free, &extents_count, NULL);
+	test_create(&tree, 0, &allocator, NULL);
 
 	const int rounds = 16 * 1024;
 	const int elem_limit = 	1024;
@@ -354,11 +362,10 @@ compare_with_sptree_check()
 			test_insert(&tree, rnd, 0, 0);
 		} else {
 			sptree_test_delete(&spt_test, &rnd);
-			test_delete(&tree, rnd);
+			test_delete(&tree, rnd, NULL);
 		}
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
 
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
@@ -367,21 +374,22 @@ compare_with_sptree_check()
 
 	test_destroy(&tree);
 
-	footer();
+	ok(true, "compare with sptree");
 }
 
 static void
 compare_with_sptree_check_branches()
 {
+	plan(4);
 	header();
 
 	sptree_test spt_test;
 	sptree_test_init(&spt_test, sizeof(type_t), 0, 0, 0, &node_comp, 0, 0);
 
 	test tree;
-	test_create(&tree, 0, extent_alloc, extent_free, &extents_count, NULL);
+	test_create(&tree, 0, &allocator, NULL);
 
-	const int elem_limit = 1024;
+	const int elem_limit = 2048;
 
 	for (int i = 0; i < elem_limit; i++) {
 		type_t v = (type_t)i;
@@ -396,8 +404,8 @@ compare_with_sptree_check_branches()
 		sptree_test_replace(&spt_test, &v, NULL);
 		test_insert(&tree, v, 0, 0);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
@@ -411,10 +419,10 @@ compare_with_sptree_check_branches()
 			fail("trees integrity", "false");
 
 		sptree_test_delete(&spt_test, &v);
-		test_delete(&tree, v);
+		test_delete(&tree, v, NULL);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
@@ -431,8 +439,8 @@ compare_with_sptree_check_branches()
 		sptree_test_replace(&spt_test, &v, NULL);
 		test_insert(&tree, v, 0, 0);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
@@ -446,10 +454,10 @@ compare_with_sptree_check_branches()
 			fail("trees integrity", "false");
 
 		sptree_test_delete(&spt_test, &v);
-		test_delete(&tree, v);
+		test_delete(&tree, v, NULL);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
@@ -466,8 +474,8 @@ compare_with_sptree_check_branches()
 		sptree_test_replace(&spt_test, &v, NULL);
 		test_insert(&tree, v, 0, 0);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
@@ -485,10 +493,10 @@ compare_with_sptree_check_branches()
 			fail("trees integrity", "false");
 
 		sptree_test_delete(&spt_test, &v);
-		test_delete(&tree, v);
+		test_delete(&tree, v, NULL);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
@@ -505,8 +513,8 @@ compare_with_sptree_check_branches()
 		sptree_test_replace(&spt_test, &v, NULL);
 		test_insert(&tree, v, 0, 0);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
@@ -524,10 +532,10 @@ compare_with_sptree_check_branches()
 			fail("trees integrity", "false");
 
 		sptree_test_delete(&spt_test, &v);
-		test_delete(&tree, v);
+		test_delete(&tree, v, NULL);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
@@ -548,8 +556,8 @@ compare_with_sptree_check_branches()
 		sptree_test_replace(&spt_test, &v, NULL);
 		test_insert(&tree, v, 0, 0);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
@@ -567,53 +575,49 @@ compare_with_sptree_check_branches()
 			fail("trees integrity", "false");
 
 		sptree_test_delete(&spt_test, &v);
-		test_delete(&tree, v);
+		test_delete(&tree, v, NULL);
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
+
 		if (!check_trees_are_identical(&tree, &spt_test))
 			fail("trees identity", "false");
 	}
 
-	if (tree.common.debug_insert_leaf_branches_mask !=
-	    tree.common.debug_insert_leaf_branches_max_mask)
-		fail("not all insert leaf branches was tested", "true");
-	if (tree.common.debug_insert_inner_branches_mask !=
-	    tree.common.debug_insert_inner_branches_max_mask)
-		fail("not all insert inner branches was tested", "true");
-	if (tree.common.debug_delete_leaf_branches_mask !=
-	    tree.common.debug_delete_leaf_branches_max_mask)
-		fail("not all delete leaf branches was tested", "true");
-	if (tree.common.debug_delete_inner_branches_mask !=
-	    tree.common.debug_delete_inner_branches_max_mask)
-		fail("not all delete inner branches was tested", "true");
+	is(tree.common.debug_insert_leaf_branches_mask,
+	   tree.common.debug_insert_leaf_branches_max_mask,
+	   "all insert leaf branches tested");
+	is(tree.common.debug_insert_inner_branches_mask,
+	   tree.common.debug_insert_inner_branches_max_mask,
+	   "all insert inner branches tested");
+	is(tree.common.debug_delete_leaf_branches_mask,
+	   tree.common.debug_delete_leaf_branches_max_mask,
+	   "all delete leaf branches tested");
+	is(tree.common.debug_delete_inner_branches_mask,
+	   tree.common.debug_delete_inner_branches_max_mask,
+	   "all delete inner branches tested");
 
 	sptree_test_destroy(&spt_test);
 
 	test_destroy(&tree);
 
 	footer();
+	check_plan();
 }
 
 static void
 bps_tree_debug_self_check()
 {
-	header();
-
 	int res = test_debug_check_internal_functions(false);
-	if (res)
+	if (res) {
 		printf("self test returned error %d\n", res);
-
-	test_debug_check_internal_functions(true);
-
-	footer();
+		test_debug_check_internal_functions(true);
+	}
+	ok(res == 0, "debug self-check");
 }
 
 static void
 loading_test()
 {
-	header();
-
 	test tree;
 
 	const type_t test_count = 1000;
@@ -622,14 +626,12 @@ loading_test()
 		arr[i] = i;
 
 	for (type_t i = 0; i <= test_count; i++) {
-		test_create(&tree, 0, extent_alloc, extent_free,
-			    &extents_count, NULL);
+		test_create(&tree, 0, &allocator, NULL);
 
 		if (test_build(&tree, arr, i))
 			fail("building failed", "true");
 
-		if (test_debug_check(&tree))
-			fail("debug check nonzero", "true");
+		debug_check(&tree);
 
 		struct test_iterator iterator;
 		iterator = test_first(&tree);
@@ -645,103 +647,91 @@ loading_test()
 		test_destroy(&tree);
 	}
 
-	footer();
+	ok(true, "loading test");
 }
 
 static void
 printing_test()
 {
-	header();
-
 	test tree;
-	test_create(&tree, 0, extent_alloc, extent_free, &extents_count, NULL);
-
+	test_create(&tree, 0, &allocator, NULL);
 	const type_t rounds = 22;
-
 	for (type_t i = 0; i < rounds; i++) {
 		type_t v = rounds + i;
-		printf("Inserting " TYPE_F "\n", v);
+		note("Inserting " TYPE_F "\n", v);
 		test_insert(&tree, v, 0, 0);
 		test_print(&tree, TYPE_F);
 		v = rounds - i - 1;
-		printf("Inserting " TYPE_F "\n", v);
+		note("Inserting " TYPE_F "\n", v);
 		test_insert(&tree, v, 0, 0);
 		test_print(&tree, TYPE_F);
 	}
-
 	test_destroy(&tree);
-
-	footer();
+	ok(true, "printing test");
 }
 
 static void
 white_box_test()
 {
+	plan(8);
 	header();
 
 	test tree;
-	test_create(&tree, 0, extent_alloc, extent_free, &extents_count, NULL);
 
-	assert(BPS_TREE_test_MAX_COUNT_IN_LEAF == 14);
-	assert(BPS_TREE_test_MAX_COUNT_IN_INNER == 10);
+	const int count_in_leaf = BPS_TREE_test_MAX_COUNT_IN_LEAF;
+	const int count_in_inner = BPS_TREE_test_MAX_COUNT_IN_INNER;
 
-	printf("full leaf:\n");
-	for (type_t i = 0; i < 14; i++) {
+	test_create(&tree, 0, &allocator, NULL);
+
+	for (type_t i = 0; i < count_in_leaf; i++)
 		test_insert(&tree, i, 0, 0);
-	}
-	test_print(&tree, TYPE_F);
+	is(tree.common.leaf_count, 1, "full leaf");
 
-	printf("split now:\n");
-	test_insert(&tree, 14, 0, 0);
-	test_print(&tree, TYPE_F);
+	test_insert(&tree, count_in_leaf, 0, 0);
+	is(tree.common.leaf_count, 2, "first split");
 
-	printf("full 2 leafs:\n");
-	for (type_t i = 15; i < 28; i++) {
+	for (type_t i = count_in_leaf + 1; i < count_in_leaf * 2; i++)
 		test_insert(&tree, i, 0, 0);
-	}
-	test_print(&tree, TYPE_F);
+	is(tree.common.leaf_count, 2, "full two leafs");
 
-	printf("split now:\n");
-	test_insert(&tree, 28, 0, 0);
-	test_print(&tree, TYPE_F);
+	test_insert(&tree, count_in_leaf * 2, 0, 0);
+	is(tree.common.leaf_count, 3, "second split");
 
-	printf("full 3 leafs:\n");
-	for (type_t i = 29; i < 42; i++) {
+	for (type_t i = count_in_leaf * 2 + 1; i < count_in_leaf * 3; i++)
 		test_insert(&tree, i, 0, 0);
-	}
-	test_print(&tree, TYPE_F);
+	is(tree.common.leaf_count, 3, "full three leafs");
 
-	printf("split now:\n");
-	test_insert(&tree, 42, 0, 0);
-	test_print(&tree, TYPE_F);
+	test_insert(&tree, count_in_leaf * 3, 0, 0);
+	is(tree.common.leaf_count, 4, "third split");
 
 	test_destroy(&tree);
-	test_create(&tree, 0, extent_alloc, extent_free, &extents_count, NULL);
-	type_t arr[140];
-	for (type_t i = 0; i < 140; i++)
-		arr[i] = i;
-	test_build(&tree, arr, 140);
-	printf("full 10 leafs:\n");
-	test_print(&tree, TYPE_F);
 
-	printf("2-level split now:\n");
-	test_insert(&tree, 140, 0, 0);
-	test_print(&tree, TYPE_F);
+	test_create(&tree, 0, &allocator, NULL);
+
+	type_t arr[count_in_leaf * count_in_inner];
+	for (type_t i = 0; i < count_in_leaf * count_in_inner; i++)
+		arr[i] = i;
+	test_build(&tree, arr, count_in_leaf * count_in_inner);
+	fail_unless(tree.common.leaf_count == count_in_inner);
+	fail_unless(tree.common.inner_count == 1);
+	is(tree.common.size, count_in_leaf * count_in_inner, "full 2 levels");
+
+	test_insert(&tree, count_in_leaf * count_in_inner, 0, 0);
+	is(tree.common.inner_count, 3, "2-level split");
 
 	test_destroy(&tree);
 
 	footer();
+	check_plan();
 }
 
 static void
 approximate_count()
 {
-	header();
 	srand(0);
 
 	approx tree;
-	approx_create(&tree, 0, extent_alloc, extent_free, &extents_count,
-		      NULL);
+	approx_create(&tree, 0, &allocator, NULL);
 
 	uint32_t in_leaf_max_count = BPS_TREE_approx_MAX_COUNT_IN_LEAF;
 	uint32_t in_leaf_min_count = in_leaf_max_count * 2 / 3;
@@ -771,7 +761,7 @@ approximate_count()
 	for (uint64_t i = 1; i <= long_sequence_count; i++)
 		for (uint64_t j = 0; j < i * long_sequence_multiplier; j++)
 			arr[count++] = ((i * 100 + 50) << 32) | j;
-	printf("Count: %llu %u\n", (unsigned long long)count, arr_size);
+	fail_unless(count == arr_size);
 	assert(count == arr_size);
 
 	for (uint64_t i = 0; i < count * 10; i++) {
@@ -784,8 +774,7 @@ approximate_count()
 
 	for (uint64_t i = 0; i < count; i++)
 		approx_insert(&tree, arr[i], NULL, NULL);
-
-	printf("Count: %zu\n", approx_size(&tree));
+	fail_unless(approx_size(&tree) == arr_size);
 
 	count = 0;
 	int err_count = 0;
@@ -830,21 +819,17 @@ approximate_count()
 		}
 	};
 
-	printf("Error count: %d\n", err_count);
-	printf("Count: %llu\n", (unsigned long long)count);
+	fail_unless(err_count == 0);
+	is(count, arr_size, "approximate count");
 
 	approx_destroy(&tree);
-
-	footer();
 }
 
 static void
 insert_get_iterator()
 {
-	header();
-
 	test tree;
-	test_create(&tree, 0, extent_alloc, extent_free, &extents_count, NULL);
+	test_create(&tree, 0, &allocator, NULL);
 	type_t value = 100000;
 
 	bps_insert_and_check(test, &tree, value, NULL)
@@ -854,45 +839,55 @@ insert_get_iterator()
 	for (i = -2; i > -10000; i -= 2)
 		bps_insert_and_check(test, &tree, i, NULL);
 	for (i = -9999; i < 10000; i += 2)
-		bps_insert_and_check(test, &tree, i, NULL)
+		bps_insert_and_check(test, &tree, i, NULL);
 
-	footer();
+	test_destroy(&tree);
+	ok(true, "insert and get iterator");
 }
 
 static void
 delete_value_check()
 {
+	plan(2);
 	header();
+
 	struct_tree tree;
-	struct_tree_create(&tree, 0, extent_alloc, extent_free, &extents_count,
-			   NULL);
+	struct_tree_create(&tree, 0, &allocator, NULL);
 	struct elem_t e1 = {1, 1};
 	struct_tree_insert(&tree, e1, NULL, NULL);
 	struct elem_t e2 = {1, 2};
-	if (struct_tree_delete_value(&tree, e2, NULL) == 0)
-		fail("deletion of the non-identical element must fail", "false");
-	if (struct_tree_find(&tree, 1) == NULL)
-		fail("test non-identical element deletion failure", "false");
-	if (struct_tree_delete_value(&tree, e1, NULL) != 0)
-		fail("deletion of the identical element must not fail", "false");
-	if (struct_tree_find(&tree, 1) != NULL)
-		fail("test identical element deletion completion", "false");
+	struct elem_t deleted = {LONG_MAX, LONG_MAX};
+
+	fail_unless(struct_tree_delete_value(&tree, e2, &deleted) == 0);
+	fail_unless(deleted.info == LONG_MAX);
+	fail_unless(deleted.marker == LONG_MAX);
+	fail_unless(struct_tree_find(&tree, 1) != NULL);
+	fail_unless(struct_tree_debug_check(&tree) == 0);
+	ok(true, "deletion of non-identical element fails");
+
+	fail_unless(struct_tree_delete_value(&tree, e1, &deleted) == 0);
+	fail_unless(deleted.info == e1.info);
+	fail_unless(deleted.marker == e1.marker);
+	fail_unless(struct_tree_find(&tree, 1) == NULL);
+	fail_unless(struct_tree_debug_check(&tree) == 0);
+	ok(true, "deletion of identical element succeeds");
+
 	struct_tree_destroy(&tree);
+
 	footer();
+	check_plan();
 }
 
 static void
 insert_successor_test()
 {
-	header();
 	test tree;
 
 	size_t limits[] = {20, 2000};
 
 	for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
 		size_t limit = limits[i];
-		test_create(&tree, 0, extent_alloc, extent_free, &extents_count,
-			    NULL);
+		test_create(&tree, 0, &allocator, NULL);
 
 		for (size_t j = 0; j < limit; j++) {
 			type_t v = 1 + rand() % (limit - 1);
@@ -922,13 +917,18 @@ insert_successor_test()
 		test_destroy(&tree);
 	}
 
-	footer();
+	ok(true, "successor test");
 }
-
 
 int
 main(void)
 {
+	plan(12);
+	header();
+
+	matras_allocator_create(&allocator, BPS_TREE_EXTENT_SIZE,
+				extent_alloc, extent_free);
+
 	simple_check();
 	compare_with_sptree_check();
 	compare_with_sptree_check_branches();
@@ -937,9 +937,13 @@ main(void)
 	printing_test();
 	white_box_test();
 	approximate_count();
-	if (extents_count != 0)
-		fail("memory leak!", "true");
+	ok(extents_count == allocator.num_reserved_extents, "leak check");
 	insert_get_iterator();
 	delete_value_check();
 	insert_successor_test();
+
+	matras_allocator_destroy(&allocator);
+
+	footer();
+	return check_plan();
 }

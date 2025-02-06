@@ -98,19 +98,39 @@ vy_tuple_new(struct tuple_format *format, const char *data, const char *end)
 static void
 vy_tuple_delete(struct tuple_format *format, struct tuple *tuple)
 {
-	say_debug("%s(%p)", __func__, tuple);
+	struct vy_stmt_env *env = format->engine;
+	size_t size = tuple_size(tuple);
 	assert(tuple_is_unreferenced(tuple));
 	/*
 	 * Turn off formats referencing in worker threads to avoid
 	 * multithread unsafe modifications of a reference
 	 * counter.
 	 */
-	if (cord_is_main())
+	if (cord_is_main()) {
+		if (format != env->key_format) {
+			assert(env->sum_tuple_size >= size);
+			env->sum_tuple_size -= size;
+		}
 		tuple_format_unref(format);
+	}
 #ifndef NDEBUG
-	memset(tuple, '#', tuple_size(tuple)); /* fail early */
+	memset(tuple, '#', size); /* fail early */
 #endif
 	free(tuple);
+}
+
+/** Fill `tuple_info'. */
+static void
+vy_tuple_info(struct tuple_format *format, struct tuple *tuple,
+	      struct tuple_info *tuple_info)
+{
+	(void)format;
+	uint16_t data_offset = tuple_data_offset(tuple);
+	tuple_info->data_size = tuple_bsize(tuple);
+	tuple_info->header_size = sizeof(struct vy_stmt);
+	tuple_info->field_map_size = data_offset - tuple_info->header_size;
+	tuple_info->waste_size = 0;
+	tuple_info->arena_type = TUPLE_ARENA_MALLOC;
 }
 
 void
@@ -118,7 +138,9 @@ vy_stmt_env_create(struct vy_stmt_env *env)
 {
 	env->tuple_format_vtab.tuple_new = vy_tuple_new;
 	env->tuple_format_vtab.tuple_delete = vy_tuple_delete;
+	env->tuple_format_vtab.tuple_info = vy_tuple_info;
 	env->max_tuple_size = 1024 * 1024;
+	env->sum_tuple_size = 0;
 	env->key_format = vy_simple_stmt_format_new(env, NULL, 0);
 	if (env->key_format == NULL)
 		panic("failed to create vinyl key format");
@@ -137,6 +159,39 @@ vy_simple_stmt_format_new(struct vy_stmt_env *env,
 {
 	return simple_tuple_format_new(&env->tuple_format_vtab,
 				       env, keys, key_count);
+}
+
+bool
+vy_stmt_is_exact_key(struct tuple *stmt, struct key_def *cmp_def,
+		     struct key_def *key_def, bool is_unique)
+{
+	/* A tuple has all primary key parts => exact. */
+	if (!vy_stmt_is_key(stmt))
+		return true;
+	const char *data = tuple_data(stmt);
+	uint32_t part_count = mp_decode_array(&data);
+	/* Extended key (with primary key parts) => exact. */
+	if (part_count == cmp_def->part_count)
+		return true;
+	/* Non-unique index => not exact. */
+	if (!is_unique)
+		return false;
+	/* Partial key => not exact. */
+	if (part_count < key_def->part_count)
+		return false;
+	/*
+	 * For a unique nullable index, presence of all key parts doesn't
+	 * guarantee that the key is exact - we also have to check that
+	 * the key doesn't have nulls.
+	 */
+	if (!key_def->is_nullable)
+		return true;
+	for (uint32_t i = 0; i < key_def->part_count; i++) {
+		if (mp_typeof(*data) == MP_NIL)
+			return false;
+		mp_next(&data);
+	}
+	return true;
 }
 
 /**
@@ -162,31 +217,27 @@ vy_stmt_alloc(struct tuple_format *format, uint32_t data_offset, uint32_t bsize)
 	uint32_t total_size = data_offset + bsize;
 	if (unlikely(total_size > env->max_tuple_size)) {
 		diag_set(ClientError, ER_VINYL_MAX_TUPLE_SIZE,
-			 (unsigned) total_size);
+			 (unsigned)total_size, env->max_tuple_size);
 		error_log(diag_last_error(diag_get()));
 		return NULL;
 	}
-#ifndef NDEBUG
-	struct errinj *inj = errinj(ERRINJ_VY_STMT_ALLOC, ERRINJ_INT);
-	if (inj != NULL && inj->iparam >= 0) {
-		if (inj->iparam-- == 0) {
-			diag_set(OutOfMemory, total_size, "malloc",
-				 "struct vy_stmt");
-			return NULL;
-		}
-	}
-#endif
+	ERROR_INJECT_COUNTDOWN(ERRINJ_VY_STMT_ALLOC_COUNTDOWN, {
+		diag_set(ClientError, ER_INJECTION,
+			 "vinyl statement allocate");
+		return NULL;
+	});
 	struct tuple *tuple = malloc(total_size);
 	if (unlikely(tuple == NULL)) {
 		diag_set(OutOfMemory, total_size, "malloc", "struct vy_stmt");
 		return NULL;
 	}
-	say_debug("vy_stmt_alloc(format = %d data_offset = %u, bsize = %u) = %p",
-		  format->id, data_offset, bsize, tuple);
 	tuple_create(tuple, 1, tuple_format_id(format),
 		     data_offset, bsize, false);
-	if (cord_is_main())
+	if (cord_is_main()) {
+		if (format != env->key_format)
+			env->sum_tuple_size += total_size;
 		tuple_format_ref(format);
+	}
 	vy_stmt_set_lsn(tuple, 0);
 	vy_stmt_set_type(tuple, 0);
 	vy_stmt_set_flags(tuple, 0);
@@ -429,9 +480,7 @@ vy_stmt_new_surrogate_delete_raw(struct tuple_format *format,
 		return NULL;
 	}
 	struct field_map_builder builder;
-	if (field_map_builder_create(&builder, format->field_map_size,
-				     region) != 0)
-		goto out;
+	field_map_builder_create(&builder, format->field_map_size, region);
 	/*
 	 * Perform simultaneous parsing of the tuple and
 	 * format::fields tree traversal to copy indexed field
@@ -465,11 +514,12 @@ vy_stmt_new_surrogate_delete_raw(struct tuple_format *format,
 		}
 		/* Initialize field_map with data offset. */
 		uint32_t offset_slot = entry.field->offset_slot;
-		if (offset_slot != TUPLE_OFFSET_SLOT_NIL &&
-		    field_map_builder_set_slot(&builder, offset_slot,
-					pos - data, entry.multikey_idx,
-					entry.multikey_count, region) != 0)
-			goto out;
+		if (offset_slot != TUPLE_OFFSET_SLOT_NIL)
+			field_map_builder_set_slot(&builder, offset_slot,
+						   pos - data,
+						   entry.multikey_idx,
+						   entry.multikey_count,
+						   region);
 		/* Copy field data. */
 		if (entry.field->type == FIELD_TYPE_ARRAY) {
 			pos = mp_encode_array(pos, entry.count);
@@ -704,6 +754,11 @@ vy_stmt_encode_secondary(struct tuple *value, struct key_def *cmp_def,
 struct tuple *
 vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format)
 {
+	ERROR_INJECT_COUNTDOWN(ERRINJ_VY_STMT_DECODE_COUNTDOWN, {
+		diag_set(ClientError, ER_INJECTION,
+			 "vinyl statement decode");
+		return NULL;
+	});
 	struct vy_stmt_env *env = format->engine;
 	struct request request;
 	uint64_t key_map = dml_request_key_map(xrow->type);

@@ -306,13 +306,13 @@ end)
 
 g.test_box_error = function()
     t.assert_error_msg_equals(
-        "Illegal parameters, Netbox text protocol support was dropped, "..
+        "Netbox text protocol support was dropped, "..
         "please use require('console').connect() instead",
         net.connect, g.server.net_box_uri, {console = true})
     local c = net.connect(g.server.net_box_uri)
 
     t.assert_error_msg_equals(
-        "Illegal parameters, query id is expected to be numeric",
+        "query id is expected to be numeric",
         c.unprepare, c, "asd")
     c:close()
 end
@@ -368,4 +368,21 @@ g.test_sync_request_in_trigger = function()
     check() -- on_connect
     check() -- on_schema_reload
     c:close()
+end
+
+-- Test that the concurrent closing of a connection works correctly.
+g.test_worker_yield_from_on_connect_trigger = function()
+    local c = net.connect(g.server.net_box_uri)
+
+    local fibers = {}
+    for _ = 1, 64 do
+        local f = fiber.new(function() c:close() end)
+        f:set_joinable(true)
+        table.insert(fibers, f)
+    end
+    for _, f in ipairs(fibers) do
+       f:join()
+    end
+
+    t.assert_equals(c:wait_state('closed'), true)
 end

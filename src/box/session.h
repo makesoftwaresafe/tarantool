@@ -188,8 +188,11 @@ session_find(uint64_t sid);
 
 /** Global on-connect triggers. */
 extern struct rlist session_on_connect;
+extern struct event *session_on_connect_event;
 
+/** Global on-auth triggers. */
 extern struct rlist session_on_auth;
+extern struct event *session_on_auth_event;
 
 /**
  * Get the current session from @a fiber
@@ -292,6 +295,7 @@ effective_user(void)
 
 /** Global on-disconnect triggers. */
 extern struct rlist session_on_disconnect;
+extern struct event *session_on_disconnect_event;
 
 void
 session_storage_cleanup(int sid);
@@ -394,14 +398,12 @@ int
 access_check_universe(user_access_t access);
 
 /**
- * Same as access_check_universe(), but in case the current user
- * doesn't have universal access, set AccessDeniedError for the
- * given object type and name.
+ * This function is called by public API wrappers around session push.
+ * It logs a deprecation warning. If session push is disabled, it also
+ * sets diag and returns -1.
  */
 int
-access_check_universe_object(user_access_t access,
-			     enum schema_object_type object_type,
-			     const char *object_name);
+session_push_check_deprecation(void);
 
 static inline int
 session_push(struct session *session, struct port *port)

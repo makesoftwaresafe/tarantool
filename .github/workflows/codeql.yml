@@ -27,18 +27,30 @@ jobs:
 
     runs-on: ubuntu-20.04-self-hosted
 
+    timeout-minutes: 60
+
+    container:
+      image: docker.io/tarantool/testing:ubuntu-focal
+      # Mount /dev to the container to be able to mount a disk image inside it
+      # for successful run of the .github/actions/environment action.
+      volumes:
+        - /dev:/dev
+      # Add extra privileges to the container for successful run
+      # of the .github/actions/environment action.
+      options: '--privileged'
+
     steps:
     - name: Prepare checkout
       uses: tarantool/actions/prepare-checkout@master
 
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0
         submodules: recursive
 
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v2
+      uses: github/codeql-action/init@v3
       with:
         languages: ${{ matrix.language }}
 
@@ -52,6 +64,6 @@ jobs:
       run: make -f .test.mk build
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v2
+      uses: github/codeql-action/analyze@v3
       with:
         category: "/language:${{matrix.language}}"

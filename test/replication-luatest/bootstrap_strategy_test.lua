@@ -234,9 +234,25 @@ g_config.test_uuid = function(cg)
     end)
 end
 
-g_config.after_test('test_uuid', function(cg)
-    cg.server1:stop()
+g_config.before_test('test_name', function(cg)
+    cg.replica_set = replica_set:new{}
+    cg.server1 = cg.replica_set:build_and_add_server{
+        alias = 'server1',
+        box_cfg = {
+            bootstrap_strategy = 'config',
+            bootstrap_leader = 'server1name',
+            instance_name = 'server1name',
+            replication = nil,
+        },
+    }
 end)
+
+g_config.test_name = function(cg)
+    cg.replica_set:start()
+    t.helpers.retrying({}, cg.server1.exec, cg.server1, function()
+        t.assert_equals(box.info.status, 'running', 'The server is running')
+    end)
+end
 
 g_config.before_test('test_replication_without_bootstrap_leader', function(cg)
     cg.replica_set = replica_set:new{}
@@ -332,9 +348,49 @@ g_config.after_test('test_single_leader', function(cg)
     cg.server1:stop()
 end)
 
+g_config.before_test('test_dynamic_leader_cfg', function(cg)
+    cg.replica_set = replica_set:new{}
+    cg.server1 = cg.replica_set:build_and_add_server{
+        alias = 'server1',
+        box_cfg = {
+            replication_timeout = 0.1,
+            bootstrap_strategy = 'config',
+            bootstrap_leader = server.build_listen_uri('server1',
+                cg.replica_set.id),
+            replication = server.build_listen_uri('server1', cg.replica_set.id),
+        },
+    }
+end)
+
+g_config.test_dynamic_leader_cfg = function(cg)
+    cg.replica_set:start()
+    cg.server1:exec(function()
+        t.assert_equals(box.info.status, 'running', 'server is working')
+        local other_name = 'other'
+        t.assert_not_equals(box.cfg.bootstrap_leader, other_name)
+        box.cfg{
+            bootstrap_leader = other_name,
+        }
+        t.assert_equals(box.cfg.bootstrap_leader, other_name,
+                        'bootstrap leader is dynamic')
+        box.cfg{
+            bootstrap_strategy = 'auto',
+        }
+        local errmsg = "the option takes no effect when bootstrap " ..
+                       "strategy is not 'config'"
+        t.assert_error_msg_contains(errmsg, box.cfg,
+                                    {bootstrap_leader = 'smth'})
+        box.cfg{
+            bootstrap_leader = '',
+        }
+        t.assert_equals(box.cfg.bootstrap_leader, nil, 'can change to nil')
+    end)
+end
+
 local g_config_success = t.group('gh-7999-bootstrap-strategy-config-success', {
      {leader = 'server3'},
      {leader = uuid3},
+     {leader = 'server3name'},
 })
 
 g_config_success.after_each(function(cg)
@@ -354,6 +410,7 @@ g_config_success.before_test('test_correct_bootstrap_leader', function(cg)
             bootstrap_strategy = 'config',
             bootstrap_leader = bootstrap_leader,
             instance_uuid = uuid1,
+            instance_name = 'server1name',
             replication = {
                 server.build_listen_uri('server1', cg.replica_set.id),
                 server.build_listen_uri('server2', cg.replica_set_a.id),
@@ -367,6 +424,7 @@ g_config_success.before_test('test_correct_bootstrap_leader', function(cg)
         box_cfg = {
             replicaset_uuid = uuida,
             instance_uuid = uuid2,
+            instance_name = 'server2name',
         }
     }
     cg.server3 = cg.replica_set_b:build_and_add_server{
@@ -374,6 +432,7 @@ g_config_success.before_test('test_correct_bootstrap_leader', function(cg)
         box_cfg = {
             replicaset_uuid = uuidb,
             instance_uuid = uuid3,
+            instance_name = 'server3name',
         },
     }
 end)
@@ -418,6 +477,7 @@ g_config_success.before_test('test_wait_only_for_leader', function(cg)
         box_cfg = {
             replicaset_uuid = uuidb,
             instance_uuid = uuid3,
+            instance_name = 'server3name',
         },
     }
 end)
@@ -432,20 +492,39 @@ end
 
 local g_config_fail = t.group('gh-7999-bootstrap-strategy-config-fail')
 
-g_config_fail.test_bad_uri_or_uuid = function()
+g_config_fail.before_each(function(cg)
+    cg.replica_set = replica_set:new{}
+end)
+
+g_config_fail.after_each(function(cg)
+    cg.replica_set:drop()
+end)
+
+g_config_fail.test_bad_uri_or_uuid = function(cg)
+    local cfg_failure = cg.replica_set:build_and_add_server{
+        alias = 'cfg_failure',
+        box_cfg = {bootstrap_strategy = 'config'},
+        env = {['TARANTOOL_RUN_BEFORE_BOX_CFG'] = set_log_before_cfg},
+    }
     local bad_config = {
         {}, -- empty table.
         {'a'}, -- non-empty table.
         {3301},
-        'abracadabra', -- neither a URI or a UUID.
-        'z2345678-1234-1234-1234-12345678', -- not a UUID.
+        '1z345678-1234-1234-1234-12345678', -- not a UUID or a name.
     }
     local errmsg = "Incorrect value for option 'bootstrap_leader':"
+    local logfile = fio.pathjoin(cfg_failure.workdir, 'cfg_failure.log')
     for _, leader in pairs(bad_config) do
-        t.assert_error_msg_contains(errmsg, box.cfg, {
-            bootstrap_strategy = 'config',
-            bootstrap_leader = leader
-        })
+        cfg_failure.box_cfg.bootstrap_leader = leader
+        -- The server will be dropped by after_all.
+        cfg_failure:start{wait_until_ready = false}
+        t.helpers.retrying({}, function()
+            t.assert(cfg_failure:grep_log(errmsg, nil, {filename = logfile}),
+                     'Incorrect option')
+            t.assert(cfg_failure:grep_log('fatal error, exiting the event loop',
+                                          nil, {filename = logfile}),
+                     'Fatal error')
+        end)
     end
 end
 

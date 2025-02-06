@@ -113,6 +113,8 @@ coio_fill_addrinfo(struct addrinfo *ai_local, const char *host,
 		rc = inet_pton(AF_INET6, host, &addr->sin6_addr);
 	}
 	if (rc != 1) {
+		free(ai_local->ai_addr);
+		ai_local->ai_addr = NULL;
 		diag_set(IllegalParams, "Invalid host name: %s", host);
 		return -1;
 	}
@@ -166,12 +168,13 @@ coio_connect_timeout(const char *host, const char *service, int host_hint,
 		return fd;
 	}
 
-	struct addrinfo *ai = NULL;
-	struct addrinfo ai_local;
+	struct addrinfo *ai;
+	struct addrinfo *ai_resolve = NULL;
+	struct addrinfo ai_local = { .ai_addr = NULL };
 	if (host != NULL && service != NULL && host_hint != 0) {
 		if (coio_fill_addrinfo(&ai_local, host, service,
 				       host_hint) != 0)
-			goto out;
+			return -1;
 		ai = &ai_local;
 	} else {
 		struct addrinfo hints;
@@ -179,9 +182,11 @@ coio_connect_timeout(const char *host, const char *service, int host_hint,
 		hints.ai_family = AF_UNSPEC; /* Allow IPv4 or IPv6 */
 		hints.ai_socktype = SOCK_STREAM;
 		hints.ai_flags = AI_ADDRCONFIG;
-		int rc = coio_getaddrinfo(host, service, &hints, &ai, delay);
+		int rc = coio_getaddrinfo(host, service, &hints, &ai_resolve,
+					  delay);
 		if (rc != 0)
 			return -1;
+		ai = ai_resolve;
 	}
 	evio_timeout_update(loop(), &start, &delay);
 	coio_timeout_init(&start, &delay, timeout);
@@ -205,9 +210,9 @@ coio_connect_timeout(const char *host, const char *service, int host_hint,
 	diag_set(SocketError, sio_socketname(fd), "connection failed");
 	return fd;
 out:
-	if (host_hint == 0)
-		freeaddrinfo(ai);
-	else
+	if (ai_resolve != NULL)
+		freeaddrinfo(ai_resolve);
+	if (ai_local.ai_addr != NULL)
 		free(ai_local.ai_addr);
 	return fd;
 }
@@ -270,6 +275,10 @@ coio_read_ahead_timeout(struct iostream *io, void *buf, size_t sz,
 			size_t bufsiz, ev_tstamp timeout)
 {
 	assert(sz <= bufsiz);
+	if (fiber_is_cancelled()) {
+		diag_set(FiberIsCancelled);
+		return -1;
+	}
 	ev_tstamp start, delay;
 	coio_timeout_init(&start, &delay, timeout);
 	ssize_t to_read = (ssize_t) sz;
@@ -368,6 +377,10 @@ ssize_t
 coio_write_timeout(struct iostream *io, const void *buf, size_t sz,
 		   ev_tstamp timeout)
 {
+	if (fiber_is_cancelled()) {
+		diag_set(FiberIsCancelled);
+		return -1;
+	}
 	ssize_t towrite = sz;
 	ev_tstamp start, delay;
 	coio_timeout_init(&start, &delay, timeout);
@@ -422,6 +435,10 @@ ssize_t
 coio_writev_timeout(struct iostream *io, struct iovec *iov, int iovcnt,
 		    size_t size_hint, ev_tstamp timeout)
 {
+	if (fiber_is_cancelled()) {
+		diag_set(FiberIsCancelled);
+		return -1;
+	}
 	size_t total = 0;
 	size_t iov_len = 0;
 	struct iovec *end = iov + iovcnt;

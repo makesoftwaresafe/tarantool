@@ -142,6 +142,31 @@ vy_lsm_new(struct vy_lsm_env *lsm_env, struct vy_cache_env *cache_env,
 
 	struct key_def *key_def = key_def_dup(index_def->key_def);
 	struct key_def *cmp_def = key_def_dup(index_def->cmp_def);
+	/*
+	 * A unique nullable key definition extended with primary key parts
+	 * (cmp_def) assumes that two tuples are equal *without* comparing
+	 * primary key fields if all secondary key fields are equal and not
+	 * nulls, see tuple_compare_slowpath(). This is a hack required to
+	 * ignore the uniqueness constraint for nulls in memtx. The memtx
+	 * engine can't use the secondary key definition as is (key_def) for
+	 * comparing tuples in the index tree, as it does for a non-nullable
+	 * unique index, because this wouldn't allow insertion of any
+	 * duplicates, including nulls. It couldn't use cmp_def without this
+	 * hack, either, because then conflicting tuples with the same
+	 * secondary key fields would always compare as not equal due to
+	 * different primary key parts.
+	 *
+	 * For Vinyl, this hack isn't required because it explicitly skips
+	 * the uniqueness check if any of the indexed fields are nulls, see
+	 * vy_check_is_unique_secondary(). Furthermore, this hack is harmful
+	 * because Vinyl relies on the fact that two tuples compare as equal by
+	 * cmp_def if and only if *all* key fields (both secondary and primary)
+	 * are equal. For example, this is used in the transaction manager,
+	 * which overwrites statements equal by cmp_def, see vy_tx_set_entry().
+	 *
+	 * We disable this hack by resetting unique_part_count in cmp_def.
+	 */
+	cmp_def->unique_part_count = cmp_def->part_count;
 
 	lsm->cmp_def = cmp_def;
 	lsm->key_def = key_def;
@@ -231,7 +256,7 @@ vy_range_tree_free_cb(vy_range_tree_t *t, struct vy_range *range, void *arg)
 	(void)arg;
 	struct vy_slice *slice;
 	rlist_foreach_entry(slice, &range->slices, in_range)
-		vy_slice_wait_pinned(slice);
+		assert(slice->pin_count == 0);
 	vy_range_delete(range);
 	return NULL;
 }
@@ -880,6 +905,35 @@ vy_lsm_set(struct vy_lsm *lsm, struct vy_mem *mem,
 
 	assert(vy_stmt_is_refable(entry.stmt));
 	assert(*region_stmt == NULL || !vy_stmt_is_refable(*region_stmt));
+	assert(vy_stmt_is_key(entry.stmt) ||
+	       format_id == tuple_format_id(mem->format));
+
+	/* Invalidate cache element. */
+	struct vy_entry deleted = vy_entry_none();
+	vy_cache_on_write(&lsm->cache, entry, &deleted);
+
+	/*
+	 * The UPSERT statement can be applied to the cached statement,
+	 * because the cache always contains newest REPLACE statements.
+	 * In such a case the UPSERT, applied to the cached statement,
+	 * can be inserted instead of the original UPSERT.
+	 */
+	bool need_unref = false;
+	if (deleted.stmt != NULL &&
+	    vy_stmt_type(entry.stmt) == IPROTO_UPSERT) {
+		struct vy_entry applied = vy_entry_apply_upsert(
+				entry, deleted, mem->cmp_def, false);
+		/*
+		 * Ignore a memory error, because it is not critical
+		 * to apply the optimization.
+		 */
+		if (applied.stmt != NULL) {
+			entry = applied;
+			need_unref = true;
+		}
+	}
+	if (deleted.stmt != NULL)
+		tuple_unref(deleted.stmt);
 
 	/*
 	 * Allocate region_stmt on demand.
@@ -893,24 +947,18 @@ vy_lsm_set(struct vy_lsm *lsm, struct vy_mem *mem,
 		*region_stmt = vy_stmt_dup_lsregion(entry.stmt,
 						    &mem->env->allocator,
 						    mem->generation);
-		if (*region_stmt == NULL)
-			return -1;
 	}
-	entry.stmt = *region_stmt;
-
-	/* We can't free region_stmt below, so let's add it to the stats */
-	lsm->stat.memory.count.bytes += tuple_size(entry.stmt);
-
-	/* Abort transaction if format was changed by DDL */
-	if (!vy_stmt_is_key(entry.stmt) &&
-	    format_id != tuple_format_id(mem->format)) {
-		diag_set(ClientError, ER_TRANSACTION_CONFLICT);
+	if (need_unref)
+		tuple_unref(entry.stmt);
+	if (*region_stmt == NULL)
 		return -1;
-	}
+
+	entry.stmt = *region_stmt;
+	struct vy_stmt_counter *count = &lsm->stat.memory.count;
 	if (vy_stmt_type(*region_stmt) != IPROTO_UPSERT)
-		return vy_mem_insert(mem, entry);
+		return vy_mem_insert(mem, entry, count);
 	else
-		return vy_mem_insert_upsert(mem, entry);
+		return vy_mem_insert_upsert(mem, entry, count);
 }
 
 /**
@@ -994,25 +1042,18 @@ vy_lsm_commit_stmt(struct vy_lsm *lsm, struct vy_mem *mem,
 {
 	vy_mem_commit_stmt(mem, entry);
 
-	lsm->stat.memory.count.rows++;
-
 	if (vy_stmt_type(entry.stmt) == IPROTO_UPSERT)
 		vy_lsm_commit_upsert(lsm, mem, entry);
 
 	vy_stmt_counter_acct_tuple(&lsm->stat.put, entry.stmt);
-
-	/* Invalidate cache element. */
-	vy_cache_on_write(&lsm->cache, entry, NULL);
 }
 
 void
 vy_lsm_rollback_stmt(struct vy_lsm *lsm, struct vy_mem *mem,
 		     struct vy_entry entry)
 {
-	vy_mem_rollback_stmt(mem, entry);
-
-	/* Invalidate cache element. */
-	vy_cache_on_write(&lsm->cache, entry, NULL);
+	vy_mem_rollback_stmt(mem, entry, &lsm->stat.memory.count);
+	vy_cache_on_rollback(&lsm->cache, entry);
 }
 
 int
@@ -1129,8 +1170,8 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
 	}
 	lsm->range_tree_version++;
 
-	say_info("%s: split range %s by key %s", vy_lsm_name(lsm),
-		 vy_range_str(range), tuple_str(split_key.stmt));
+	say_verbose("%s: split range %s by key %s", vy_lsm_name(lsm),
+		    vy_range_str(range), tuple_str(split_key.stmt));
 
 	rlist_foreach_entry(slice, &range->slices, in_range)
 		vy_slice_wait_pinned(slice);
@@ -1217,8 +1258,8 @@ vy_lsm_coalesce_range(struct vy_lsm *lsm, struct vy_range *range)
 	vy_lsm_add_range(lsm, result);
 	lsm->range_tree_version++;
 
-	say_info("%s: coalesced ranges %s",
-		 vy_lsm_name(lsm), vy_range_str(result));
+	say_verbose("%s: coalesced ranges %s",
+		    vy_lsm_name(lsm), vy_range_str(result));
 	return true;
 
 fail_commit:

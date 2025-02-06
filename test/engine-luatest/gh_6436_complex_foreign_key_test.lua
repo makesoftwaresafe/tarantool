@@ -40,27 +40,27 @@ g.test_bad_complex_foreign_key = function(cg)
         end
         local opts = space_opts({space=false,field={}})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, foreign key: space must be string or number",
+            "foreign key: space must be string or number",
             function() box.schema.create_space('city', opts) end
         )
         local opts = space_opts({space='country',field='country_id'})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, foreign key: field must be a table with local field -> foreign field mapping",
+            "foreign key: field must be a table with local field -> foreign field mapping",
             function() box.schema.create_space('city', opts) end
         )
         opts = space_opts({space='country',field={}})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, foreign key: field must be a table with local field -> foreign field mapping",
+            "foreign key: field must be a table with local field -> foreign field mapping",
             function() box.schema.create_space('city', opts) end
         )
         opts = space_opts({space='country',field={[false]='country_id'}})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, foreign key: local field must be string or number",
+            "foreign key: local field must be string or number",
             function() box.schema.create_space('city', opts) end
         )
         opts = space_opts({space='country',field={c_id=false}})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, foreign key: foreign field must be string or number",
+            "foreign key: foreign field must be string or number",
             function() box.schema.create_space('city', opts) end
         )
         opts = space_opts({[string.rep('a', 66666)]={space='country',field={p_id='planet_id', c_id='country_id'}}})
@@ -109,7 +109,7 @@ g.test_complex_foreign_key_primary = function(cg)
         t.assert_equals(country:select{}, {{1, 11, 'Russia'}, {1, 12, 'France'}})
         t.assert_error_msg_content_equals(
             "Can't modify space 'country': space is referenced by foreign key",
-            function() country:drop() end
+            country.drop, country
         )
         t.assert_error_msg_content_equals(
             "Foreign key 'country' integrity check failed: wrong foreign field name",
@@ -198,7 +198,7 @@ g.test_complex_foreign_key_secondary = function(cg)
                                            {101, 1, 'earth', 'rf', 'France'}})
         t.assert_error_msg_content_equals(
             "Can't modify space 'country': space is referenced by foreign key",
-            function() country:drop() end
+            country.drop, country
         )
         t.assert_equals(country:select{}, {{100, 1, 'earth', 'ru', 'Russia'},
                                            {101, 1, 'earth', 'rf', 'France'}})
@@ -293,7 +293,7 @@ g.test_complex_foreign_key_numeric = function(cg)
                                            {101, 1, 'earth', 'rf', 'France'}})
         t.assert_error_msg_content_equals(
             "Can't modify space 'country': space is referenced by foreign key",
-            function() country:drop() end
+            country.drop, country
         )
         t.assert_equals(country:select{}, {{100, 1, 'earth', 'ru', 'Russia'},
                                            {101, 1, 'earth', 'rf', 'France'}})

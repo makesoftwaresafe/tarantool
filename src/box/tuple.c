@@ -46,6 +46,12 @@ enum {
 	OBJSIZE_MIN = 16,
 };
 
+const char *tuple_arena_type_strs[tuple_arena_type_MAX] = {
+	[TUPLE_ARENA_MEMTX] = "memtx",
+	[TUPLE_ARENA_MALLOC] = "malloc",
+	[TUPLE_ARENA_RUNTIME] = "runtime",
+};
+
 /**
  * Storage for additional reference counter of a tuple.
  */
@@ -93,10 +99,16 @@ runtime_tuple_delete(struct tuple_format *format, struct tuple *tuple);
 static struct tuple *
 runtime_tuple_new(struct tuple_format *format, const char *data, const char *end);
 
+/** Fill `tuple_info'. */
+static void
+runtime_tuple_info(struct tuple_format *format, struct tuple *tuple,
+		   struct tuple_info *tuple_info);
+
 /** A virtual method table for tuple_format_runtime */
 static struct tuple_format_vtab tuple_format_runtime_vtab = {
 	runtime_tuple_delete,
 	runtime_tuple_new,
+	runtime_tuple_info,
 };
 
 static struct tuple *
@@ -136,7 +148,6 @@ runtime_tuple_new(struct tuple_format *format, const char *data, const char *end
 	char *raw = (char *) tuple + data_offset;
 	field_map_build(&builder, raw - field_map_size);
 	memcpy(raw, data, data_len);
-	say_debug("%s(%zu) = %p", __func__, data_len, tuple);
 end:
 	region_truncate(region, region_svp);
 	return tuple;
@@ -146,12 +157,29 @@ static void
 runtime_tuple_delete(struct tuple_format *format, struct tuple *tuple)
 {
 	assert(format->vtab.tuple_delete == tuple_format_runtime_vtab.tuple_delete);
-	say_debug("%s(%p)", __func__, tuple);
 	assert(tuple->local_refs == 0);
 	assert(!tuple_has_flag(tuple, TUPLE_HAS_UPLOADED_REFS));
 	size_t total = tuple_size(tuple);
 	tuple_format_unref(format);
 	smfree(&runtime_alloc, tuple, total);
+}
+
+static void
+runtime_tuple_info(struct tuple_format *format, struct tuple *tuple,
+		   struct tuple_info *tuple_info)
+{
+	assert(format->vtab.tuple_delete ==
+	       tuple_format_runtime_vtab.tuple_delete);
+	(void)format;
+
+	uint16_t data_offset = tuple_data_offset(tuple);
+	tuple_info->data_size = tuple_bsize(tuple);
+	tuple_info->header_size = sizeof(struct tuple);
+	if (tuple_is_compact(tuple))
+		tuple_info->header_size -= TUPLE_COMPACT_SAVINGS;
+	tuple_info->field_map_size = data_offset - tuple_info->header_size;
+	tuple_info->waste_size = 0;
+	tuple_info->arena_type = TUPLE_ARENA_RUNTIME;
 }
 
 int
@@ -285,14 +313,48 @@ tuple_bigref_tuple_count()
 }
 
 struct tuple_format *
-runtime_tuple_format_new(struct tuple_dictionary *dict)
+runtime_tuple_format_new(const char *format_data, size_t format_data_len,
+			 bool names_only)
 {
-	return tuple_format_new(&tuple_format_runtime_vtab, /*engine=*/NULL,
-				/*keys=*/NULL, /*key_count=*/0,
-				/*space_field_count=*/NULL,
-				/*exact_field_count=*/0, 0, dict,
-				/*is_temporary=*/false, /*is_reusable=*/true,
-				/*contraint_def=*/NULL, /*constraint_count=*/0);
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+	const char *p = format_data;
+	struct field_def *fields = NULL;
+	uint32_t field_count = 0;
+	if (format_data != NULL &&
+	    field_def_array_decode(&p, &fields, &field_count, region,
+				   /*names_only=*/names_only) != 0)
+		goto error;
+	struct tuple_dictionary *dict =
+		tuple_dictionary_new(fields, field_count);
+	if (dict == NULL)
+		goto error;
+	if (names_only) {
+		fields = NULL;
+		field_count = 0;
+	}
+	struct tuple_format *format =
+		tuple_format_new(/*vtab=*/&tuple_format_runtime_vtab,
+				 /*engine=*/NULL, /*keys=*/NULL,
+				 /*key_count=*/0, /*space_fields=*/fields,
+				 /*space_field_count=*/field_count,
+				 /*exact_field_count=*/0,  /*dict=*/dict,
+				 /*is_temporary=*/false, /*is_reusable=*/true,
+				 /*constraint_def=*/NULL,
+				 /*constraint_count=*/0,
+				 /*format_data=*/format_data,
+				 /*format_data_len=*/format_data_len);
+	region_truncate(region, region_svp);
+	/*
+	 * Since dictionary reference counter is 1 from the
+	 * beginning and after creation of the tuple_format
+	 * increases by one, we must decrease it once.
+	 */
+	tuple_dictionary_unref(dict);
+	return format;
+error:
+	region_truncate(region, region_svp);
+	return NULL;
 }
 
 int
@@ -303,7 +365,8 @@ tuple_init(field_name_hash_f hash)
 	/*
 	 * Create a format for runtime tuples
 	 */
-	tuple_format_runtime = runtime_tuple_format_new(/*dict=*/NULL);
+	tuple_format_runtime = runtime_tuple_format_new(NULL, 0,
+							/*names_only=*/false);
 	if (tuple_format_runtime == NULL)
 		return -1;
 
@@ -357,9 +420,6 @@ tuple_arena_create(struct slab_arena *arena, struct quota *quota,
 				       " tuple arena", prealloc, arena_name);
 		}
 	}
-
-	say_debug("tuple arena %s: addr %p size %zu flags %#x dontdump %d",
-		  arena_name, arena->arena, prealloc, flags, dontdump);
 }
 
 void

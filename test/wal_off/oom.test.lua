@@ -43,6 +43,9 @@ for state, v in space:pairs() do
 end;
 test_run:cmd("setopt delimiter ''");
 t
+
+-- TODO(gh-3807) - may fail to truncate due to memory limit is reached
+box.cfg{memtx_memory = box.cfg.memtx_memory + 1024}
 space:truncate()
 space:insert{0, 'test'}
 space.index['primary']:get{0}
@@ -88,7 +91,7 @@ space = box.schema.space.create('tweedledum')
 index = space:create_index('primary', { type = 'hash' })
 
 collectgarbage('collect')
-for i=1,10000 do space:insert{i, str} end
+for i=1,10492 do space:insert{i, str} end
 definitely_used = index:count() * 16 * 1024
 2 * definitely_used > arena_bytes -- at least half memory used
 to_del = index:count()
@@ -96,7 +99,7 @@ for i=1,to_del do space:delete{i} end
 index:count()
 
 collectgarbage('collect')
-for i=1,10000 do space:insert{i, str} end
+for i=1,10492 do space:insert{i, str} end
 definitely_used = index:count() * 16 * 1024
 2 * definitely_used > arena_bytes -- at least half memory used
 space:truncate()

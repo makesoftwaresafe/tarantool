@@ -78,13 +78,19 @@ tuple_arena_destroy(struct slab_arena *arena);
 /**
  * Creates a new format for standalone tuples.
  * Tuples created with the new format are allocated from the runtime arena.
- * In contrast to the preallocated tuple_format_runtime, which has no field
- * names, the new format uses the provided field name dictionary.
+ * In contrast to the preallocated tuple_format_runtime, which has no
+ * information about fields, the new format uses the field definitions from the
+ * Msgpack encoded format clause.
+ *
+ * In some cases (formats received over IPROTO or formats for read views) we
+ * only need to get the 'name' field options and ignore the rest, hence the
+ * `names_only` flag is provided.
  *
  * On success, returns the new format. On error, returns NULL and sets diag.
  */
 struct tuple_format *
-runtime_tuple_format_new(struct tuple_dictionary *dict);
+runtime_tuple_format_new(const char *format_data, size_t format_data_len,
+			 bool names_only);
 
 /** \cond public */
 
@@ -393,7 +399,7 @@ enum tuple_flag {
 	 */
 	TUPLE_IS_DIRTY = 1,
 	/**
-	 * The tuple belongs to a temporary space so it can be freed
+	 * The tuple belongs to a data-temporary space so it can be freed
 	 * immediately while a snapshot is in progress.
 	 */
 	TUPLE_IS_TEMPORARY = 2,
@@ -452,6 +458,44 @@ struct PACKED tuple
 };
 
 static_assert(sizeof(struct tuple) == 10, "Just to be sure");
+
+/** Type of the arena where the tuple is allocated. */
+enum tuple_arena_type {
+	TUPLE_ARENA_MEMTX = 0,
+	TUPLE_ARENA_MALLOC = 1,
+	TUPLE_ARENA_RUNTIME = 2,
+	tuple_arena_type_MAX
+};
+
+/** Arena type names. */
+extern const char *tuple_arena_type_strs[tuple_arena_type_MAX];
+
+/** Information about the tuple. */
+struct tuple_info {
+	/** Size of the MsgPack data. See also tuple_bsize(). */
+	size_t data_size;
+	/** Header size depends on the engine and on the compact/bulky mode. */
+	size_t header_size;
+	/** Size of the field_map. See also field_map_build_size(). */
+	size_t field_map_size;
+	/**
+	 * The amount of excess memory used to store the tuple in mempool.
+	 * Note that this value is calculated not during the actual allocation,
+	 * but afterwards. This means that it can be incorrect if the state of
+	 * the allocator changed. See also small_alloc_info().
+	 */
+	size_t waste_size;
+	/** Type of the arena where the tuple is allocated. */
+	enum tuple_arena_type arena_type;
+};
+
+/** Fill `info' with the information about the `tuple'. */
+static inline void
+tuple_info(struct tuple *tuple, struct tuple_info *info)
+{
+	struct tuple_format *format = tuple_format_by_id(tuple->format_id);
+	format->vtab.tuple_info(format, tuple, info);
+}
 
 static_assert(DIV_ROUND_UP(tuple_flag_MAX, 8) <=
 	      sizeof(((struct tuple *)0)->flags),
@@ -764,7 +808,6 @@ tuple_new(struct tuple_format *format, const char *data, const char *end)
 static inline void
 tuple_delete(struct tuple *tuple)
 {
-	say_debug("%s(%p)", __func__, tuple);
 	assert(tuple->local_refs == 0);
 	assert(!tuple_has_flag(tuple, TUPLE_HAS_UPLOADED_REFS));
 	assert(!tuple_has_flag(tuple, TUPLE_IS_DIRTY));
@@ -1063,19 +1106,23 @@ tuple_field_raw_by_part(struct tuple_format *format, const char *data,
 			const uint32_t *field_map,
 			struct key_part *part, int multikey_idx)
 {
-	if (unlikely(part->format_epoch != format->epoch)) {
-		assert(format->epoch != 0);
-		part->format_epoch = format->epoch;
-		/*
-		 * Clear the offset slot cache, since it's stale.
-		 * The cache will be reset by the lookup.
-		 */
-		part->offset_slot_cache = TUPLE_OFFSET_SLOT_NIL;
+	int32_t *offset_slot_cache = NULL;
+	if (cord_is_main()) {
+		offset_slot_cache = &part->offset_slot_cache;
+		if (unlikely(part->format_epoch != format->epoch)) {
+			assert(format->epoch != 0);
+			part->format_epoch = format->epoch;
+			/*
+			 * Clear the offset slot cache, since it's stale.
+			 * The cache will be reset by the lookup.
+			 */
+			*offset_slot_cache = TUPLE_OFFSET_SLOT_NIL;
+		}
 	}
 	return tuple_field_raw_by_path(format, data, field_map, part->fieldno,
 				       part->path, part->path_len,
 				       TUPLE_INDEX_BASE,
-				       &part->offset_slot_cache, multikey_idx);
+				       offset_slot_cache, multikey_idx);
 }
 
 /**
@@ -1389,7 +1436,9 @@ static inline int
 tuple_field_uuid(struct tuple *tuple, int fieldno, struct tt_uuid *out)
 {
 	const char *value = tuple_field_cstr(tuple, fieldno);
-	if (value == NULL || tt_uuid_from_string(value, out) != 0) {
+	if (value == NULL)
+		return -1;
+	if (tt_uuid_from_string(value, out) != 0) {
 		diag_set(ClientError, ER_INVALID_UUID, value);
 		return -1;
 	}

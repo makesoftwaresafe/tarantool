@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <vector>
 #include <time.h>
+#include <core/random.h>
 
 #include "unit.h"
 
@@ -40,23 +41,20 @@ equal_key(hash_value_t v1, hash_value_t v2)
 #include "salad/light.h"
 
 inline void *
-my_light_alloc(void *ctx)
+my_light_alloc(struct matras_allocator *allocator)
 {
-	size_t *p_extents_count = (size_t *)ctx;
-	assert(p_extents_count == &extents_count);
-	++*p_extents_count;
+	++extents_count;
 	return malloc(light_extent_size);
 }
 
 inline void
-my_light_free(void *ctx, void *p)
+my_light_free(struct matras_allocator *allocator, void *p)
 {
-	size_t *p_extents_count = (size_t *)ctx;
-	assert(p_extents_count == &extents_count);
-	--*p_extents_count;
+	--extents_count;
 	free(p);
 }
 
+static struct matras_allocator allocator;
 
 static void
 simple_test()
@@ -68,8 +66,7 @@ simple_test()
 	stats.extent_count = extents_count;
 
 	struct light_core ht;
-	light_create(&ht, 0, light_extent_size, my_light_alloc, my_light_free,
-		     &extents_count, &stats);
+	light_create(&ht, 0, &allocator, &stats);
 	std::vector<bool> vect;
 	size_t count = 0;
 	const size_t rounds = 1000;
@@ -134,8 +131,7 @@ collision_test()
 	header();
 
 	struct light_core ht;
-	light_create(&ht, 0, light_extent_size, my_light_alloc, my_light_free,
-		     &extents_count, NULL);
+	light_create(&ht, 0, &allocator, NULL);
 	std::vector<bool> vect;
 	size_t count = 0;
 	const size_t rounds = 100;
@@ -198,8 +194,7 @@ iterator_test()
 	header();
 
 	struct light_core ht;
-	light_create(&ht, 0, light_extent_size, my_light_alloc, my_light_free,
-		     &extents_count, NULL);
+	light_create(&ht, 0, &allocator, NULL);
 	const size_t rounds = 1000;
 	const size_t start_limits = 20;
 
@@ -261,8 +256,7 @@ iterator_freeze_check()
 	struct light_core ht;
 
 	for (int i = 0; i < 10; i++) {
-		light_create(&ht, 0, light_extent_size, my_light_alloc,
-			     my_light_free, &extents_count, NULL);
+		light_create(&ht, 0, &allocator, NULL);
 		int comp_buf_size = 0;
 		int comp_buf_size2 = 0;
 		for (int j = 0; j < test_data_size; j++) {
@@ -327,14 +321,96 @@ iterator_freeze_check()
 	footer();
 }
 
+/**
+ * Check that LIGHT(slot)() is correctly calculated for table sizes > 2^31.
+ */
+static void
+slot_in_big_table_test()
+{
+	header();
+
+	struct light_core ht;
+	light_create(&ht, 0, &allocator, NULL);
+
+	ht.common.table_size = 4000000000;
+	ht.common.cover_mask = 0xffffffff;
+	uint32_t hash = 0x00031337;
+	uint32_t slot = light_slot(&ht.common, hash);
+	fail_if(slot != 0x00031337);
+
+	light_destroy(&ht);
+
+	footer();
+}
+
+/**
+ * Insert nearly 2^32 records into the hash table.
+ */
+static void
+max_capacity_test()
+{
+	/*
+	 * XXX: The test is disabled, because it requires 64 GB of RAM.
+	 */
+	return;
+
+	header();
+
+	/* The maximum number of records that can be stored in the table. */
+	const size_t data_count = (size_t)UINT32_MAX + 1 - LIGHT_GROW_INCREMENT;
+
+	struct light_core ht;
+	light_create(&ht, 0, &allocator, NULL);
+
+	uint64_t seed[4];
+	random_bytes((char *)seed, sizeof(seed));
+
+	/* Test light_insert(). */
+	xoshiro_srand(seed);
+	for (size_t i = 0; i < data_count; i++) {
+		hash_value_t val = xoshiro_random();
+		hash_t id = light_insert(&ht, hash(val), val);
+		fail_if(id == light_end);
+		if ((i & 0xfffff) == 0)
+			printf("%f%%\n", i * 100.0 / data_count);
+	}
+	/* Try to exceed the maximum capacity. */
+	hash_value_t val = xoshiro_random();
+	hash_t id = light_insert(&ht, hash(val), val);
+	fail_if(id != light_end);
+
+	/* Test light_find(). */
+	xoshiro_srand(seed);
+	for (size_t i = 0; i < data_count; i++) {
+		hash_value_t val = xoshiro_random();
+		hash_t id = light_find(&ht, hash(val), val);
+		fail_if(id == light_end);
+		if ((i & 0xfffff) == 0)
+			printf("%f%%\n", i * 100.0 / data_count);
+	}
+
+	light_destroy(&ht);
+
+	footer();
+}
+
 int
 main(int, const char**)
 {
-	srand(time(0));
+	random_init();
+	matras_allocator_create(&allocator, light_extent_size,
+				my_light_alloc, my_light_free);
+
 	simple_test();
 	collision_test();
 	iterator_test();
 	iterator_freeze_check();
-	if (extents_count != 0)
+	slot_in_big_table_test();
+	max_capacity_test();
+
+	if ((int)extents_count != allocator.num_reserved_extents)
 		fail("memory leak!", "true");
+
+	matras_allocator_destroy(&allocator);
+	random_free();
 }

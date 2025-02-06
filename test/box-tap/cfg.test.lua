@@ -6,7 +6,7 @@ local socket = require('socket')
 local fio = require('fio')
 local uuid = require('uuid')
 local msgpack = require('msgpack')
-test:plan(107)
+test:plan(112)
 
 --------------------------------------------------------------------------------
 -- Invalid values
@@ -49,6 +49,11 @@ invalid('vinyl_run_size_ratio', 1)
 invalid('vinyl_bloom_fpr', 0)
 invalid('vinyl_bloom_fpr', 1.1)
 invalid('wal_queue_max_size', -1)
+invalid('memtx_sort_threads', 'all')
+invalid('memtx_sort_threads', -1)
+invalid('memtx_sort_threads', 0)
+invalid('memtx_sort_threads', 257)
+invalid('replication_synchro_queue_max_size', -1)
 
 local function invalid_combinations(name, val)
     local status, result = pcall(box.cfg, val)
@@ -75,7 +80,7 @@ test:ok(not status and result:match('Please call box.cfg{}'),
     'exception on unconfigured box')
 
 status, result = pcall(box.error, box.error.ILLEGAL_PARAMS, 'xx')
-test:ok(not status and result.code == box.error.ILLEGAL_PARAMS, "box.error without box.cfg")
+test:ok(not status and result.type == 'IllegalParams', "box.error without box.cfg")
 status, result = pcall(function() return box.runtime.info() end)
 test:ok(status and type(result) == 'table', "box.runtime without box.cfg")
 status, result = pcall(function() return box.index.EQ end)

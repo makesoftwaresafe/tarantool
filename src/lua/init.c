@@ -45,9 +45,11 @@
 
 #include <fiber.h>
 #include "version.h"
+#include "assoc.h"
 #include "coio.h"
 #include "core/backtrace.h"
 #include "core/tt_static.h"
+#include "lua/alloc.h"
 #include "lua/backtrace.h"
 #include "lua/fiber.h"
 #include "lua/fiber_cond.h"
@@ -132,8 +134,11 @@ extern char minifio_lua[],
 	tap_lua[],
 	fio_lua[],
 	error_lua[],
+	utils_lua[],
 	argparse_lua[],
 	iconv_lua[],
+	protobuf_wireformat_lua[],
+	protobuf_lua[],
 	/* jit.* library */
 	jit_vmdef_lua[],
 	jit_bc_lua[],
@@ -151,126 +156,35 @@ extern char minifio_lua[],
 	env_lua[],
 	pwd_lua[],
 	table_lua[],
-	trigger_lua[],
 	string_lua[],
+	varbinary_lua[],
 	swim_lua[],
 	jit_p_lua[], /* LuaJIT 2.1 profiler */
 	jit_zone_lua[], /* LuaJIT 2.1 profiler */
 	/* tools.* libraries. */
 	utils_avl_lua[],
 	utils_bufread_lua[],
+	utils_evread_lua[],
 	utils_symtab_lua[],
 	memprof_parse_lua[],
 	memprof_process_lua[],
 	memprof_humanize_lua[],
 	memprof_lua[],
 	sysprof_parse_lua[],
-	sysprof_collapse_lua[],
 	sysprof_lua[],
 	datetime_lua[],
 	timezones_lua[],
 	print_lua[],
 	pairs_lua[],
-	luadebug_lua[]
-#if defined(EMBED_LUAROCKS)
-	, luarocks_core_hardcoded_lua[],
-	luarocks_admin_cache_lua[],
-	luarocks_admin_cmd_add_lua[],
-	luarocks_admin_cmd_make_manifest_lua[],
-	luarocks_admin_cmd_refresh_cache_lua[],
-	luarocks_admin_cmd_remove_lua[],
-	luarocks_admin_index_lua[],
-	luarocks_build_builtin_lua[],
-	luarocks_build_cmake_lua[],
-	luarocks_build_command_lua[],
-	luarocks_build_lua[],
-	luarocks_build_make_lua[],
-	luarocks_cmd_build_lua[],
-	luarocks_cmd_config_lua[],
-	luarocks_cmd_doc_lua[],
-	luarocks_cmd_download_lua[],
-	luarocks_cmd_help_lua[],
-	luarocks_cmd_init_lua[],
-	luarocks_cmd_install_lua[],
-	luarocks_cmd_lint_lua[],
-	luarocks_cmd_list_lua[],
-	luarocks_cmd_lua[],
-	luarocks_cmd_make_lua[],
-	luarocks_cmd_new_version_lua[],
-	luarocks_cmd_pack_lua[],
-	luarocks_cmd_path_lua[],
-	luarocks_cmd_purge_lua[],
-	luarocks_cmd_remove_lua[],
-	luarocks_cmd_search_lua[],
-	luarocks_cmd_show_lua[],
-	luarocks_cmd_test_lua[],
-	luarocks_cmd_unpack_lua[],
-	luarocks_cmd_upload_lua[],
-	luarocks_cmd_which_lua[],
-	luarocks_cmd_write_rockspec_lua[],
-	luarocks_core_cfg_lua[],
-	luarocks_core_dir_lua[],
-	luarocks_core_manif_lua[],
-	luarocks_core_path_lua[],
-	luarocks_core_persist_lua[],
-	luarocks_core_sysdetect_lua[],
-	luarocks_core_vers_lua[],
-	luarocks_deps_lua[],
-	luarocks_dir_lua[],
-	luarocks_download_lua[],
-	luarocks_fetch_cvs_lua[],
-	luarocks_fetch_git_file_lua[],
-	luarocks_fetch_git_http_lua[],
-	luarocks_fetch_git_https_lua[],
-	luarocks_fetch_git_lua[],
-	luarocks_fetch_git_ssh_lua[],
-	luarocks_fetch_hg_http_lua[],
-	luarocks_fetch_hg_https_lua[],
-	luarocks_fetch_hg_lua[],
-	luarocks_fetch_hg_ssh_lua[],
-	luarocks_signing_lua[],
-	luarocks_fetch_lua[],
-	luarocks_fetch_sscm_lua[],
-	luarocks_fetch_svn_lua[],
-	luarocks_fs_lua[],
-	luarocks_fs_lua_lua[],
-	luarocks_fs_tools_lua[],
-	luarocks_fs_unix_lua[],
-	luarocks_fs_unix_tools_lua[],
-	luarocks_fun_lua[],
-	luarocks_loader_lua[],
-	luarocks_manif_lua[],
-	luarocks_manif_writer_lua[],
-	luarocks_pack_lua[],
-	luarocks_path_lua[],
-	luarocks_persist_lua[],
-	luarocks_queries_lua[],
-	luarocks_remove_lua[],
-	luarocks_repos_lua[],
-	luarocks_require_lua[],
-	luarocks_results_lua[],
-	luarocks_rockspecs_lua[],
-	luarocks_search_lua[],
-	luarocks_test_busted_lua[],
-	luarocks_test_command_lua[],
-	luarocks_test_lua[],
-	luarocks_tools_patch_lua[],
-	luarocks_tools_tar_lua[],
-	luarocks_tools_zip_lua[],
-	luarocks_type_check_lua[],
-	luarocks_type_manifest_lua[],
-	luarocks_type_rockspec_lua[],
-	luarocks_upload_api_lua[],
-	luarocks_upload_multipart_lua[],
-	luarocks_util_lua[],
-	luarocks_core_util_lua[]
-#endif /* defined(EMBED_LUAROCKS) */
+	luadebug_lua[],
+	version_lua[]
 ;
 
 static const char *lua_modules[] = {
 	/* Make it first to affect load of all other modules */
 	"strict", strict_lua,
 	"compat", compat_lua,
+	"internal.utils", utils_lua,
 	"fun", fun_lua,
 	"debug", debug_lua,
 	"tarantool", init_lua,
@@ -279,6 +193,7 @@ static const char *lua_modules[] = {
 	"env", env_lua,
 	"buffer", buffer_lua,
 	"string", string_lua,
+	"varbinary", varbinary_lua,
 	"table", table_lua,
 	"msgpackffi", msgpackffi_lua,
 	"crypto", crypto_lua,
@@ -296,11 +211,12 @@ static const char *lua_modules[] = {
 	"help.en_US", help_en_US_lua,
 	"help", help_lua,
 	"internal.argparse", argparse_lua,
-	"internal.trigger", trigger_lua,
 	"pwd", pwd_lua,
 	"http.client", httpc_lua,
 	"iconv", iconv_lua,
 	"swim", swim_lua,
+	"internal.protobuf.wireformat", protobuf_wireformat_lua,
+	"protobuf", protobuf_lua,
 	COMPRESS_LUA_MODULES
 	/* jit.* library */
 	"jit.vmdef", jit_vmdef_lua,
@@ -320,18 +236,19 @@ static const char *lua_modules[] = {
 	"utils.avl", utils_avl_lua,
 	"utils.bufread", utils_bufread_lua,
 	"utils.symtab", utils_symtab_lua,
+	"utils.evread", utils_evread_lua,
 	"memprof.parse", memprof_parse_lua,
 	"memprof.process", memprof_process_lua,
 	"memprof.humanize", memprof_humanize_lua,
 	"memprof", memprof_lua,
 	"sysprof.parse", sysprof_parse_lua,
-	"sysprof.collapse", sysprof_collapse_lua,
 	"sysprof", sysprof_lua,
 	"timezones", timezones_lua,
 	"datetime", datetime_lua,
 	"internal.print", print_lua,
 	"internal.pairs", pairs_lua,
 	"luadebug", luadebug_lua,
+	"version", version_lua,
 	ETCD_CLIENT_LUA_MODULES
 	NULL
 };
@@ -341,105 +258,64 @@ static const char *lua_modules[] = {
  * Then it'll be embedded, but not loaded until the first use.
  */
 static const char *lua_modules_preload[] = {
-#if defined(EMBED_LUAROCKS)
-	/*
-	 * LuaRocks creates a temporary file on startup, which may fail
-	 * if the tmp dir is read-only.
-	 */
-	"luarocks.core.hardcoded", luarocks_core_hardcoded_lua,
-	"luarocks.core.util", luarocks_core_util_lua,
-	"luarocks.core.persist", luarocks_core_persist_lua,
-	"luarocks.core.sysdetect", luarocks_core_sysdetect_lua,
-	"luarocks.core.cfg", luarocks_core_cfg_lua,
-	"luarocks.core.dir", luarocks_core_dir_lua,
-	"luarocks.core.path", luarocks_core_path_lua,
-	"luarocks.core.manif", luarocks_core_manif_lua,
-	"luarocks.core.vers", luarocks_core_vers_lua,
-	"luarocks.util", luarocks_util_lua,
-	"luarocks.loader", luarocks_loader_lua,
-	"luarocks.dir", luarocks_dir_lua,
-	"luarocks.path", luarocks_path_lua,
-	"luarocks.fs", luarocks_fs_lua,
-	"luarocks.persist", luarocks_persist_lua,
-	"luarocks.fun", luarocks_fun_lua,
-	"luarocks.tools.patch", luarocks_tools_patch_lua,
-	"luarocks.tools.zip", luarocks_tools_zip_lua,
-	"luarocks.tools.tar", luarocks_tools_tar_lua,
-	"luarocks.fs.unix", luarocks_fs_unix_lua,
-	"luarocks.fs.unix.tools", luarocks_fs_unix_tools_lua,
-	"luarocks.fs.lua", luarocks_fs_lua_lua,
-	"luarocks.fs.tools", luarocks_fs_tools_lua,
-	"luarocks.queries", luarocks_queries_lua,
-	"luarocks.type_check", luarocks_type_check_lua,
-	"luarocks.type.rockspec", luarocks_type_rockspec_lua,
-	"luarocks.rockspecs", luarocks_rockspecs_lua,
-	"luarocks.signing", luarocks_signing_lua,
-	"luarocks.fetch", luarocks_fetch_lua,
-	"luarocks.type.manifest", luarocks_type_manifest_lua,
-	"luarocks.manif", luarocks_manif_lua,
-	"luarocks.build.builtin", luarocks_build_builtin_lua,
-	"luarocks.deps", luarocks_deps_lua,
-	"luarocks.cmd", luarocks_cmd_lua,
-	"luarocks.test.busted", luarocks_test_busted_lua,
-	"luarocks.test.command", luarocks_test_command_lua,
-	"luarocks.results", luarocks_results_lua,
-	"luarocks.search", luarocks_search_lua,
-	"luarocks.repos", luarocks_repos_lua,
-	"luarocks.cmd.show", luarocks_cmd_show_lua,
-	"luarocks.cmd.path", luarocks_cmd_path_lua,
-	"luarocks.cmd.write_rockspec", luarocks_cmd_write_rockspec_lua,
-	"luarocks.manif.writer", luarocks_manif_writer_lua,
-	"luarocks.remove", luarocks_remove_lua,
-	"luarocks.pack", luarocks_pack_lua,
-	"luarocks.build", luarocks_build_lua,
-	"luarocks.cmd.make", luarocks_cmd_make_lua,
-	"luarocks.cmd.build", luarocks_cmd_build_lua,
-	"luarocks.cmd.install", luarocks_cmd_install_lua,
-	"luarocks.cmd.list", luarocks_cmd_list_lua,
-	"luarocks.download", luarocks_download_lua,
-	"luarocks.cmd.download", luarocks_cmd_download_lua,
-	"luarocks.cmd.search", luarocks_cmd_search_lua,
-	"luarocks.cmd.pack", luarocks_cmd_pack_lua,
-	"luarocks.cmd.new_version", luarocks_cmd_new_version_lua,
-	"luarocks.cmd.purge", luarocks_cmd_purge_lua,
-	"luarocks.cmd.init", luarocks_cmd_init_lua,
-	"luarocks.cmd.lint", luarocks_cmd_lint_lua,
-	"luarocks.test", luarocks_test_lua,
-	"luarocks.cmd.test", luarocks_cmd_test_lua,
-	"luarocks.cmd.which", luarocks_cmd_which_lua,
-	"luarocks.cmd.remove", luarocks_cmd_remove_lua,
-	"luarocks.upload.multipart", luarocks_upload_multipart_lua,
-	"luarocks.upload.api", luarocks_upload_api_lua,
-	"luarocks.cmd.upload", luarocks_cmd_upload_lua,
-	"luarocks.cmd.help", luarocks_cmd_help_lua,
-	"luarocks.cmd.doc", luarocks_cmd_doc_lua,
-	"luarocks.cmd.unpack", luarocks_cmd_unpack_lua,
-	"luarocks.cmd.config", luarocks_cmd_config_lua,
-	"luarocks.require", luarocks_require_lua,
-	"luarocks.build.cmake", luarocks_build_cmake_lua,
-	"luarocks.build.make", luarocks_build_make_lua,
-	"luarocks.build.command", luarocks_build_command_lua,
-	"luarocks.fetch.cvs", luarocks_fetch_cvs_lua,
-	"luarocks.fetch.svn", luarocks_fetch_svn_lua,
-	"luarocks.fetch.sscm", luarocks_fetch_sscm_lua,
-	"luarocks.fetch.git", luarocks_fetch_git_lua,
-	"luarocks.fetch.git_file", luarocks_fetch_git_file_lua,
-	"luarocks.fetch.git_http", luarocks_fetch_git_http_lua,
-	"luarocks.fetch.git_https", luarocks_fetch_git_https_lua,
-	"luarocks.fetch.git_ssh", luarocks_fetch_git_ssh_lua,
-	"luarocks.fetch.hg", luarocks_fetch_hg_lua,
-	"luarocks.fetch.hg_http", luarocks_fetch_hg_http_lua,
-	"luarocks.fetch.hg_https", luarocks_fetch_hg_https_lua,
-	"luarocks.fetch.hg_ssh", luarocks_fetch_hg_ssh_lua,
-	"luarocks.admin.cache", luarocks_admin_cache_lua,
-	"luarocks.admin.cmd.refresh_cache", luarocks_admin_cmd_refresh_cache_lua,
-	"luarocks.admin.index", luarocks_admin_index_lua,
-	"luarocks.admin.cmd.add", luarocks_admin_cmd_add_lua,
-	"luarocks.admin.cmd.remove", luarocks_admin_cmd_remove_lua,
-	"luarocks.admin.cmd.make_manifest", luarocks_admin_cmd_make_manifest_lua,
-#endif /* defined(EMBED_LUAROCKS) */
 	NULL
 };
+
+/**
+ * Names of all global built-in objects. Note that this is a set, not a map,
+ * i.e. only keys are used while values are NULL.
+ *
+ * We consider a global key (from _G) to be built-in if it exists after
+ * initializing all Tarantool modules but before executing the user script.
+ */
+static struct mh_strnptr_t *builtin_globals = NULL;
+
+static void
+builtin_globals_init(struct lua_State *L)
+{
+	struct mh_strnptr_t *h = mh_strnptr_new();
+	lua_pushnil(L);
+	while (lua_next(L, LUA_GLOBALSINDEX) != 0) {
+		lua_pop(L, 1); /* pop the value, leave the key */
+		if (lua_type(L, -1) == LUA_TSTRING) {
+			size_t len;
+			const char *s = xstrdup(lua_tolstring(L, -1, &len));
+			uint32_t hash = mh_strn_hash(s, len);
+			struct mh_strnptr_node_t n = {s, len, hash, NULL};
+			struct mh_strnptr_node_t prev;
+			struct mh_strnptr_node_t *prev_ptr = &prev;
+			mh_strnptr_put(h, &n, &prev_ptr, NULL);
+			assert(prev_ptr == NULL);
+		}
+	}
+	builtin_globals = h;
+}
+
+static void
+builtin_globals_free(void)
+{
+	struct mh_strnptr_t *h = builtin_globals;
+	if (h != NULL) {
+		builtin_globals = NULL;
+		mh_int_t i;
+		mh_foreach(h, i)
+			free((void *)mh_strnptr_node(h, i)->str);
+		mh_strnptr_delete(h);
+	}
+}
+
+bool
+tarantool_lua_is_builtin_global(const char *name, uint32_t name_len)
+{
+	/* Extract the top-level namespace prefix. */
+	uint32_t len = 0;
+	for (const char *s = name; len < name_len; s++, len++) {
+		if (*s == ' ' || *s == '.' || *s == ':' || *s == '[')
+			break;
+	}
+	struct mh_strnptr_t *h = builtin_globals;
+	return h != NULL && mh_strnptr_find_str(h, name, len) != mh_end(h);
+}
 
 /*
  * {{{ box Lua library: common functions
@@ -485,10 +361,13 @@ static int
 lbox_tarantool_debug_getsources(struct lua_State *L)
 {
 	int index = lua_gettop(L);
-	if (index != 1)
-		luaL_error(L, "getsources() function expects one argument");
+	if (index != 1) {
+		diag_set(IllegalParams,
+			 "getsources() function expects one argument");
+		luaT_error(L);
+	}
 	size_t len = 0;
-	const char *modname = luaL_checklstring(L, index, &len);
+	const char *modname = luaT_checklstring(L, index, &len);
 	if (len <= 0)
 		goto ret_nil;
 	const char *code = tarantool_debug_getsources(modname);
@@ -507,21 +386,29 @@ ret_nil:
 static int
 lbox_tonumber64(struct lua_State *L)
 {
-	luaL_checkany(L, 1);
-	int base = luaL_optint(L, 2, -1);
-	luaL_argcheck(L, (2 <= base && base <= 36) || base == -1, 2,
-		      "base out of range");
+	if (lua_gettop(L) < 1) {
+		diag_set(IllegalParams, "Usage: tonumber64(arg)");
+		luaT_error(L);
+	}
+	int base = luaT_optint(L, 2, -1);
+	if ((base < 2 || base > 36) && base != -1) {
+		diag_set(IllegalParams,
+			 "invalid argument 2, base out of range");
+		luaT_error(L);
+	}
 	switch (lua_type(L, 1)) {
 	case LUA_TNUMBER:
 		base = (base == -1 ? 10 : base);
-		if (base != 10)
-			return luaL_argerror(L, 1, "string expected");
+		if (base != 10) {
+			diag_set(IllegalParams, "argument 1 is not a string");
+			return luaT_error(L);
+		}
 		lua_settop(L, 1); /* return original value as is */
 		return 1;
 	case LUA_TSTRING:
 	{
 		size_t argl = 0;
-		const char *arg = luaL_checklstring(L, 1, &argl);
+		const char *arg = luaT_checklstring(L, 1, &argl);
 		/* Trim whitespaces at begin/end */
 		while (argl > 0 && isspace(arg[argl - 1])) {
 			argl--;
@@ -606,8 +493,10 @@ skip:		base = (base == -1 ? 10 : base);
 	case LUA_TCDATA:
 	{
 		base = (base == -1 ? 10 : base);
-		if (base != 10)
-			return luaL_argerror(L, 1, "string expected");
+		if (base != 10) {
+			diag_set(IllegalParams, "argument 1 is not a string");
+			return luaT_error(L);
+		}
 		uint32_t ctypeid = 0;
 		luaL_checkcdata(L, 1, &ctypeid);
 		if (ctypeid >= CTID_INT8 && ctypeid <= CTID_DOUBLE) {
@@ -724,6 +613,7 @@ tarantool_panic_handler(lua_State *L) {
 			 ar.name, ar.namewhat,
 			 ar.short_src, ar.currentline);
 	}
+	lsan_turn_off();
 	return 1;
 }
 
@@ -734,15 +624,7 @@ luaopen_tarantool(lua_State *L)
 	lua_pushstring(L, tarantool_version());
 	lua_setfield(L, LUA_GLOBALSINDEX, "_TARANTOOL");
 
-	/*
-	 * Get tarantool module.
-	 *
-	 * src/lua/init.lua is already registered as tarantool
-	 * module, so we `require` it here, not create.
-	 */
-	lua_getfield(L, LUA_GLOBALSINDEX, "require");
-	lua_pushstring(L, "tarantool");
-	lua_call(L, 1, 1);
+	luaT_newmodule(L, "tarantool", NULL);
 
 	/* package */
 	lua_pushstring(L, tarantool_package());
@@ -755,6 +637,10 @@ luaopen_tarantool(lua_State *L)
 	/* build */
 	lua_pushstring(L, "build");
 	lua_newtable(L);
+
+	/* tzdata version */
+	lua_pushstring(L, tzdata_version());
+	lua_setfield(L, -2, "tzdata_version");
 
 	/* build.target */
 	lua_pushstring(L, "target");
@@ -787,6 +673,24 @@ luaopen_tarantool(lua_State *L)
 	lua_pushstring(L, "static");
 #else
 	lua_pushstring(L, "dynamic");
+#endif
+	lua_settable(L, -3);
+
+	/* build.asan */
+	lua_pushstring(L, "asan");
+#ifdef ENABLE_ASAN
+	lua_pushboolean(L, true);
+#else
+	lua_pushboolean(L, false);
+#endif
+	lua_settable(L, -3);
+
+	/* build.test_build */
+	lua_pushstring(L, "test_build");
+#ifdef TEST_BUILD
+	lua_pushboolean(L, true);
+#else
+	lua_pushboolean(L, false);
 #endif
 	lua_settable(L, -3);
 
@@ -832,10 +736,7 @@ void
 tarantool_lua_init(const char *tarantool_bin, const char *script, int argc,
 		   char **argv)
 {
-	lua_State *L = luaL_newstate();
-	if (L == NULL) {
-		panic("failed to initialize Lua");
-	}
+	lua_State *L = luaT_newstate();
 	luaL_openlibs(L);
 #ifndef LUAJIT_JIT_STATUS
 	(void)luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
@@ -852,6 +753,10 @@ tarantool_lua_init(const char *tarantool_bin, const char *script, int argc,
 		lua_settable(L, -3);
 	}
 	lua_setfield(L, LUA_GLOBALSINDEX, "arg");
+
+	/* Create a table for "package.searchers" analogue. */
+	lua_newtable(L);
+	lua_setfield(L, LUA_REGISTRYINDEX, "_TARANTOOL_PACKAGE_SEARCHERS");
 
 	/*
 	 * Create a table for storing loaded built-in modules.
@@ -879,6 +784,7 @@ tarantool_lua_init(const char *tarantool_bin, const char *script, int argc,
 	lua_call(L, 0, 0);
 	lua_register(L, "tonumber64", lbox_tonumber64);
 
+	tarantool_lua_alloc_init(L);
 	tarantool_lua_tweaks_init(L);
 	tarantool_lua_uri_init(L);
 	tarantool_lua_utf8_init(L);
@@ -898,6 +804,7 @@ tarantool_lua_init(const char *tarantool_bin, const char *script, int argc,
 	tarantool_lua_swim_init(L);
 	tarantool_lua_decimal_init(L);
 	tarantool_lua_compress_init(L);
+	tarantool_lua_trigger_init(L);
 #ifdef ENABLE_BACKTRACE
 	luaM_sysprof_set_backtracer(fiber_backtracer);
 #endif
@@ -928,6 +835,7 @@ tarantool_lua_init(const char *tarantool_bin, const char *script, int argc,
 #if defined(ENABLE_BACKTRACE)
 	backtrace_lua_init();
 #endif /* defined(ENABLE_BACKTRACE) */
+	luaopen_tarantool(L);
 	for (const char **s = lua_modules; *s; s += 2) {
 		const char *modname = *s;
 		const char *modsrc = *(s + 1);
@@ -948,9 +856,6 @@ tarantool_lua_init(const char *tarantool_bin, const char *script, int argc,
 		builtin_modcache_put(modname, modsrc);
 	}
 	lua_pop(L, 1); /* _PRELOAD */
-
-	luaopen_tarantool(L);
-
 #ifdef NDEBUG
 	/* Unload strict after boot in release mode */
 	if (luaL_dostring(L, "require('strict').off()") != 0)
@@ -966,6 +871,7 @@ tarantool_lua_init(const char *tarantool_bin, const char *script, int argc,
 int
 tarantool_lua_postinit(struct lua_State *L)
 {
+	builtin_globals_init(L);
 	/*
 	 * loaders.initializing = nil
 	 *
@@ -1031,6 +937,7 @@ run_script_f(va_list ap)
 {
 	struct lua_State *L = va_arg(ap, struct lua_State *);
 	const char *path = va_arg(ap, const char *);
+	struct instance_state *instance = va_arg(ap, struct instance_state *);
 	uint32_t opt_mask = va_arg(ap, uint32_t);
 	int optc = va_arg(ap, int);
 	const char **optv = va_arg(ap, const char **);
@@ -1039,6 +946,9 @@ run_script_f(va_list ap)
 	bool interactive = opt_mask & O_INTERACTIVE;
 	bool bytecode = opt_mask & O_BYTECODE;
 	bool debugging = opt_mask & O_DEBUGGING;
+	bool help_env_list = opt_mask & O_HELP_ENV_LIST;
+	bool failover = opt_mask & O_FAILOVER;
+	bool integrity = opt_mask & O_INTEGRITY;
 	/*
 	 * An error is returned via an external diag. A caller
 	 * can't use fiber_join(), because the script can call
@@ -1046,8 +956,16 @@ run_script_f(va_list ap)
 	 * never really dead. It never returns from its function.
 	 */
 	struct diag *diag = va_arg(ap, struct diag *);
-	bool aux_loop_is_run = false;
-	bool is_option_e_ran = false;
+
+	/*
+	 * Return control to tarantool_lua_run_script.
+	 * tarantool_lua_run_script then will start an auxiliary event
+	 * loop and re-schedule this fiber.
+	 *
+	 * This also update time in ev after Tarantool startup which
+	 * reduce time slip in timers (see #9261).
+	 */
+	fiber_sleep(0.0);
 
 	/*
 	 * Execute scripts or modules pointed by TT_PRELOAD
@@ -1092,6 +1010,19 @@ run_script_f(va_list ap)
 			break;
 		case 'e':
 			/*
+			 * Do not run the chunk given via -e
+			 * option if the integrity check is enabled.
+			 * XXX: Fortunately, -e and its argument
+			 * are stripped from the Lua <arg> table,
+			 * so this is "The Last Homely House"
+			 * where one can obtain this Lua chunk.
+			 * TODO: inform the user that -e Lua chunk
+			 * was not executed during the startup.
+			 */
+			if (integrity)
+				break;
+
+			/*
 			 * Execute chunk
 			 */
 			if (luaL_loadbuffer(L, optv[i + 1], strlen(optv[i + 1]),
@@ -1100,7 +1031,6 @@ run_script_f(va_list ap)
 			if (luaT_call(L, 0, 0) != 0)
 				goto error;
 			lua_settop(L, 0);
-			is_option_e_ran = true;
 			break;
 		default:
 			unreachable(); /* checked by getopt() in main() */
@@ -1108,12 +1038,79 @@ run_script_f(va_list ap)
 	}
 
 	/*
-	 * Return control to tarantool_lua_run_script.
-	 * tarantool_lua_run_script then will start an auxiliary event
-	 * loop and re-schedule this fiber.
+	 * Show a list of environment variables that are
+	 * considered by tarantool and exit.
 	 */
-	fiber_sleep(0.0);
-	aux_loop_is_run = true;
+	if (help_env_list) {
+		/* require('config'):_print_env_list() */
+		if (lua_require_lib(L, "config") != 0)
+			goto error;
+		lua_pushstring(L, "_print_env_list");
+		lua_gettable(L, -2);
+		lua_pushvalue(L, -2);
+		if (luaT_call(L, 1, 0) != 0)
+			goto error;
+		lua_settop(L, 0);
+		goto end;
+	}
+
+	/* Start integrity verification. */
+	if (integrity) {
+		/*
+		 * local integrity = require('integrity')
+		 * integrity.enable_integrity_check(path_to_hashes)
+		 */
+		if (lua_require_lib(L, "integrity") != 0)
+			goto error;
+		lua_getfield(L, -1, "enable_integrity_check");
+
+		lua_pushstring(L, instance->hashes);
+		if (luaT_call(L, 1, 0) != 0)
+			goto error;
+
+		lua_settop(L, 0);
+	}
+
+	/*
+	 * Start an instance using an externally provided
+	 * configuration if the --name option is passed.
+	 */
+	if (instance->name != NULL) {
+		/* require('config'):_startup(name, config) */
+		if (lua_require_lib(L, "config") != 0)
+			goto error;
+		lua_pushstring(L, "_startup");
+		lua_gettable(L, -2);
+		lua_pushvalue(L, -2);
+		lua_pushstring(L, instance->name);
+		lua_pushstring(L, instance->config);
+		if (luaT_call(L, 3, 0) != 0)
+			goto error;
+		lua_settop(L, 0);
+	}
+
+	/* Start the failover script. */
+	if (failover) {
+		/*
+		 * local failover = require('internal.failover')
+		 * failover:_startup({config_file = <...>})
+		 */
+		if (lua_require_lib(L, "internal.failover") != 0)
+			goto error;
+		lua_pushstring(L, "_startup");
+		lua_gettable(L, -2);
+		lua_pushvalue(L, -2);
+
+		/* {config_file = <...>} */
+		lua_createtable(L, 0, 1);
+		lua_pushstring(L, instance->config);
+		lua_setfield(L, -2, "config_file");
+
+		if (luaT_call(L, 2, 0) != 0)
+			goto error;
+		lua_settop(L, 0);
+		goto end;
+	}
 
 	int is_a_tty = isatty(STDIN_FILENO);
 
@@ -1148,8 +1145,6 @@ run_script_f(va_list ap)
 			goto luajit_error;
 		if (lua_main(L, false, argc, argv) != 0)
 			goto error;
-	} else if (!is_option_e_ran) {
-		interactive = true;
 	}
 
 	/*
@@ -1178,13 +1173,6 @@ run_script_f(va_list ap)
 	 * return control back to tarantool_lua_run_script.
 	 */
 end:
-	/*
-	 * Auxiliary loop in tarantool_lua_run_script
-	 * should start (ev_run()) before this fiber
-	 * invokes ev_break().
-	 */
-	if (!aux_loop_is_run)
-		fiber_sleep(0.0);
 	ev_break(loop(), EVBREAK_ALL);
 	return 0;
 
@@ -1196,8 +1184,9 @@ error:
 }
 
 int
-tarantool_lua_run_script(char *path, uint32_t opt_mask,
-			 int optc, const char **optv, int argc, char **argv)
+tarantool_lua_run_script(char *path, struct instance_state *instance,
+			 uint32_t opt_mask, int optc, const char **optv,
+			 int argc, char **argv)
 {
 	const char *title = path ? basename(path) : "interactive";
 	/*
@@ -1220,15 +1209,14 @@ tarantool_lua_run_script(char *path, uint32_t opt_mask,
 	 */
 	struct diag script_diag;
 	diag_create(&script_diag);
-	fiber_start(script_fiber, tarantool_L, path, opt_mask,
+	fiber_start(script_fiber, tarantool_L, path, instance, opt_mask,
 		    optc, optv, argc, argv, &script_diag);
 
 	/*
 	 * Run an auxiliary event loop to re-schedule run_script fiber.
 	 * When this fiber finishes, it will call ev_break to stop the loop.
 	 */
-	if (start_loop)
-		ev_run(loop(), 0);
+	ev_run(loop(), 0);
 	/* The fiber running the startup script has ended. */
 	script_fiber = NULL;
 	diag_move(&script_diag, diag_get());
@@ -1244,6 +1232,7 @@ tarantool_lua_run_script(char *path, uint32_t opt_mask,
 void
 tarantool_lua_free()
 {
+	builtin_globals_free();
 	builtin_modcache_free();
 	tarantool_lua_utf8_free();
 	/*

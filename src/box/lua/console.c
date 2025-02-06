@@ -54,6 +54,8 @@
 #include <string.h>
 #include <strings.h>
 
+bool is_console_exited;
+
 struct rlist on_console_eval = RLIST_HEAD_INITIALIZER(on_console_eval);
 
 static struct luaL_serializer *serializer_yaml;
@@ -286,6 +288,7 @@ static int saved_point = 0;
 
 static int console_hide_prompt_ref = LUA_NOREF;
 static int console_show_prompt_ref = LUA_NOREF;
+static int gettable_ref = LUA_NOREF;
 
 /**
  * Don't attempt to hide/show prompt in certain readline states.
@@ -727,6 +730,16 @@ lbox_console_run_on_eval(struct lua_State *L)
 	return 0;
 }
 
+/**
+ * Sets `is_console_exited' to true.
+ */
+static int
+lbox_console_console_exited(MAYBE_UNUSED struct lua_State *L)
+{
+	is_console_exited = true;
+	return 0;
+}
+
 int
 console_session_fd(struct session *session)
 {
@@ -897,6 +910,7 @@ tarantool_lua_console_init(struct lua_State *L)
 		{"format_yaml",		lbox_console_format_yaml},
 		{"format_lua",		lbox_console_format_lua},
 		{"run_on_eval",		lbox_console_run_on_eval},
+		{"console_exited",	lbox_console_console_exited},
 		{NULL, NULL}
 	};
 	luaT_newmodule(L, "console.lib", consolelib);
@@ -955,9 +969,6 @@ tarantool_lua_console_init(struct lua_State *L)
 	 */
 	lua_setfield(L, -2, "formatter_lua");
 
-	/* Output formatter in Lua mode */
-	lua_serializer_init(L);
-
 	struct session_vtab console_session_vtab = {
 		.push	= console_session_push,
 		.fd	= console_session_fd,
@@ -970,6 +981,13 @@ tarantool_lua_console_init(struct lua_State *L)
 	console_hide_prompt_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	lua_pushcfunction(L, lbox_console_show_prompt);
 	console_show_prompt_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+	/*
+	 * Compile a Lua wrapper for table indexation. For sanity, verify that
+	 * it compiles successfully.
+	 */
+	VERIFY(luaT_dostring(L, "return function(t, k) return t[k] end") == 0);
+	gettable_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 }
 
 /*
@@ -1095,6 +1113,23 @@ lua_rl_getcompletion(lua_State *L)
 	/* use __autocomplete metamethod if it's present */
 	lua_pushstring(L, "__autocomplete");
 	lua_rawget(L, -2);
+	if (lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		/*
+		 * __autocomplete may not always be part of the metatable (e.g.,
+		 * in case of cdata), so we also want to trigger the __index
+		 * metamethod instead of simply doing a raw lookup in the
+		 * metatable.
+		 */
+		lua_rawgeti(L, LUA_REGISTRYINDEX, gettable_ref);
+		lua_pushvalue(L, -3);
+		lua_pushstring(L, "__autocomplete");
+		if (lua_pcall(L, 2, 1, 0) != 0) {
+			/* pcall returns an error to the stack */
+			lua_pop(L, 1);
+			return 0;
+		}
+	}
 	if (lua_isfunction(L, -1)) {
 		lua_replace(L, -2);
 		lua_insert(L, -2);

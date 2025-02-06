@@ -72,6 +72,8 @@ g.test_box_status = function(cg)
     local watcher = c:watch('box.status',
                             function(name, state)
                                 t.assert_equals(name, 'box.status')
+                                -- Tested in the box-luatest/upgrade_to_3_0_0.
+                                state.dd_version = nil
                                 result = state
                                 result_no = result_no + 1
                             end)
@@ -151,6 +153,7 @@ g.before_test('test_box_election', function(cg)
         election_mode = 'off',
         replication_synchro_quorum = 2,
         replication_synchro_timeout = 1,
+        replication_sync_timeout = 300,
         replication_timeout = 0.25,
         election_timeout = 0.25,
     }
@@ -277,7 +280,7 @@ g.test_box_schema = function(cg)
 
     version_n = 0
     cg.master:exec(function() box.space.p:drop() end)
-    t.helpers.retrying({}, function() t.assert_equals(version_n, 2) end)
+    t.helpers.retrying({}, function() t.assert_equals(version_n, 1) end)
     -- there'll be 2 changes - index and space
     t.assert_equals(version, init_version + 4)
 
@@ -378,6 +381,8 @@ g.test_internal_ballot = function(cg)
         box.space.test:insert{1}
         return box.info.vclock
     end)
+    vclock[0] = nil
+    old_vclock[0] = nil
     local ballot_key = box.iproto.ballot_key
     local expected = {
         [ballot_key.IS_RO_CFG] = true,
@@ -400,6 +405,7 @@ g.test_internal_ballot = function(cg)
     expected[ballot_key.IS_ANON] = false
     -- Replica registration bumps vclock.
     expected[ballot_key.VCLOCK] = cg.master:get_vclock()
+    expected[ballot_key.VCLOCK][0] = nil
     table.insert(expected[ballot_key.REGISTERED_REPLICA_UUIDS],
                  cg.replica:get_instance_uuid())
     table.sort(expected[ballot_key.REGISTERED_REPLICA_UUIDS])
@@ -413,5 +419,10 @@ g.test_internal_ballot = function(cg)
     cg.replica:exec(function() box.cfg{election_mode = 'manual'} end)
     expected[ballot_key.CAN_LEAD] = true
     expected[ballot_key.IS_RO] = true
+    cg.replica:exec(wait_ballot_updated_to, {expected})
+    cg.replica:update_box_cfg{instance_name='replica-name'}
+    expected[ballot_key.INSTANCE_NAME] = 'replica-name'
+    expected[ballot_key.VCLOCK] = cg.master:get_vclock()
+    expected[ballot_key.VCLOCK][0] = nil
     cg.replica:exec(wait_ballot_updated_to, {expected})
 end

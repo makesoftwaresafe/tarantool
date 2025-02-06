@@ -82,6 +82,11 @@ sql_trigger_begin(struct Parse *parse)
 	const char *table_name = alter_def->entity_name->a[0].zName;
 	uint32_t space_id = box_space_id_by_name(table_name,
 						 strlen(table_name));
+	if (space_id == BOX_ID_NIL &&
+	    alter_def->entity_name->a[0].legacy_name != NULL) {
+		char *old_name = alter_def->entity_name->a[0].legacy_name;
+		space_id = box_space_id_by_name(old_name, strlen(old_name));
+	}
 	if (space_id == BOX_ID_NIL) {
 		diag_set(ClientError, ER_NO_SUCH_SPACE, table_name);
 		goto set_tarantool_error_and_cleanup;
@@ -90,17 +95,15 @@ sql_trigger_begin(struct Parse *parse)
 	if (!parse->parse_only) {
 		struct Vdbe *v = sqlGetVdbe(parse);
 		sqlVdbeCountChanges(v);
-		const char *error_msg =
-			tt_sprintf(tnt_errcode_desc(ER_TRIGGER_EXISTS),
-				   trigger_name);
 		int name_reg = ++parse->nMem;
 		sqlVdbeAddOp4(parse->pVdbe, OP_String8, 0, name_reg, 0,
 			      sql_xstrdup(trigger_name), P4_DYNAMIC);
 		bool no_err = create_def->if_not_exist;
 		vdbe_emit_halt_with_presence_test(parse, BOX_TRIGGER_ID, 0,
 						  name_reg, 1,
-						  ER_TRIGGER_EXISTS, error_msg,
-						  (no_err != 0), OP_NoConflict);
+						  ER_TRIGGER_EXISTS,
+						  trigger_name, (no_err != 0),
+						  OP_NoConflict);
 	}
 
 	/* Build the Trigger object. */
@@ -235,17 +238,9 @@ sql_trigger_step_new(u8 op, struct Token *target_name)
 	int size = sizeof(struct TriggerStep) + name_size;
 	struct TriggerStep *trigger_step = sql_xmalloc0(size);
 	char *z = (char *)&trigger_step[1];
-	int rc = sql_normalize_name(z, name_size, target_name->z,
-				    target_name->n);
-	if (rc > name_size) {
-		name_size = rc;
-		trigger_step = sql_xrealloc(trigger_step,
-					    sizeof(*trigger_step) + name_size);
-		z = (char *) &trigger_step[1];
-		if (sql_normalize_name(z, name_size, target_name->z,
-				       target_name->n) > name_size)
-			unreachable();
-	}
+	memcpy(z, target_name->z, target_name->n);
+	z[target_name->n] = '\0';
+	sqlDequote(z);
 	trigger_step->zTarget = z;
 	trigger_step->op = op;
 	return trigger_step;
@@ -303,6 +298,16 @@ sql_trigger_delete(struct sql_trigger *trigger)
 }
 
 void
+sql_trigger_delete_all(struct sql_trigger *trigger)
+{
+	while (trigger != NULL) {
+		struct sql_trigger *next = trigger->next;
+		sql_trigger_delete(trigger);
+		trigger = next;
+	}
+}
+
+void
 vdbe_code_drop_trigger(struct Parse *parser, const char *trigger_name,
 		       bool account_changes)
 {
@@ -338,14 +343,11 @@ sql_drop_trigger(struct Parse *parser)
 
 	assert(name->nSrc == 1);
 	const char *trigger_name = name->a[0].zName;
-	const char *error_msg =
-		tt_sprintf(tnt_errcode_desc(ER_NO_SUCH_TRIGGER),
-			   trigger_name);
 	int name_reg = ++parser->nMem;
 	sqlVdbeAddOp4(v, OP_String8, 0, name_reg, 0, sql_xstrdup(trigger_name),
 		      P4_DYNAMIC);
 	vdbe_emit_halt_with_presence_test(parser, BOX_TRIGGER_ID, 0, name_reg,
-					  1, ER_NO_SUCH_TRIGGER, error_msg,
+					  1, ER_NO_SUCH_TRIGGER, trigger_name,
 					  no_err, OP_Found);
 	vdbe_code_drop_trigger(parser, trigger_name, true);
 	sqlSrcListDelete(name);

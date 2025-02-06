@@ -291,9 +291,15 @@ sql_expr_coll(Parse *parse, Expr *p, bool *is_explicit_coll, uint32_t *coll_id,
 		}
 		if (op == TK_COLLATE ||
 		    (op == TK_REGISTER && p->op2 == TK_COLLATE)) {
-			*coll = sql_get_coll_seq(parse, p->u.zToken, coll_id);
-			if (*coll == NULL)
+			uint32_t id = sql_coll_id_by_expr(p);
+			if (id == UINT32_MAX) {
+				diag_set(ClientError, ER_NO_SUCH_COLLATION,
+					 p->u.zToken);
+				parse->is_aborted = true;
 				return -1;
+			}
+			*coll_id = id;
+			*coll = coll_by_id(id)->coll;
 			*is_explicit_coll = true;
 			break;
 		}
@@ -363,7 +369,7 @@ sql_expr_coll(Parse *parse, Expr *p, bool *is_explicit_coll, uint32_t *coll_id,
 		if (op == TK_FUNCTION) {
 			uint32_t arg_count = p->x.pList == NULL ? 0 :
 					     p->x.pList->nExpr;
-			uint32_t flags = sql_func_flags(p->u.zToken);
+			uint32_t flags = sql_func_flags(p);
 			if (((flags & SQL_FUNC_DERIVEDCOLL) != 0) &&
 			    arg_count > 0 && p->type == FIELD_TYPE_STRING) {
 				/*
@@ -1035,7 +1041,7 @@ sql_expr_new(int op, const struct Token *token)
 struct Expr *
 sql_expr_new_dequoted(int op, const struct Token *token)
 {
-	int extra_size = 0, rc;
+	int extra_size = 0;
 	if (token != NULL) {
 		int val;
 		assert(token->z != NULL || token->n == 0);
@@ -1047,21 +1053,11 @@ sql_expr_new_dequoted(int op, const struct Token *token)
 	if (token == NULL || token->n == 0)
 		return e;
 	e->u.zToken = (char *) &e[1];
-	if (token->z[0] == '"')
-		e->flags |= EP_DblQuoted;
-	if (op != TK_ID && op != TK_COLLATE && op != TK_FUNCTION) {
-		memcpy(e->u.zToken, token->z, token->n);
-		e->u.zToken[token->n] = '\0';
-		sqlDequote(e->u.zToken);
-	} else if ((rc = sql_normalize_name(e->u.zToken, extra_size, token->z,
-					    token->n)) > extra_size) {
-		extra_size = rc;
-		e = sql_xrealloc(e, sizeof(*e) + extra_size);
-		e->u.zToken = (char *) &e[1];
-		if (sql_normalize_name(e->u.zToken, extra_size, token->z,
-				       token->n) > extra_size)
-			unreachable();
-	}
+	memcpy(e->u.zToken, token->z, token->n);
+	e->u.zToken[token->n] = '\0';
+	sqlDequote(e->u.zToken);
+	if (op == TK_ID || op == TK_COLLATE || op == TK_FUNCTION)
+		e->flags |= token->z[0] != '"' ? EP_Lookup2 : 0;
 	return e;
 }
 
@@ -1290,13 +1286,13 @@ expr_new_variable(struct Parse *parse, const struct Token *spec,
 		if (id->z - spec->z != 1) {
 			diag_set(ClientError, ER_SQL_UNKNOWN_TOKEN,
 				 parse->line_count, spec->z - parse->zTail + 1,
-				 spec->n, spec->z);
+				 tt_cstr(spec->z, spec->n));
 			parse->is_aborted = true;
 			return NULL;
 		}
 		if (spec->z[0] == '#' && sqlIsdigit(id->z[0])) {
 			diag_set(ClientError, ER_SQL_SYNTAX_NEAR_TOKEN,
-				 parse->line_count, spec->n, spec->z);
+				 parse->line_count, tt_cstr(spec->z, spec->n));
 			parse->is_aborted = true;
 			return NULL;
 		}
@@ -1632,6 +1628,7 @@ sql_expr_list_dup(struct ExprList *p, int flags)
 		}
 		pItem->zName = sql_xstrdup(pOldItem->zName);
 		pItem->zSpan = sql_xstrdup(pOldItem->zSpan);
+		pItem->legacy_name = sql_xstrdup(pOldItem->legacy_name);
 		pItem->sort_order = pOldItem->sort_order;
 		pItem->done = 0;
 		pItem->bSpanIsTab = pOldItem->bSpanIsTab;
@@ -1663,6 +1660,7 @@ sqlSrcListDup(struct SrcList *p, int flags)
 		struct SrcList_item *pOldItem = &p->a[i];
 		pNewItem->zName = sql_xstrdup(pOldItem->zName);
 		pNewItem->zAlias = sql_xstrdup(pOldItem->zAlias);
+		pNewItem->legacy_name = sql_xstrdup(pOldItem->legacy_name);
 		pNewItem->fg = pOldItem->fg;
 		pNewItem->iCursor = pOldItem->iCursor;
 		pNewItem->addrFillSub = pOldItem->addrFillSub;
@@ -1670,6 +1668,8 @@ sqlSrcListDup(struct SrcList *p, int flags)
 		if (pNewItem->fg.isIndexedBy) {
 			pNewItem->u1.zIndexedBy =
 				sql_xstrdup(pOldItem->u1.zIndexedBy);
+			pNewItem->legacy_index_name =
+				sql_xstrdup(pOldItem->legacy_index_name);
 		}
 		pNewItem->pIBIndex = pOldItem->pIBIndex;
 		if (pNewItem->fg.isTabFunc) {
@@ -1705,6 +1705,7 @@ sqlIdListDup(struct IdList *p)
 		struct IdList_item *pNewItem = &pNew->a[i];
 		struct IdList_item *pOldItem = &p->a[i];
 		pNewItem->zName = sql_xstrdup(pOldItem->zName);
+		pNewItem->legacy_name = sql_xstrdup(pOldItem->legacy_name);
 		pNewItem->idx = pOldItem->idx;
 	}
 	return pNew;
@@ -1811,7 +1812,10 @@ sqlExprListAppendVector(Parse * pParse,	/* Parsing context */
 		pList = sql_expr_list_append(pList, pSubExpr);
 		assert(pList->nExpr == iFirst + i + 1);
 		pList->a[pList->nExpr - 1].zName = pColumns->a[i].zName;
+		pList->a[pList->nExpr - 1].legacy_name =
+			pColumns->a[i].legacy_name;
 		pColumns->a[i].zName = 0;
+		pColumns->a[i].legacy_name = NULL;
 	}
 
 	if (pExpr->op == TK_SELECT) {
@@ -1872,7 +1876,8 @@ sqlExprListSetName(Parse * pParse,	/* Parsing context */
 	struct ExprList_item *item = &pList->a[pList->nExpr - 1];
 	assert(item->zName == NULL);
 	if (dequote) {
-		item->zName = sql_normalized_name_new(pName->z, pName->n);
+		item->zName = sql_name_new(pName->z, pName->n);
+		item->legacy_name = sql_legacy_name_new(pName->z, pName->n);
 	} else {
 		item->zName = sql_xstrndup(pName->z, pName->n);
 	}
@@ -1903,6 +1908,7 @@ exprListDeleteNN(struct ExprList *pList)
 		sql_expr_delete(pItem->pExpr);
 		sql_xfree(pItem->zName);
 		sql_xfree(pItem->zSpan);
+		sql_xfree(pItem->legacy_name);
 	}
 	sql_xfree(pList->a);
 	sql_xfree(pList);
@@ -2768,9 +2774,6 @@ sqlCodeSubselect(Parse * pParse,	/* Parsing context */
 			 *
 			 * If this is an EXISTS, write an integer 0 (not exists) or 1 (exists)
 			 * into a register and return that register number.
-			 *
-			 * In both cases, the query is augmented with "LIMIT 1".  Any
-			 * preexisting limit is discarded in place of the new LIMIT 1.
 			 */
 			Select *pSel;	/* SELECT statement to encode */
 			SelectDest dest;	/* How to deal with SELECT result */
@@ -2796,12 +2799,22 @@ sqlCodeSubselect(Parse * pParse,	/* Parsing context */
 				sqlVdbeAddOp2(v, OP_Bool, false, dest.iSDParm);
 				VdbeComment((v, "Init EXISTS result"));
 			}
-			if (pSel->pLimit == NULL) {
-				pSel->pLimit = sql_expr_new(TK_INTEGER,
-							    &sqlIntTokens[1]);
-				ExprSetProperty(pSel->pLimit, EP_System);
+			if (pExpr->op == TK_SELECT) {
+				if (pSel->pLimit == NULL) {
+					pSel->pLimit = sql_expr_new_int(1);
+					ExprSetProperty(pSel->pLimit,
+							EP_System);
+				}
+				pSel->selFlags |= SF_SingleRow;
+			} else {
+				/*
+				 * For EXISTS it doesn't matter whether we
+				 * return one or more results, so just replace
+				 * limit with 1.
+				 */
+				sql_expr_delete(pSel->pLimit);
+				pSel->pLimit = sql_expr_new_int(1);
 			}
-			pSel->selFlags |= SF_SingleRow;
 			pSel->iLimit = 0;
 			pSel->selFlags &= ~SF_MultiValue;
 			if (sqlSelect(pParse, pSel, &dest)) {
@@ -3146,6 +3159,7 @@ expr_code_dec(struct Parse *parser, struct Expr *expr, bool is_neg, int reg)
 	return;
 error:
 	sql_xfree(value);
+	diag_set(ClientError, ER_INVALID_DEC, str);
 	parser->is_aborted = true;
 }
 
@@ -3183,7 +3197,8 @@ expr_code_int(struct Parse *parse, struct Expr *expr, bool is_neg,
 		else
 			value = strtoull(z, NULL, 16);
 		if (errno != 0) {
-			diag_set(ClientError, ER_HEX_LITERAL_MAX, sign, z,
+			diag_set(ClientError, ER_HEX_LITERAL_MAX,
+				 tt_sprintf("%s%s", sign, z),
 				 strlen(z) - 2, 16);
 			parse->is_aborted = true;
 			return;
@@ -3193,7 +3208,8 @@ expr_code_int(struct Parse *parse, struct Expr *expr, bool is_neg,
 		bool unused;
 		if (sql_atoi64(z, &value, &unused, len) != 0 ||
 		    (is_neg && (uint64_t) value > (uint64_t) INT64_MAX + 1)) {
-			diag_set(ClientError, ER_INT_LITERAL_MAX, sign, z);
+			diag_set(ClientError, ER_INT_LITERAL_MAX,
+				 tt_sprintf("%s%s", sign, z));
 			parse->is_aborted = true;
 			return;
 		}
@@ -3917,7 +3933,8 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 					diag_set(ClientError,
 						 ER_FUNC_WRONG_ARG_COUNT,
 						 func->def->name,
-						 "at least two", nFarg);
+						 "at least two", nFarg, 2,
+						 SQL_MAX_FUNCTION_ARG);
 					pParse->is_aborted = true;
 					break;
 				}
@@ -3946,7 +3963,8 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 					diag_set(ClientError,
 						 ER_FUNC_WRONG_ARG_COUNT,
 						 func->def->name,
-						 "at least one", nFarg);
+						 "at least one", nFarg, 1,
+						 SQL_MAX_FUNCTION_ARG);
 					pParse->is_aborted = true;
 					break;
 				}
@@ -4295,15 +4313,10 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 		}
 		assert(!ExprHasProperty(pExpr, EP_IntValue));
 		if (pExpr->on_conflict_action == ON_CONFLICT_ACTION_IGNORE) {
-			sqlVdbeAddOp4(v, OP_Halt, 0,
-					  ON_CONFLICT_ACTION_IGNORE, 0,
-					  pExpr->u.zToken, 0);
+			sqlVdbeAddOp2(v, OP_Halt, 0, ON_CONFLICT_ACTION_IGNORE);
 		} else {
-			const char *err =
-				tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-					   pExpr->u.zToken);
-			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, err,
-				      P4_STATIC);
+			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0,
+				      sql_xstrdup(pExpr->u.zToken), P4_DYNAMIC);
 			sqlVdbeAddOp2(v, OP_Halt, -1,
 				      pExpr->on_conflict_action);
 		}
@@ -5438,3 +5451,44 @@ sqlClearTempRegCache(Parse * pParse)
 	pParse->nRangeReg = 0;
 }
 
+uint32_t
+sql_fieldno_by_expr(const struct space *space, const struct Expr *expr)
+{
+	assert(expr->op == TK_ID);
+	uint32_t res = sql_space_fieldno(space, expr->u.zToken);
+	if (res != UINT32_MAX || (expr->flags & EP_Lookup2) == 0)
+		return res;
+	char *old_name_str = sql_legacy_name_new0(expr->u.zToken);
+	res = sql_space_fieldno(space, old_name_str);
+	sql_xfree(old_name_str);
+	return res;
+
+}
+
+uint32_t
+sql_fieldno_by_item(const struct space *space, const struct ExprList_item *item)
+{
+	uint32_t res = sql_space_fieldno(space, item->zName);
+	if (res != UINT32_MAX || item->legacy_name == NULL)
+		return res;
+	return sql_space_fieldno(space, item->legacy_name);
+}
+
+uint32_t
+sql_coll_id_by_expr(const struct Expr *expr)
+{
+	assert(expr->op == TK_COLLATE);
+	const char *name = expr->u.zToken;
+	struct coll_id *coll_id = coll_by_name(name, strlen(name));
+	if (coll_id != NULL)
+		return coll_id->id;
+	if ((expr->flags & EP_Lookup2) == 0)
+		return UINT32_MAX;
+
+	char *old_name_str = sql_legacy_name_new0(expr->u.zToken);
+	coll_id = coll_by_name(old_name_str, strlen(old_name_str));
+	sql_xfree(old_name_str);
+	if (coll_id != NULL)
+		return coll_id->id;
+	return UINT32_MAX;
+}

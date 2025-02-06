@@ -2,10 +2,13 @@
 -- mode.
 
 local fun = require('fun')
+local fio = require('fio')
 local fiber = require('fiber')
 local log = require('log')
 local yaml = require('yaml')
 local popen = require('popen')
+local tnt = require('tarantool')
+local t = require('luatest')
 
 -- Default timeout for expecting an input on child's stdout.
 --
@@ -17,6 +20,38 @@ local M = {}
 
 local mt = {}
 mt.__index = mt
+
+local dbg_header = tnt.package .. " debugger " .. tnt.version
+
+-- {{{ General-purpose utils
+
+-- Join paths in an intuitive way.
+--
+-- If a component is nil, it is skipped.
+--
+-- If a component is an absolute path, it skips all the previous
+-- components.
+--
+-- The wrapper is written for two components for simplicity.
+--
+-- NB: Copied from test/luatest_helpers/server.lua.
+local function pathjoin(a, b)
+    -- No first path -- skip it.
+    if a == nil then
+        return b
+    end
+    -- No second path -- skip it.
+    if b == nil then
+        return a
+    end
+    -- The absolute path is checked explicitly due to gh-8816.
+    if b:startswith('/') then
+        return b
+    end
+    return fio.pathjoin(a, b)
+end
+
+-- }}} General-purpose utils
 
 -- {{{ Instance methods
 
@@ -45,7 +80,14 @@ function mt._start_stderr_logger(self)
 end
 
 function mt._stop_stderr_logger(self)
-    self._stderr_logger:cancel()
+    if self._stderr_logger == nil then
+        return
+    end
+    -- The server could have finished already, thus
+    -- kill only what needs to be killed.
+    if self._stderr_logger:status() ~= 'dead' then
+        self._stderr_logger:cancel()
+    end
     self._stderr_logger = nil
 end
 
@@ -79,7 +121,7 @@ function mt.read_line(self, opts)
     return line
 end
 
--- Returns all readed lines (including expected one).
+-- Returns all read lines (including expected one).
 function mt.read_until_line(self, exp_line, opts)
     local opts = opts or {}
     local deadline = opts.deadline or (fiber.clock() + TIMEOUT)
@@ -90,6 +132,31 @@ function mt.read_until_line(self, exp_line, opts)
         local line = self:read_line({deadline = deadline})
         table.insert(res, line)
     until line == exp_line
+
+    return res
+end
+
+-- Returns all read lines (excluding one with expected prompt, with deadline).
+-- Checks if stderr is empty.
+function mt.read_until_prompt(self, opts)
+    local opts = opts or {}
+    local deadline = opts.deadline or (fiber.clock() + TIMEOUT)
+
+    while not self._readahead_buffer:find(self._prompt) do
+        self:read_chunk({deadline = deadline})
+    end
+
+    local res, new_buffer = unpack(self._readahead_buffer:split(self._prompt,
+                                                                1))
+    new_buffer = self._prompt .. new_buffer
+
+    self._readahead_buffer = new_buffer
+
+    local stderr, err = self.ph:read({timeout = 0.05, stderr = true})
+    if stderr ~= "" and not (stderr == nil and
+                             tostring(err) == "timed out") then
+        error(("Unexpected stderr output: %s"):format(stderr))
+    end
 
     return res
 end
@@ -119,6 +186,14 @@ function mt.assert_data(self, exp_data, opts)
     end
 end
 
+local function decolor(string)
+    assert(type(string) == 'string')
+    -- The gsub is meant to clean ANSI color codes, for more details on
+    -- the format see the doc:
+    -- https://www.xfree86.org/current/ctlseqs.html
+    return string:gsub(M.ESC .. '%[[0-9;]*m', '')
+end
+
 -- ReadLine echoes commands to stdout. It is easier to match the
 -- echo against the original command, when the command is a
 -- one-liner. Let's replace newlines with spaces.
@@ -138,11 +213,16 @@ end
 -- * ReadLine 7: x<CR><duplicate x>, extra spaces.
 -- * ReadLine 6: <space><CR>.
 --
--- This function drop duplicates that goes in row, strips <CR> and
--- spaces. Applying of this function to a source command and
--- readline's echoed command allows to compare them for equality.
+-- This function drop duplicates that goes in row, strips <CR>,
+-- spaces, tabs and ANSI color codes. Applying of this function
+-- to a source command and readline's echoed command allows to
+-- compare them for equality.
 local function _prepare_command_for_compare(x)
-    x = x:gsub(' ', ''):gsub(M.CR, '')
+    x = x:gsub(' ', '')
+         :gsub(M.CR, '')
+         :gsub(M.TAB, '')
+
+    x = decolor(x)
     local acc = fun.iter(x):reduce(function(acc, c)
         if acc[#acc] ~= c then
             table.insert(acc, c)
@@ -161,12 +241,9 @@ function mt._assert_command_echo(self, prepared_command, opts)
 
     -- If readline wraps the line, prepare the commands for
     -- compare.
-    local comment = ''
-    if echo:find(M.CR) ~= nil then
-        exp_echo = _prepare_command_for_compare(exp_echo)
-        echo = _prepare_command_for_compare(echo)
-        comment = ' (the commands are mangled for the comparison)'
-    end
+    exp_echo = _prepare_command_for_compare(exp_echo)
+    echo = _prepare_command_for_compare(echo)
+    local comment = ' (the commands are mangled for the comparison)'
 
     if echo ~= exp_echo then
         error(('Unexpected command echo %q, expected %q%s'):format(
@@ -200,6 +277,21 @@ function mt.read_response(self, opts)
 
     local raw_reply = '---\n' .. table.concat(lines, '\n') .. '\n'
     local reply = yaml.decode(raw_reply)
+
+    -- Consider reply an error if the following conditions are met:
+    --
+    -- 1. The reply contains just one response.
+    -- 2. The response is a table.
+    -- 3. The table contains only one key.
+    -- 4. This key is 'error'.
+    --
+    -- This is how tarantool's console serializes a raised error.
+    local is_error = #reply == 1 and type(reply[1]) == 'table' and
+        next(reply[1], next(reply[1])) == nil and reply[1].error ~= nil
+    if is_error then
+        error(reply[1].error, 0)
+    end
+
     return unpack(reply, 1, table.maxn(reply))
 end
 
@@ -224,6 +316,19 @@ function mt.close(self)
     self.ph:close()
 end
 
+-- Run a command and return its response.
+--
+-- If an expected value is provided, verify that the response
+-- equals to it.
+function mt.roundtrip(self, command, ...)
+    self:execute_command(command)
+    local response = self:read_response()
+    if select('#', ...) > 0 then
+        t.assert_equals(response, (...))
+    end
+    return response
+end
+
 -- }}} Instance methods
 
 -- {{{ Module functions
@@ -236,16 +341,18 @@ function M.escape_control(str)
         :gsub(M.ESC, '<ESC>')
 end
 
-function M.new(opts)
+function M._new_internal(opts)
     local opts = opts or {}
     local args = opts.args or {}
+    local env = opts.env or {}
+    local prompt = opts.prompt
 
     local tarantool_exe = arg[-1]
     local ph = popen.new(fun.chain({tarantool_exe, '-i'}, args):totable(), {
         stdin = popen.opts.PIPE,
         stdout = popen.opts.PIPE,
         stderr = popen.opts.PIPE,
-        env = {
+        env = fun.chain({
             -- Don't know why, but without defined TERM environment
             -- variable readline doesn't accept INPUTRC environment
             -- variable.
@@ -257,24 +364,48 @@ function M.new(opts)
             -- (because the command in the echo output will be
             -- trimmed).
             INPUTRC = '/dev/null',
-        },
+            -- Disable hide/show prompt functionality, because it
+            -- may break a command echo check.
+            --
+            -- For example, it occurs on the 'scheduled next
+            -- checkpoint' log message, which is issued from a
+            -- background fiber.
+            TT_CONSOLE_HIDE_SHOW_PROMPT = 'false',
+        }, env):tomap(),
     })
 
     local res = setmetatable({
         ph = ph,
         _readahead_buffer = '',
-        _prompt = 'tarantool> ',
+        _prompt = prompt or 'tarantool> ',
     }, mt)
 
-    -- Log child's stderr.
-    res:_start_stderr_logger()
+    return res
+end
+
+function M.new_debugger(opts)
+    opts = opts or {}
+    opts.prompt = opts.prompt or 'luadebug> '
+    local debugger = M._new_internal(opts)
+    if opts.expect_header then
+        local stderr, err = debugger.ph:read({timeout = TIMEOUT, stderr = true})
+        if (stderr == nil) then
+            error(err)
+        end
+        assert(stderr:find(dbg_header, 0, true))
+    end
+    return debugger
+end
+
+function M.new(opts)
+    local res = M._new_internal(opts)
 
     -- Write a command and ignore the echoed output.
     --
     -- ReadLine 6 writes <ESC>[?1034h at beginning, it may hit
     -- assertions on the child's output.
     --
-    -- This sequence of charcters is smm ('set meta mode')
+    -- This sequence of characters is smm ('set meta mode')
     -- terminal capacity value. It has relation to writing
     -- characters out of the ASCII range -- ones with 8th bit set,
     -- but its description is vague. See terminfo(5).
@@ -285,6 +416,52 @@ function M.new(opts)
     -- Disable stdout line buffering in the child.
     res:execute_command("io.stdout:setvbuf('no')")
     assert(res:read_response(), true)
+
+    -- Log child's stderr.
+    res:_start_stderr_logger()
+
+    return res
+end
+
+-- Create a new tarantool process and connect its console to
+-- the given server.
+--
+-- The first parameter is a luatest.server object.
+--
+-- The second parameter (opts) is the same as in new().
+function M.connect(server, opts)
+    local known_paths = {
+        -- A default control socket place of tarantool started
+        -- from a YAML configuration.
+        pathjoin(server.chdir, 'var/run/{{ alias }}/tarantool.control'),
+        -- A short socket path is convenient if console.listen()
+        -- is called on the instance manually.
+        pathjoin(server.workdir, 'tarantool.control'),
+    }
+
+    -- Pick up a first existing console socket path from the list.
+    local err = ''
+    local socket_path
+    for _, known_path in ipairs(known_paths) do
+        known_path = known_path:gsub('{{ alias }}', server.alias)
+        if fio.path.exists(known_path) then
+            socket_path = known_path
+            break
+        end
+        err = err .. ('%s: no such file\n'):format(known_path)
+    end
+    if socket_path == nil then
+        error(err)
+    end
+
+    -- Start tarantool and connect its console to the given
+    -- server.
+    local res = M.new(opts)
+    local cmd = ("require('console').connect('%s')"):format(socket_path)
+    res:roundtrip(cmd, true)
+
+    -- Adjust expected prompt to correctly process command's echo.
+    res:set_prompt(('unix/:%s> '):format(socket_path))
 
     return res
 end

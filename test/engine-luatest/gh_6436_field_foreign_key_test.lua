@@ -40,62 +40,62 @@ g.test_bad_foreign_key = function(cg)
         end
         local fmt = gen_format("hello world")
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key must be a table",
+            "format[2]: foreign key must be a table",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({fkey="hello world"})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key definition must be a table with 'space' and 'field' members",
+            "format[2]: foreign key definition must be a table with 'space' and 'field' members",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({space = 'country'})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key definition must be a table with 'space' and 'field' members",
+            "format[2]: foreign key definition must be a table with 'space' and 'field' members",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({fkey={space = 'country'}})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key: field must be specified",
+            "format[2]: foreign key: field must be specified",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({space = 'planet', field = 'id'})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key: space planet was not found",
+            "format[2]: foreign key: space planet was not found",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({fkey={space = 'planet', field = 'id'}})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key: space planet was not found",
+            "format[2]: foreign key: space planet was not found",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({space = {'country'}, field = 'id'})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key: space must be string or number",
+            "format[2]: foreign key: space must be string or number",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({fkey={space = {'country'}, field = 'id'}})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key: space must be string or number",
+            "format[2]: foreign key: space must be string or number",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({space = 'country', field = false})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key: field must be string or number",
+            "format[2]: foreign key: field must be string or number",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({fkey={space = 'country', field = false}})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key: field must be string or number",
+            "format[2]: foreign key: field must be string or number",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({space = 'country', field = 'id', mood = 'wtf'})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key: unexpected parameter 'mood'",
+            "format[2]: foreign key: unexpected parameter 'mood'",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({fkey={space = 'country', field = 'id', mood = 'wtf'}})
         t.assert_error_msg_content_equals(
-            "Illegal parameters, format[2]: foreign key: unexpected parameter 'mood'",
+            "format[2]: foreign key: unexpected parameter 'mood'",
             function() box.schema.create_space('city', {engine=engine, format=fmt}) end
         )
         fmt = gen_format({[string.rep('a', 66666)] = {space = 'country', field = 'id'}})
@@ -137,7 +137,7 @@ g.test_foreign_key_primary = function(cg)
         t.assert_equals(country:select{}, {{1, 'ru', 'Russia'}, {2, 'fr', 'France'}})
         t.assert_error_msg_content_equals(
             "Can't modify space 'country': space is referenced by foreign key",
-            function() country:drop() end
+            country.drop, country
         )
         t.assert_equals(country:select{}, {{1, 'ru', 'Russia'}, {2, 'fr', 'France'}})
         t.assert_error_msg_content_equals(
@@ -215,7 +215,7 @@ g.test_foreign_key_secondary = function(cg)
         t.assert_equals(country:select{}, {{1, 'ru', 'Russia'}, {2, 'fr', 'France'}})
         t.assert_error_msg_content_equals(
             "Can't modify space 'country': space is referenced by foreign key",
-            function() country:drop() end
+            country.drop, country
         )
         t.assert_equals(country:select{}, {{1, 'ru', 'Russia'}, {2, 'fr', 'France'}})
         t.assert_error_msg_content_equals(
@@ -297,7 +297,7 @@ g.test_foreign_key_numeric = function(cg)
         t.assert_equals(country:select{}, {{1, 'ru', 'Russia'}, {2, 'fr', 'France'}})
         t.assert_error_msg_content_equals(
             "Can't modify space 'country': space is referenced by foreign key",
-            function() country:drop() end
+            country.drop, country
         )
         t.assert_equals(country:select{}, {{1, 'ru', 'Russia'}, {2, 'fr', 'France'}})
         t.assert_error_msg_content_equals(

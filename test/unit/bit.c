@@ -251,6 +251,84 @@ test_bitmap_size(void)
 	footer();
 }
 
+/**
+ * Check all possible valid inputs of `bit_set_range()'.
+ */
+static void
+test_bit_set_range(void)
+{
+	header();
+
+	const size_t data_size = 64; /* In bytes. */
+	const size_t data_count = data_size * CHAR_BIT; /* In bits. */
+
+	for (size_t pos = 0; pos < data_count; pos++) {
+		for (size_t count = 0; count <= data_count - pos; count++) {
+			for (int val = 0; val <= 1; val++) {
+				uint8_t data[data_size];
+				uint8_t ref[data_size];
+
+				/* Initialize buffers. */
+				memset(data, 0xA5, sizeof(data));
+				memset(ref, 0xA5, sizeof(ref));
+				/* Calculate reference result. */
+				for (size_t i = pos; i < pos + count; i++) {
+					if (val == 0)
+						bit_clear(ref, i);
+					else
+						bit_set(ref, i);
+				}
+				/* The function under test. */
+				bit_set_range(data, pos, count, val);
+				/* Compare results. */
+				fail_if(memcmp(data, ref, sizeof(data)) != 0);
+			}
+		}
+	}
+
+	footer();
+}
+
+/**
+ * Check all possible valid inputs of `bit_copy_range()`.
+ */
+static inline void
+test_bit_copy_range(bool src_val)
+{
+	header();
+	printf("Source value: %s\n", src_val ? "true" : "false");
+
+	const size_t data_size = 64; /* In bytes. */
+	const size_t data_count = data_size * CHAR_BIT; /* In bits. */
+	const uint8_t src_byte = src_val ? 0xff : 0x00;
+	const uint8_t dst_byte = src_val ? 0x00 : 0xff;
+
+	uint8_t src[data_size];
+	memset(src, src_byte, sizeof(src));
+	for (size_t src_i = 0; src_i < data_count; src_i++) {
+		for (size_t dst_i = 0; dst_i < data_count; dst_i++) {
+			size_t src_max = data_count - src_i;
+			size_t dst_max = data_count - dst_i;
+			for (size_t c = 1; c <= src_max && c <= dst_max; c++) {
+				uint8_t dst[data_size];
+				uint8_t ref[data_size];
+
+				/* Initialize the buffer. */
+				memset(dst, dst_byte, sizeof(dst));
+				/* Calculate the reference mask. */
+				memset(ref, dst_byte, sizeof(ref));
+				bit_set_range(ref, dst_i, c, src_val);
+				/* The function under test. */
+				bit_copy_range(dst, dst_i, src, src_i, c);
+				/* Compare results. */
+				fail_if(memcmp(dst, ref, sizeof(dst)) != 0);
+			}
+		}
+	}
+
+	footer();
+}
+
 int
 main(void)
 {
@@ -263,4 +341,7 @@ main(void)
 	test_bit_iter_empty();
 	test_bit_iter_fractional();
 	test_bitmap_size();
+	test_bit_set_range();
+	test_bit_copy_range(true);
+	test_bit_copy_range(false);
 }

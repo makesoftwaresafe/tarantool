@@ -12,6 +12,7 @@ OutOfMemory: Failed to allocate 42 bytes in allocator for exception
 # exception propagated
 # cancel dead has started
 # by this time the fiber should be dead already
+# Can change the joinability in safe cases.
 	*** fiber_join_test: done ***
 	*** fiber_stack_test ***
 # normal-stack fiber not crashed
@@ -29,11 +30,17 @@ OutOfMemory: Failed to allocate 42 bytes in allocator for exception
 	*** fiber_wait_on_deadline_test: done ***
 	*** cord_cojoin_test ***
 	*** cord_cojoin_test: done ***
-	*** cord_cancel_and_join_test ***
-	*** cord_cancel_and_join_test: done ***
+	*** cord_cojoin_cancel_test ***
+	*** cord_cojoin_cancel_test: done ***
 	*** fiber_test_defaults ***
 	*** fiber_test_defaults: done ***
 	*** fiber_test_leak ***
 	*** fiber_test_leak: done ***
 	*** fiber_test_leak ***
 	*** fiber_test_leak: done ***
+	*** fiber_test_client_fiber_count ***
+	*** fiber_test_client_fiber_count: done ***
+	*** fiber_test_set_system ***
+	*** fiber_test_set_system: done ***
+	*** fiber_test_shutdown: done ***
+	*** fiber_test_shutdown ***

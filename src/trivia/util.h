@@ -106,6 +106,14 @@ strnindex(const char *const *haystack, const char *needle, uint32_t len,
 #define lengthof(array) (sizeof (array) / sizeof ((array)[0]))
 #endif
 
+static inline void
+alloc_failure(const char *filename, int line, size_t size)
+{
+	fprintf(stderr, "Can't allocate %zu bytes at %s:%d",
+		size, filename, line);
+	exit(EXIT_FAILURE);
+}
+
 /**
  * An x* variant of a memory allocation function calls the original function
  * and panics if it fails (i.e. it should never return NULL).
@@ -113,11 +121,8 @@ strnindex(const char *const *haystack, const char *needle, uint32_t len,
 #define xalloc_impl(size, func, args...)					\
 	({									\
 		void *ret = func(args);						\
-		if (unlikely(ret == NULL)) {					\
-			fprintf(stderr, "Can't allocate %zu bytes at %s:%d",	\
-				(size_t)(size), __FILE__, __LINE__);		\
-			exit(EXIT_FAILURE);					\
-		}								\
+		if (unlikely(ret == NULL))					\
+			alloc_failure(__FILE__, __LINE__, (size));		\
 		ret;								\
 	})
 
@@ -126,6 +131,14 @@ strnindex(const char *const *haystack, const char *needle, uint32_t len,
 #define xrealloc(ptr, size)	xalloc_impl((size), realloc, (ptr), (size))
 #define xstrdup(s)		xalloc_impl(strlen((s)) + 1, strdup, (s))
 #define xstrndup(s, n)		xalloc_impl((n) + 1, strndup, (s), (n))
+#define xaligned_alloc(size, align) \
+		xalloc_impl((size), aligned_alloc, (align), (size))
+#define xalloc_object(T) ({							\
+	(T *)xaligned_alloc(sizeof(T), alignof(T));				\
+})
+#define xalloc_array(T, count) ({						\
+	(T *)xaligned_alloc(sizeof(T) * (count), alignof(T));			\
+})
 #define xmempool_alloc(p)	xalloc_impl((p)->objsize, mempool_alloc, (p))
 #define xregion_alloc(p, size)	xalloc_impl((size), region_alloc, (p), (size))
 #define xregion_aligned_alloc(p, size, align) \
@@ -135,13 +148,31 @@ strnindex(const char *const *haystack, const char *needle, uint32_t len,
 #define xibuf_reserve(p, size)	xalloc_impl((size), ibuf_reserve, (p), (size))
 #define xruntime_memory_alloc(size) \
 	xalloc_impl((size), runtime_memory_alloc, (size))
-
+#define xlsregion_alloc(p, size, id) \
+	xalloc_impl((size), lsregion_alloc, (p), (size), (id))
+#define xlsregion_aligned_alloc(p, size, align, id) \
+	xalloc_impl((size), lsregion_aligned_alloc, (p), (size), (align), (id))
+#define xlsregion_alloc_object(lsregion, id, T) ({				\
+	(T *)xlsregion_aligned_alloc((lsregion), sizeof(T), alignof(T), (id));	\
+})
+#define xlsregion_reserve(p, size) \
+	xalloc_impl((size), lsregion_reserve, (p), (size))
 #define xregion_alloc_object(region, T) ({					\
 	(T *)xregion_aligned_alloc((region), sizeof(T), alignof(T));		\
 })
 #define xregion_alloc_array(region, T, count) ({				\
 	(T *)xregion_aligned_alloc((region), sizeof(T) * (count), alignof(T));\
 })
+
+#define xobuf_alloc(p, size)	xalloc_impl((size), obuf_alloc, (p), (size))
+#define xobuf_reserve(p, size)	xalloc_impl((size), obuf_reserve, (p), (size))
+
+#define xobuf_dup(p, src, size)							\
+	({									\
+		size_t ret = obuf_dup((p), (src), (size));			\
+		if (unlikely(ret != (size_t)(size)))				\
+			alloc_failure(__FILE__, __LINE__, (size));		\
+	})
 
 /** \cond public */
 
@@ -249,8 +280,12 @@ strnindex(const char *const *haystack, const char *needle, uint32_t len,
  * including padding if any.
  */
 #ifndef offsetof
-#define offsetof(type, member) ((size_t) &((type *)0)->member)
-#endif
+#  if __has_builtin(__builtin_offsetof)
+#    define offsetof(type, member) __builtin_offsetof(type, member)
+#  else
+#    define offsetof(type, member) ((size_t)&((type *)0)->member)
+#  endif
+#endif /* offsetof */
 
 /**
  * This macro is used to retrieve an enclosing structure from a pointer to
@@ -378,6 +413,23 @@ strnindex(const char *const *haystack, const char *needle, uint32_t len,
 #endif
 
 /**
+ * Adds the 'always_inline' attribute to the function if it's supported. This
+ * attribute forces the function to be inlined if it's possible. If it's not,
+ * this results in a diagnostic.
+ *
+ * Example:
+ *
+ * \code
+ * ALWAYS_INLINE int function() { return 0; }
+ * \endcode
+ */
+#if __has_attribute(always_inline) || defined(__GNUC__)
+#  define ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#  define ALWAYS_INLINE inline
+#endif
+
+/**
  * A function declared as NORETURN shall not return to its caller.
  * The compiler will generate a diagnostic for a function declared as
  * NORETURN that appears to be capable of returning to its caller.
@@ -456,6 +508,17 @@ strnindex(const char *const *haystack, const char *needle, uint32_t len,
 #  define PACKED
 #endif
 
+/**
+ * NO_SANITIZE_ADDRESS attribute disables AddressSanitizer for a given function.
+ * The attribute may not be supported by old compilers, but they do not support
+ * ASAN as well, so it's safe to define the attribute only if ASAN is enabled.
+ */
+#if __has_feature(address_sanitizer)
+#  define NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
+#else
+#  define NO_SANITIZE_ADDRESS
+#endif
+
 /** Function Attributes }}} */
 
 /** {{{ Statement Attributes */
@@ -485,7 +548,8 @@ strnindex(const char *const *haystack, const char *needle, uint32_t len,
 
 void close_all_xcpt(int fdc, ...);
 
-#if defined(__GNUC__) && __GNUC__ >= 11
+#if (defined(__GNUC__) && __GNUC__ >= 11) || \
+	(defined(__clang__) && __clang_major__ >= 12)
 /** Import __gcov_dump function. */
 void
 __gcov_dump(void);
@@ -587,15 +651,6 @@ strlcpy(char *dst, const char *src, size_t size);
 size_t
 strlcat(char *dst, const char *src, size_t size);
 #endif
-
-/**
- * Check that @a str is valid utf-8 sequence and can be printed
- * unescaped.
- * @param str string
- * @param length string length
- */
-int
-utf8_check_printable(const char *str, size_t length);
 
 #ifndef HAVE_MEMMEM
 /* Declare memmem(). */
@@ -776,6 +831,13 @@ var##_assert_type(void)							\
 	(void)p;							\
 }
 
+/** Like assert() but evaluates the given expression even if NDEBUG is set. */
+#ifndef NDEBUG
+# define VERIFY(expr) assert(expr)
+#else
+# define VERIFY(expr) ((void)(expr))
+#endif
+
 #ifndef NDEBUG
 /**
  * Execute a CPU instruction that results in the SIGILL signal.
@@ -795,6 +857,27 @@ illegal_instruction(void)
 		#error unsupported architecture
 	#endif
 }
+#endif
+
+#ifdef ENABLE_ASAN
+# include <sanitizer/lsan_interface.h>
+# define LSAN_IGNORE_OBJECT(ptr) __lsan_ignore_object(ptr)
+
+/**
+ * Disable leak sanitizer. Leak check will not be performed on Tarantool
+ * exit.
+ */
+void
+lsan_turn_off(void);
+
+#else
+# define LSAN_IGNORE_OBJECT(ptr) ((void)ptr)
+
+static inline void
+lsan_turn_off(void)
+{
+}
+
 #endif
 
 #if defined(__cplusplus)

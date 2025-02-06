@@ -10,6 +10,8 @@ if platform.system() == "OpenBSD":
 
 # mask BFD warnings: https://bugs.launchpad.net/tarantool/+bug/1018356
 sys.stdout.push_filter("unable to read unknown load command 0x2\d+", "")
+sys.stdout.push_filter("Tarantool (\d+)\.\d+\.\d+(-\w+)*",
+                       "Tarantool \\1.<minor>.<patch>-<suffix>")
 server.test_option("--help")
 server.test_option("-h")
 # Replace with the same value for case when builddir inside source dir
@@ -58,17 +60,5 @@ server.test_option("-e \"print(rawget(_G, 'log') == nil)\" " + \
                    "-e \"print(log.info('Hello'))\" " + \
                    script + \
                    " 1 2 3 --help")
-
-b_cmds = ["-b", "-bl -e ''", "-b -l -e ''", "-b -e '' output"]
-for cmd in b_cmds:
-    res = server.test_option_get(cmd, silent=True)
-    print(cmd)
-    print(res, end='')
-
-j_cmds = ["-jon -e ''", "-j on -e ''"]
-for cmd in j_cmds:
-    res = server.test_option_get(cmd, silent=True)
-    assert res == ""
-    print(cmd)
 
 sys.stdout.clear_all_filters()

@@ -31,6 +31,7 @@
  * SUCH DAMAGE.
  */
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(__cplusplus)
@@ -41,6 +42,33 @@ struct obuf;
 struct lua_State;
 struct port;
 struct Mem;
+struct mp_ctx;
+struct port_c_entry;
+
+/**
+ * Mode in which data is dumped from a port to a Lua stack (@sa
+ * `port_dump_lua`).
+ */
+enum port_dump_lua_mode {
+	/**
+	 * Data is dumped directly to Lua stack, item-by-item. This mode follows
+	 * the Lua functions' convention to pass arguments and return results.
+	 */
+	PORT_DUMP_LUA_MODE_FLAT,
+	/**
+	 * Data is dumped as a table.  This mode follows Tarantool's
+	 * `box.select` convention when a table of results is returned.
+	 */
+	PORT_DUMP_LUA_MODE_TABLE,
+	/**
+	 * Data is dumped as a MsgPack object. This means that data is possibly
+	 * first converted to MsgPack, and then a MsgPack object is created from
+	 * it. This mode follows Tarantool's convention of passing raw MsgPack
+	 * data coming from IPROTO to Lua (see `box.schema.func::takes_raw_args`
+	 * option).
+	 */
+	PORT_DUMP_LUA_MODE_MP_OBJECT,
+};
 
 /**
  * A single port represents a destination of any output. One such
@@ -54,27 +82,25 @@ struct port_vtab {
 	 * Dump the content of a port to an output buffer.
 	 * @param port Port to dump.
 	 * @param out Buffer to dump to.
+	 * @param ctx MsgPack encoding context to save meta information to.
 	 *
 	 * @retval >= 0 Number of entries dumped.
 	 * @retval < 0 Error.
 	 */
-	int (*dump_msgpack)(struct port *port, struct obuf *out);
+	int (*dump_msgpack)(struct port *port, struct obuf *out,
+			    struct mp_ctx *ctx);
 	/**
 	 * Same as dump_msgpack(), but do not add MsgPack array
 	 * header. Used by the legacy Tarantool 1.6 format.
 	 */
-	int (*dump_msgpack_16)(struct port *port, struct obuf *out);
+	int (*dump_msgpack_16)(struct port *port, struct obuf *out,
+			       struct mp_ctx *ctx);
 	/**
-	 * Dump the content of a port to a given Lua stack.
-	 * When is_flat == true is specified, the data is dumped
-	 * directly to Lua stack, item-by-item. Otherwise, a
-	 * result table is created. The is_flat == true mode
-	 * follows Lua functions convention to pass arguments
-	 * and return a results, while is_flat == false follows
-	 * Tarantool's :select convention when the table of
-	 * results is returned.
+	 * Dump the content of a port to a given Lua stack (@sa
+	 * `port_dump_lua_mode` for a description of operation modes).
 	 */
-	void (*dump_lua)(struct port *port, struct lua_State *L, bool is_flat);
+	void (*dump_lua)(struct port *port, struct lua_State *L,
+			 enum port_dump_lua_mode mode);
 	/**
 	 * Dump a port content as a plain text into a buffer,
 	 * allocated inside.
@@ -108,6 +134,16 @@ struct port_vtab {
 	 * implementation
 	 */
 	struct Mem *(*get_vdbemem)(struct port *port, uint32_t *size);
+	/**
+	 * Get the content of a port as a list of port_c_entry.
+	 * This API is used to easily process port contents from C.
+	 * If port is empty, NULL is returned.
+	 * The lifecycle of the returned value is the same as for
+	 * @get_msgpack method, i.e. it depends on particular
+	 * implementation. Anyway, returned entries mustn't be destroyed
+	 * since they don't own any resources.
+	 */
+	const struct port_c_entry *(*get_c_entries)(struct port *port);
 	/** Destroy a port and release associated resources. */
 	void (*destroy)(struct port *port);
 };
@@ -125,7 +161,7 @@ struct port {
 	 * Implementation dependent content. Needed to declare
 	 * an abstract port instance on stack.
 	 */
-	char pad[68];
+	char pad[74];
 };
 
 /** Is not inlined just to be exported. */
@@ -133,21 +169,36 @@ void
 port_destroy(struct port *port);
 
 static inline int
+port_dump_msgpack_with_ctx(struct port *port, struct obuf *out,
+			   struct mp_ctx *ctx)
+{
+	return port->vtab->dump_msgpack(port, out, ctx);
+}
+
+static inline int
 port_dump_msgpack(struct port *port, struct obuf *out)
 {
-	return port->vtab->dump_msgpack(port, out);
+	return port_dump_msgpack_with_ctx(port, out, NULL);
+}
+
+static inline int
+port_dump_msgpack_16_with_ctx(struct port *port, struct obuf *out,
+			      struct mp_ctx *ctx)
+{
+	return port->vtab->dump_msgpack_16(port, out, ctx);
 }
 
 static inline int
 port_dump_msgpack_16(struct port *port, struct obuf *out)
 {
-	return port->vtab->dump_msgpack_16(port, out);
+	return port_dump_msgpack_16_with_ctx(port, out, NULL);
 }
 
 static inline void
-port_dump_lua(struct port *port, struct lua_State *L, bool is_flat)
+port_dump_lua(struct port *port, struct lua_State *L,
+	      enum port_dump_lua_mode mode)
 {
-	port->vtab->dump_lua(port, L, is_flat);
+	port->vtab->dump_lua(port, L, mode);
 }
 
 static inline const char *
@@ -166,6 +217,12 @@ static inline struct Mem *
 port_get_vdbemem(struct port *port, uint32_t *size)
 {
 	return port->vtab->get_vdbemem(port, size);
+}
+
+static inline const struct port_c_entry *
+port_get_c_entries(struct port *port)
+{
+	return port->vtab->get_c_entries(port);
 }
 
 #if defined(__cplusplus)

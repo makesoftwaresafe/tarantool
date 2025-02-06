@@ -57,6 +57,41 @@ extern "C" {
 	 * IPROTO_UPDATE and IPROTO_UPSERT request body.
 	 */								\
 	_(SPACE_AND_INDEX_NAMES,  5)					\
+	/** IPROTO_WATCH_ONCE request support. */			\
+	_(WATCH_ONCE,  6)						\
+	/**
+	 * Tuple format in DML request responses support:
+	 * Tuples in IPROTO_DATA response field are encoded as MP_TUPLE and
+	 * tuple format is sent in IPROTO_TUPLE_FORMATS field.
+	 */								\
+	_(DML_TUPLE_EXTENSION, 7)					\
+	/**
+	 * Tuple format in call and eval request responses support:
+	 * Tuples in IPROTO_DATA response field are encoded as MP_TUPLE and
+	 * tuple formats are sent in IPROTO_TUPLE_FORMATS field.
+	 */								\
+	_(CALL_RET_TUPLE_EXTENSION, 8)					\
+	/**
+	 * Tuple format in call and eval request arguments support:
+	 * Tuples in IPROTO_TUPLE request field are encoded as MP_TUPLE and
+	 * tuple formats are received in IPROTO_TUPLE_FORMATS field.
+	 */								\
+	_(CALL_ARG_TUPLE_EXTENSION, 9)					\
+	/**
+	 * Cursor (for checkpoint join) in FETCH_SNAPSHOT support:
+	 * IPROTO_IS_CHECKPOINT_JOIN, IPROTO_CHECKPOINT_VCLOCK and
+	 * IRPOTO_CHECKPOINT_LSN.
+	 */								\
+	_(FETCH_SNAPSHOT_CURSOR, 10)					\
+	/**
+	 * Synchronous transaction support:
+	 * IS_SYNC flag in IPROTO_BEGIN, IPROTO_COMMIT
+	 */								\
+	_(IS_SYNC, 11)							\
+	/**
+	 * Support of data insertion in Arrow format.
+	 */								\
+	_(INSERT_ARROW, 12)						\
 
 #define IPROTO_FEATURE_MEMBER(s, v) IPROTO_FEATURE_ ## s = v,
 
@@ -81,7 +116,7 @@ struct iproto_features {
  * `box.iproto.protocol_version` needs to be updated correspondingly.
  */
 enum {
-	IPROTO_CURRENT_VERSION = 5,
+	IPROTO_CURRENT_VERSION = 10,
 };
 
 /**

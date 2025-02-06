@@ -16,9 +16,11 @@ runs:
           lcov \
           ruby-dev \
           liblz4-dev \
+          libbenchmark-dev \
           autoconf \
           automake \
-          libtool
+          libtool \
+          util-linux
 
         luarocks install luacheck 0.26.1
         gem install coveralls-lcov

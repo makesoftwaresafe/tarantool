@@ -18,9 +18,11 @@
 #include "fiber.h"
 #include "errinj.h"
 #include "module_cache.h"
+#include "tt_static.h"
 
 #include "box/error.h"
 #include "box/port.h"
+#include "box/lua/integrity.h"
 
 #include "lua/utils.h"
 #include "libeio/eio.h"
@@ -144,8 +146,9 @@ find_package(const char *package, size_t package_len,
 	struct lua_State *L = tarantool_L;
 	int top = lua_gettop(L);
 	if (luaT_cpcall(L, lpackage_search, &ctx) != 0) {
-		diag_set(ClientError, ER_LOAD_MODULE, ctx.package_len,
-			 ctx.package, lua_tostring(L, -1));
+		diag_set(ClientError, ER_LOAD_MODULE,
+			 tt_cstr(ctx.package, ctx.package_len),
+			 lua_tostring(L, -1));
 		lua_settop(L, top);
 		return -1;
 	}
@@ -325,6 +328,12 @@ module_new(const char *package, size_t package_len,
 		goto error;
 	}
 
+	if (!integrity_verify_file(source_path, NULL, 0)) {
+		diag_set(SystemError, "integrity check failed for module %s",
+			 source_path);
+		goto error;
+	}
+
 	struct stat st;
 	if (stat(source_path, &st) < 0) {
 		diag_set(SystemError, "failed to stat() module: %s",
@@ -363,8 +372,8 @@ module_new(const char *package, size_t package_len,
 	if (rmdir(dir_name) != 0)
 		say_warn("failed to delete temporary dir: %s", dir_name);
 	if (m->handle == NULL) {
-		diag_set(ClientError, ER_LOAD_MODULE, package_len,
-			  package, dlerror());
+		diag_set(ClientError, ER_LOAD_MODULE,
+			 tt_cstr(package, package_len), dlerror());
 		goto error;
 	}
 

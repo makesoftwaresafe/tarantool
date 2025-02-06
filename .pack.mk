@@ -7,6 +7,7 @@ RWS_BASE_URL = https://rws.tarantool.org
 PRODUCT_NAME = tarantool
 
 VARDIR ?=/tmp/t
+OUTPUT_DIR ?=${PWD}/build
 
 GIT_DESCRIBE = $(shell git describe HEAD)
 GIT_TAG = $(shell git tag --points-at HEAD)
@@ -16,6 +17,7 @@ VERSION = ${MAJOR_VERSION}.${MINOR_VERSION}
 
 TARANTOOL_SERIES = series-${MAJOR_VERSION}
 S3_SOURCE_REPO_URL = s3://tarantool_repo/sources
+S3_SCHEMA_REPO_URL = s3://tarantool_repo/schema
 
 prepare:
 	rm -rf build packpack
@@ -44,8 +46,19 @@ package: prepare
 	echo VERSION=$${VERSION}; \
 	PACKPACK_EXTRA_DOCKER_RUN_PARAMS="--network=host --volume ${VARDIR}:${VARDIR} ${PACKPACK_EXTRA_DOCKER_RUN_PARAMS}" \
 	TARBALL_EXTRA_ARGS="--exclude=*.exe --exclude=*.dll" \
-	PRESERVE_ENVVARS="TARBALL_EXTRA_ARGS,${PRESERVE_ENVVARS}" \
+	PRESERVE_ENVVARS="CMAKE_BUILD_TYPE,TARBALL_EXTRA_ARGS,${PRESERVE_ENVVARS}" \
 	./packpack/packpack
+
+package-static:
+	if [ -n "${GIT_TAG}" ]; then \
+		export VERSION="$$(echo ${GIT_TAG} | sed 's/-/~/')"; \
+	else \
+		export VERSION="$$(echo ${GIT_DESCRIBE} | sed ${SED_REPLACE_VERSION_REGEX} | sed 's/-/~/').dev"; \
+	fi; \
+	export OUTPUT_DIR=${OUTPUT_DIR}; \
+	echo VERSION=$${VERSION}; \
+	echo OUTPUT_DIR=${OUTPUT_DIR}; \
+	./static-build/make_packages.sh
 
 deploy:
 	if [ -z "${REPO_TYPE}" ]; then \
@@ -75,6 +88,31 @@ deploy:
 	echo $${CURL_CMD}; \
 	$${CURL_CMD}
 
+deploy-static:
+	if [ -z "${REPO_TYPE}" ]; then \
+		echo "Env variable 'REPO_TYPE' must be defined!"; \
+		exit 1; \
+	fi
+
+	for pkg_type in rpm deb; do \
+		RWS_ENDPOINT=${RWS_BASE_URL}/${REPO_TYPE}/${TARANTOOL_SERIES}/linux-$${pkg_type}/static; \
+		CURL_CMD="curl \
+			--location \
+			--fail \
+			--silent \
+			--show-error \
+			--retry 5 \
+			--retry-delay 5 \
+			--request PUT $${RWS_ENDPOINT} \
+			--user $${RWS_AUTH} \
+			--form product=${PRODUCT_NAME}"; \
+		for f in $$(ls -I '_CPack_Packages' ${OUTPUT_DIR}/*.$${pkg_type}); do \
+			CURL_CMD="$${CURL_CMD} --form $$(basename $${f})=@$${f}"; \
+		done; \
+		echo $${CURL_CMD}; \
+		$${CURL_CMD}; \
+	done;
+
 source: prepare
 	if [ -n "${GIT_TAG}" ]; then \
 		export VERSION=${GIT_TAG}; \
@@ -87,3 +125,12 @@ source: prepare
 
 source-deploy: source
 	aws --endpoint-url ${AWS_S3_ENDPOINT_URL} s3 cp build/*.tar.gz ${S3_SOURCE_REPO_URL}/ --acl public-read
+
+schema-deploy:
+	if [ -n "${GIT_TAG}" ]; then \
+		CONFIG_SCHEMA_FILE=config.schema.${GIT_TAG}.json; \
+	else \
+		CONFIG_SCHEMA_FILE=config.schema.json; \
+	fi; \
+	mv config-schema-pretty.json $${CONFIG_SCHEMA_FILE}; \
+	aws --endpoint-url ${AWS_S3_ENDPOINT_URL} s3 cp $${CONFIG_SCHEMA_FILE} ${S3_SCHEMA_REPO_URL}/ --acl public-read

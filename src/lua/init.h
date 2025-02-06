@@ -43,9 +43,27 @@ extern bool start_loop;
 
 extern struct lua_State *tarantool_L;
 
+/* Struct with the information for instance configuration. */
+struct instance_state {
+	/* Instance name to be started. */
+	const char *name;
+	/* Path to configuration file. */
+	const char *config;
+	/* Path to file with hash sums of modules and configuration file. */
+	const char *hashes;
+};
+
 #define O_INTERACTIVE 0x1
 #define O_BYTECODE    0x2
 #define O_DEBUGGING   0x4
+#define O_EXECUTE     0x8
+#define O_HELP_ENV_LIST 0x10
+#define O_FAILOVER      0x20
+#define O_INTEGRITY     0x40
+
+/** Returns true if the name refers to a built-in global Lua object. */
+bool
+tarantool_lua_is_builtin_global(const char *name, uint32_t name_len);
 
 /**
  * Create tarantool_L and initialize built-in Lua modules.
@@ -79,8 +97,8 @@ tarantool_lua_free();
  *        error is set.
  */
 int
-tarantool_lua_run_script(char *path, uint32_t opt_mask,
-			 int optc, const char **optv,
+tarantool_lua_run_script(char *path, struct instance_state *instance,
+			 uint32_t opt_mask, int optc, const char **optv,
 			 int argc, char **argv);
 
 extern char *history;

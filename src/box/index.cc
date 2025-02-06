@@ -34,7 +34,6 @@
 #include "schema.h"
 #include "user_def.h"
 #include "space.h"
-#include "result.h"
 #include "iproto_constants.h"
 #include "txn.h"
 #include "rmean.h"
@@ -52,28 +51,58 @@ UnsupportedIndexFeature::UnsupportedIndexFeature(const char *file,
 	unsigned line, struct index_def *index_def, const char *what)
 	: ClientError(file, line, ER_UNKNOWN)
 {
-	struct space *space = space_cache_find_xc(index_def->space_id);
 	code = ER_UNSUPPORTED_INDEX_FEATURE;
 	error_format_msg(this, tnt_errcode_desc(code), index_def->name,
 			 index_type_strs[index_def->type],
-			 space->def->name, space->def->engine_name, what);
+			 index_def->space_name, index_def->engine_name, what);
+	error_set_str(this, "index", index_def->name);
+	error_set_str(this, "index_type", index_type_strs[index_def->type]);
+	error_set_str(this, "space", index_def->space_name);
+	error_set_str(this, "engine", index_def->engine_name);
+	error_set_str(this, "feature", what);
 }
 
 struct error *
 BuildUnsupportedIndexFeature(const char *file, unsigned line,
 			     struct index_def *index_def, const char *what)
 {
-	try {
-		return new UnsupportedIndexFeature(file, line, index_def, what);
-	} catch (OutOfMemory *e) {
-		return e;
-	}
+	return new UnsupportedIndexFeature(file, line, index_def, what);
+}
+
+/**
+ * Add key as the last error payload field with name "key". The key
+ * is MsgPack array without array prefix. The size of the array
+ * is given by part_count.
+ */
+static void
+error_set_key(struct error *error, const char *key, uint32_t part_count)
+{
+	const char *key_end = key;
+	for (uint32_t i = 0; i < part_count; i++)
+		mp_next(&key_end);
+	size_t region_svp = region_used(&fiber()->gc);
+	size_t key_buf_size = key_end - key + mp_sizeof_array(part_count);
+	char *key_buf = (char *)xregion_alloc(&fiber()->gc, key_buf_size);
+	char *key_pos = (char *)mp_encode_array(key_buf, part_count);
+	memcpy(key_pos, key, key_end - key);
+	error_set_mp(error, "key", key_buf, key_buf_size);
+	region_truncate(&fiber()->gc, region_svp);
+}
+
+void
+error_set_index(struct error *error, const struct index_def *index_def)
+{
+	error_set_str(error, "index", index_def->name);
+	error_set_uint(error, "index_id", index_def->iid);
+	error_set_str(error, "space", index_def->space_name);
+	error_set_uint(error, "space_id", index_def->space_id);
 }
 
 int
 key_validate(const struct index_def *index_def, enum iterator_type type,
 	     const char *key, uint32_t part_count)
 {
+	const char *key_begin = key;
 	assert(key != NULL || part_count == 0);
 	if (part_count == 0) {
 		/*
@@ -93,28 +122,28 @@ key_validate(const struct index_def *index_def, enum iterator_type type,
 		if (part_count != 1 && part_count != d && part_count != d * 2) {
 			diag_set(ClientError, ER_KEY_PART_COUNT, d  * 2,
 				 part_count);
-			return -1;
+			goto error;
 		}
 		if (part_count == 1) {
 			if (key_part_validate(FIELD_TYPE_ARRAY, key, 0, false))
-				return -1;
+				goto error;
 			uint32_t array_size = mp_decode_array(&key);
 			if (array_size != d && array_size != d * 2) {
 				diag_set(ClientError, ER_RTREE_RECT, "Key", d,
 					 d * 2);
-				return -1;
+				goto error;
 			}
 			for (uint32_t part = 0; part < array_size; part++) {
 				if (key_part_validate(FIELD_TYPE_NUMBER, key,
-						      0, false))
-					return -1;
+						      part, false))
+					goto error;
 				mp_next(&key);
 			}
 		} else {
 			for (uint32_t part = 0; part < part_count; part++) {
 				if (key_part_validate(FIELD_TYPE_NUMBER, key,
 						      part, false))
-					return -1;
+					goto error;
 				mp_next(&key);
 			}
 		}
@@ -122,7 +151,7 @@ key_validate(const struct index_def *index_def, enum iterator_type type,
 		if (part_count > index_def->key_def->part_count) {
 			diag_set(ClientError, ER_KEY_PART_COUNT,
 				 index_def->key_def->part_count, part_count);
-			return -1;
+			goto error;
 		}
 
 		/* Partial keys are allowed only for TREE index type. */
@@ -131,42 +160,80 @@ key_validate(const struct index_def *index_def, enum iterator_type type,
 				 index_type_strs[index_def->type],
 				 index_def->key_def->part_count,
 				 part_count);
-			return -1;
+			goto error;
 		}
 		const char *key_end;
 		if (key_validate_parts(index_def->key_def, key,
 				       part_count, true, &key_end) != 0)
-			return -1;
+			goto error;
 	}
 	return 0;
+error:
+	error_set_index(diag_last_error(diag_get()), index_def);
+	error_set_key(diag_last_error(diag_get()), key_begin, part_count);
+	return -1;
 }
 
 int
-exact_key_validate(struct key_def *key_def, const char *key,
+exact_key_validate(struct index_def *index_def, const char *key,
 		   uint32_t part_count)
 {
 	assert(key != NULL || part_count == 0);
+	struct key_def *key_def = index_def->key_def;
+	if (!index_def->opts.is_unique) {
+		diag_set(ClientError, ER_MORE_THAN_ONE_TUPLE);
+		error_set_index(diag_last_error(diag_get()), index_def);
+		return -1;
+	}
 	if (key_def->part_count != part_count) {
 		diag_set(ClientError, ER_EXACT_MATCH, key_def->part_count,
 			 part_count);
-		return -1;
+		goto error;
 	}
 	const char *key_end;
-	return key_validate_parts(key_def, key, part_count, false, &key_end);
+	if (key_validate_parts(key_def, key, part_count, false, &key_end) != 0)
+		goto error;
+	return 0;
+error:
+	error_set_key(diag_last_error(diag_get()), key, part_count);
+	error_set_index(diag_last_error(diag_get()), index_def);
+	return -1;
 }
 
 int
-exact_key_validate_nullable(struct key_def *key_def, const char *key,
-			    uint32_t part_count)
+index_check_dup(struct index *index, struct tuple *old_tuple,
+		struct tuple *new_tuple, struct tuple *dup_tuple,
+		enum dup_replace_mode mode)
 {
-	assert(key != NULL || part_count == 0);
-	if (key_def->part_count != part_count) {
-		diag_set(ClientError, ER_EXACT_MATCH, key_def->part_count,
-			 part_count);
-		return -1;
+	if (dup_tuple == NULL) {
+		if (mode == DUP_REPLACE) {
+			assert(old_tuple != NULL);
+			/*
+			 * dup_replace_mode is DUP_REPLACE, and
+			 * a tuple with the same key is not found.
+			 */
+			diag_set(ClientError, ER_CANT_UPDATE_PRIMARY_KEY,
+				 index->def->space_name, index->def->space_id,
+				 old_tuple, new_tuple, NULL);
+			return -1;
+		}
+	} else { /* dup_tuple != NULL */
+		if (dup_tuple != old_tuple &&
+		    (old_tuple != NULL || mode == DUP_INSERT)) {
+			/*
+			 * There is a duplicate of new_tuple,
+			 * and it's not old_tuple: we can't
+			 * possibly delete more than one tuple
+			 * at once.
+			 */
+			diag_set(ClientError, ER_TUPLE_FOUND,
+				 index->def->name, index->def->space_name,
+				 tuple_str(dup_tuple), tuple_str(new_tuple),
+				 dup_tuple, new_tuple);
+			return -1;
+		}
 	}
-	const char *key_end;
-	return key_validate_parts(key_def, key, part_count, true, &key_end);
+	return 0;
 }
 
 char *
@@ -285,11 +352,7 @@ box_index_random(uint32_t space_id, uint32_t index_id, uint32_t rnd,
 	if (check_index(space_id, index_id, &space, &index) != 0)
 		return -1;
 	/* No tx management, random() is for approximation anyway. */
-	struct result_processor res_proc;
-	result_process_prepare(&res_proc, space);
-	int rc = index_random(index, rnd, result);
-	result_process_perform(&res_proc, &rc, result);
-	if (rc != 0)
+	if (index_random(index, rnd, result) != 0)
 		return -1;
 	if (*result != NULL)
 		tuple_bless(*result);
@@ -308,13 +371,9 @@ box_index_get(uint32_t space_id, uint32_t index_id, const char *key,
 	struct index *index;
 	if (check_index(space_id, index_id, &space, &index) != 0)
 		return -1;
-	if (!index->def->opts.is_unique) {
-		diag_set(ClientError, ER_MORE_THAN_ONE_TUPLE);
-		return -1;
-	}
 	const char *key_array = key;
 	uint32_t part_count = mp_decode_array(&key);
-	if (exact_key_validate(index->def->key_def, key, part_count))
+	if (exact_key_validate(index->def, key, part_count) != 0)
 		return -1;
 	box_run_on_select(space, index, ITER_EQ, key_array);
 	/* Start transaction in the engine. */
@@ -322,10 +381,7 @@ box_index_get(uint32_t space_id, uint32_t index_id, const char *key,
 	struct txn_ro_savepoint svp;
 	if (txn_begin_ro_stmt(space, &txn, &svp) != 0)
 		return -1;
-	struct result_processor res_proc;
-	result_process_prepare(&res_proc, space);
 	int rc = index_get(index, key, part_count, result);
-	result_process_perform(&res_proc, &rc, result);
 	txn_end_ro_stmt(txn, &svp);
 	if (rc != 0)
 		return -1;
@@ -361,10 +417,7 @@ box_index_min(uint32_t space_id, uint32_t index_id, const char *key,
 	struct txn_ro_savepoint svp;
 	if (txn_begin_ro_stmt(space, &txn, &svp) != 0)
 		return -1;
-	struct result_processor res_proc;
-	result_process_prepare(&res_proc, space);
 	int rc = index_min(index, key, part_count, result);
-	result_process_perform(&res_proc, &rc, result);
 	txn_end_ro_stmt(txn, &svp);
 	if (rc != 0)
 		return -1;
@@ -398,10 +451,7 @@ box_index_max(uint32_t space_id, uint32_t index_id, const char *key,
 	struct txn_ro_savepoint svp;
 	if (txn_begin_ro_stmt(space, &txn, &svp) != 0)
 		return -1;
-	struct result_processor res_proc;
-	result_process_prepare(&res_proc, space);
 	int rc = index_max(index, key, part_count, result);
-	result_process_perform(&res_proc, &rc, result);
 	txn_end_ro_stmt(txn, &svp);
 	if (rc != 0)
 		return -1;
@@ -417,8 +467,7 @@ box_index_count(uint32_t space_id, uint32_t index_id, int type,
 	assert(key != NULL && key_end != NULL);
 	mp_tuple_assert(key, key_end);
 	if (type < 0 || type >= iterator_type_MAX) {
-		diag_set(ClientError, ER_ILLEGAL_PARAMS,
-			 "Invalid iterator type");
+		diag_set(IllegalParams, "Invalid iterator type");
 		return -1;
 	}
 	enum iterator_type itype = (enum iterator_type) type;
@@ -446,15 +495,15 @@ box_index_count(uint32_t space_id, uint32_t index_id, int type,
 /* {{{ Iterators ************************************************/
 
 box_iterator_t *
-box_index_iterator_after(uint32_t space_id, uint32_t index_id, int type,
-			 const char *key, const char *key_end,
-			 const char *packed_pos, const char *packed_pos_end)
+box_index_iterator_with_offset(uint32_t space_id, uint32_t index_id, int type,
+			       const char *key, const char *key_end,
+			       const char *packed_pos,
+			       const char *packed_pos_end, uint32_t offset)
 {
 	assert(key != NULL && key_end != NULL);
 	mp_tuple_assert(key, key_end);
 	if (type < 0 || type >= iterator_type_MAX) {
-		diag_set(ClientError, ER_ILLEGAL_PARAMS,
-			 "Invalid iterator type");
+		diag_set(IllegalParams, "Invalid iterator type");
 		return NULL;
 	}
 	enum iterator_type itype = (enum iterator_type) type;
@@ -493,12 +542,11 @@ box_index_iterator_after(uint32_t space_id, uint32_t index_id, int type,
 	struct txn_ro_savepoint svp;
 	if (txn_begin_ro_stmt(space, &txn, &svp) != 0)
 		return NULL;
-	struct iterator *it = index_create_iterator_after(index, itype, key,
-							  part_count, pos);
+	struct iterator *it = index_create_iterator_with_offset(
+		index, itype, key, part_count, pos, offset);
 	txn_end_ro_stmt(txn, &svp);
 	if (it == NULL)
 		return NULL;
-	it->space = space;
 	it->pos_buf = pos_buf;
 	it->pos_buf_size = pos_buf_size;
 	pos_guard.is_active = false;
@@ -511,8 +559,8 @@ box_iterator_t *
 box_index_iterator(uint32_t space_id, uint32_t index_id, int type,
 		   const char *key, const char *key_end)
 {
-	return box_index_iterator_after(space_id, index_id, type, key, key_end,
-					NULL, NULL);
+	return box_index_iterator_with_offset(space_id, index_id, type, key,
+					      key_end, NULL, NULL, 0);
 }
 
 int
@@ -521,16 +569,12 @@ box_iterator_next(box_iterator_t *itr, box_tuple_t **result)
 	assert(result != NULL);
 	if (box_check_slice() != 0)
 		return -1;
-	struct space *space = iterator_space(itr);
+	struct space *space = index_weak_ref_get_space(&itr->index_ref);
 	if (space == NULL) {
 		*result = NULL;
 		return 0;
 	}
-	struct result_processor res_proc;
-	result_process_prepare(&res_proc, space);
-	int rc = iterator_next(itr, result);
-	result_process_perform(&res_proc, &rc, result);
-	if (rc != 0)
+	if (iterator_next(itr, result) != 0)
 		return -1;
 	if (*result != NULL)
 		tuple_bless(*result);
@@ -577,64 +621,19 @@ box_index_compact(uint32_t space_id, uint32_t index_id)
 void
 iterator_create(struct iterator *it, struct index *index)
 {
+	index_weak_ref_create(&it->index_ref, index);
 	it->next_internal = NULL;
 	it->next = NULL;
 	it->free = NULL;
-	it->space_cache_version = space_cache_version;
-	it->space_id = index->def->space_id;
-	it->index_id = index->def->iid;
-	it->index = index;
-	it->space = NULL;
 	it->pos_buf = NULL;
 	it->pos_buf_size = 0;
-}
-
-/**
- * Helper function that checks that the iterated index wasn't dropped
- * and updates it->space and it->space_cache_version on success.
- * Returns 0 on success, -1 on failure.
- */
-static int
-iterator_check_space(struct iterator *it)
-{
-	struct space *space = space_by_id(it->space_id);
-	if (space == NULL)
-		return -1;
-	struct index *index = space_index(space, it->index_id);
-	if (index != it->index ||
-	    index->space_cache_version > it->space_cache_version)
-		return -1;
-	it->space_cache_version = space_cache_version;
-	it->space = space;
-	return 0;
-}
-
-static bool
-iterator_is_valid(struct iterator *it)
-{
-	/* In case of ephemeral space there is no need to check schema version */
-	if (it->space_id == 0)
-		return true;
-	if (unlikely(it->space_cache_version != space_cache_version)) {
-		if (iterator_check_space(it) != 0)
-			return false;
-	}
-	return true;
-}
-
-struct space *
-iterator_space_slow(struct iterator *it)
-{
-	if (iterator_check_space(it) != 0)
-		return NULL;
-	return it->space;
 }
 
 int
 iterator_next(struct iterator *it, struct tuple **ret)
 {
 	assert(it->next != NULL);
-	if (!iterator_is_valid(it)) {
+	if (!index_weak_ref_check(&it->index_ref)) {
 		*ret = NULL;
 		return 0;
 	}
@@ -645,7 +644,7 @@ int
 iterator_next_internal(struct iterator *it, struct tuple **ret)
 {
 	assert(it->next_internal != NULL);
-	if (!iterator_is_valid(it)) {
+	if (!index_weak_ref_check(&it->index_ref)) {
 		*ret = NULL;
 		return 0;
 	}
@@ -658,7 +657,7 @@ iterator_position(struct iterator *it, const char **pos, uint32_t *size)
 	assert(it->position != NULL);
 	assert(pos != NULL);
 	assert(size != NULL);
-	if (!iterator_is_valid(it)) {
+	if (!index_weak_ref_check(&it->index_ref)) {
 		*pos = NULL;
 		*size = 0;
 		return 0;
@@ -672,7 +671,7 @@ size_t
 iterator_position_pack_bufsize(const char *pos, const char *pos_end)
 {
 	assert(pos != NULL);
-	return base64_bufsize(pos_end - pos, ITERATOR_POS_B64_OPTS);
+	return base64_encode_bufsize(pos_end - pos, ITERATOR_POS_B64_OPTS);
 }
 
 void
@@ -699,8 +698,7 @@ iterator_position_unpack_bufsize(const char *packed_pos,
 	assert(packed_pos != NULL);
 	assert(packed_pos_end != NULL);
 	assert(packed_pos < packed_pos_end);
-	/* See description of base64_decode. */
-	return 3 * (packed_pos_end - packed_pos) / 4 + 1;
+	return base64_decode_bufsize(packed_pos_end - packed_pos);
 }
 
 int
@@ -746,7 +744,10 @@ iterator_position_validate(const char *pos, uint32_t pos_part_count,
 {
 	int cmp;
 	/* Position must be compatible with the index. */
-	if (exact_key_validate_nullable(cmp_def, pos, pos_part_count) != 0)
+	if (cmp_def->part_count != pos_part_count)
+		goto fail;
+	const char *pos_end;
+	if (key_validate_parts(cmp_def, pos, pos_part_count, true, &pos_end) != 0)
 		goto fail;
 	/* Position msut meet the search criteria. */
 	cmp = key_compare(pos, pos_part_count, HINT_NONE,
@@ -773,14 +774,11 @@ iterator_delete(struct iterator *it)
 	it->free(it);
 }
 
-int
+void
 index_create(struct index *index, struct engine *engine,
 	     const struct index_vtab *vtab, struct index_def *def)
 {
 	def = index_def_dup(def);
-	if (def == NULL)
-		return -1;
-
 	index->vtab = vtab;
 	index->engine = engine;
 	index->def = def;
@@ -790,37 +788,32 @@ index_create(struct index *index, struct engine *engine,
 	index->unique_id = unique_id++;
 	/* Unusable until set to proper value during space creation. */
 	index->dense_id = UINT32_MAX;
-	rlist_create(&index->nearby_gaps);
-	rlist_create(&index->full_scans);
-	return 0;
+	rlist_create(&index->read_gaps);
 }
 
 void
 index_delete(struct index *index)
 {
 	assert(index->refs == 0);
+	assert(rlist_empty(&index->read_gaps));
 	/*
 	 * Free index_def after destroying the index as
 	 * engine might still need it, e.g. to check if
 	 * the index is primary or secondary.
 	 */
 	struct index_def *def = index->def;
-	memtx_tx_on_index_delete(index);
 	index->vtab->destroy(index);
 	index_def_delete(def);
 }
 
-int
+void
 index_read_view_create(struct index_read_view *rv,
 		       const struct index_read_view_vtab *vtab,
 		       struct index_def *def)
 {
 	rv->vtab = vtab;
 	rv->def = index_def_dup(def);
-	if (rv->def == NULL)
-		return -1;
 	rv->space = NULL;
-	return 0;
 }
 
 void
@@ -931,9 +924,38 @@ generic_index_count(struct index *index, enum iterator_type type,
 	int rc = 0;
 	size_t count = 0;
 	struct tuple *tuple = NULL;
-	while ((rc = iterator_next(it, &tuple)) == 0 && tuple != NULL)
+	while ((rc = iterator_next(it, &tuple)) == 0 && tuple != NULL) {
+		rc = box_check_slice();
+		if (rc != 0)
+			break;
 		++count;
+	}
 	iterator_delete(it);
+	if (rc < 0)
+		return rc;
+	return count;
+}
+
+ssize_t
+generic_index_read_view_count(struct index_read_view *rv,
+			      enum iterator_type type, const char *key,
+			      uint32_t part_count)
+{
+	struct index_read_view_iterator it;
+	if (index_read_view_create_iterator(rv, type, key,
+					    part_count, &it) != 0)
+		return -1;
+	int rc = 0;
+	size_t count = 0;
+	struct read_view_tuple tuple;
+	while ((rc = index_read_view_iterator_next_raw(&it, &tuple)) == 0 &&
+	       tuple.data != NULL) {
+		rc = box_check_slice();
+		if (rc != 0)
+			break;
+		++count;
+	}
+	index_read_view_iterator_destroy(&it);
 	if (rc < 0)
 		return rc;
 	return count;
@@ -988,6 +1010,61 @@ generic_index_create_iterator(struct index *base, enum iterator_type type,
 	return NULL;
 }
 
+
+struct iterator *
+generic_index_create_iterator_with_offset(struct index *base,
+					  enum iterator_type type,
+					  const char *key, uint32_t part_count,
+					  const char *pos, uint32_t offset)
+{
+	/* Create a reguar iterator. */
+	struct iterator *it = index_create_iterator_after(
+		base, type, key, part_count, pos);
+	if (it == NULL)
+		return NULL;
+
+	/* Skip the required amount of tuples. */
+	for (size_t i = 0; i < offset; i++) {
+		if (box_check_slice() != 0)
+			goto fail;
+		struct tuple *skipped_tuple;
+		if (iterator_next(it, &skipped_tuple) != 0)
+			goto fail;
+		if (skipped_tuple == NULL)
+			return it;
+	}
+	return it;
+fail:
+	iterator_delete(it);
+	return NULL;
+}
+
+int
+generic_index_read_view_create_iterator_with_offset(
+	struct index_read_view *rv, enum iterator_type type,
+	const char *key, uint32_t part_count,
+	const char *pos, uint32_t offset,
+	struct index_read_view_iterator *it)
+{
+	if (index_read_view_create_iterator_after(rv, type, key, part_count,
+						  pos, it) != 0)
+		return -1;
+
+	/* Skip the required amount of tuples. */
+	for (size_t i = 0; i < offset; i++) {
+		if (box_check_slice() != 0)
+			goto fail;
+		struct read_view_tuple skipped_tuple;
+		if (index_read_view_iterator_next_raw(it, &skipped_tuple) != 0)
+			goto fail;
+		if (skipped_tuple.data == NULL)
+			return 0;
+	}
+	return 0;
+fail:
+	index_read_view_iterator_destroy(it);
+	return -1;
+}
 
 struct index_read_view *
 generic_index_create_read_view(struct index *index)
@@ -1086,10 +1163,10 @@ int
 generic_iterator_position(struct iterator *it, const char **pos,
 			  uint32_t *size)
 {
-	(void)it;
 	(void)pos;
 	(void)size;
-	diag_set(UnsupportedIndexFeature, it->index->def, "pagination");
+	struct index *index = index_weak_ref_get_index_checked(&it->index_ref);
+	diag_set(UnsupportedIndexFeature, index->def, "pagination");
 	return -1;
 }
 
@@ -1102,6 +1179,12 @@ generic_index_read_view_iterator_position(struct index_read_view_iterator *it,
 	(void)size;
 	diag_set(UnsupportedIndexFeature, it->base.index->def, "pagination");
 	return -1;
+}
+
+void
+generic_index_read_view_iterator_destroy(struct index_read_view_iterator *it)
+{
+	TRASH(it);
 }
 
 /* }}} */

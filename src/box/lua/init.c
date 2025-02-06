@@ -45,9 +45,13 @@
 #include "box/txn.h"
 #include "box/func.h"
 #include "box/mp_error.h"
+#include "box/mp_box_ctx.h"
+#include "box/mp_tuple.h"
+#include "box/tuple.h"
 
 #include "box/lua/error.h"
 #include "box/lua/tuple.h"
+#include "box/lua/tuple_format.h"
 #include "box/lua/call.h"
 #include "box/lua/slab.h"
 #include "box/lua/index.h"
@@ -75,6 +79,12 @@
 #include "box/lua/security.h"
 #include "box/lua/space_upgrade.h"
 #include "box/lua/wal_ext.h"
+#include "box/lua/wal_retention_period.h"
+#include "box/lua/trigger.h"
+#include "box/lua/config/utils/expression_lexer.h"
+#include "box/lua/failover.h"
+#include "box/lua/integrity.h"
+#include "box/lua/config/extras.h"
 
 #include "mpstream/mpstream.h"
 
@@ -82,6 +92,7 @@ static uint32_t CTID_STRUCT_TXN_SAVEPOINT_PTR = 0;
 
 extern char session_lua[],
 	tuple_lua[],
+	tuple_format_lua[],
 	key_def_lua[],
 	schema_lua[],
 	load_cfg_lua[],
@@ -90,9 +101,12 @@ extern char session_lua[],
 	feedback_daemon_lua[],
 #endif
 	net_box_lua[],
+	net_replicaset_lua[],
+	internal_version_lua[],
 	upgrade_lua[],
 	console_lua[],
 	merger_lua[],
+	iproto_lua[],
 	checks_version_lua[],
 	checks_lua[],
 	metrics_api_lua[],
@@ -116,6 +130,7 @@ extern char session_lua[],
 	metrics_registry_lua[],
 	metrics_stash_lua[],
 	metrics_tarantool_clock_lua[],
+	metrics_tarantool_config_lua[],
 	metrics_tarantool_cpu_lua[],
 	metrics_tarantool_event_loop_lua[],
 	metrics_tarantool_fibers_lua[],
@@ -133,7 +148,43 @@ extern char session_lua[],
 	metrics_tarantool_vinyl_lua[],
 	metrics_tarantool_lua[],
 	metrics_utils_lua[],
-	metrics_version_lua[];
+	metrics_version_lua[],
+	/* {{{ config */
+	config_applier_app_lua[],
+	config_applier_autoexpel_lua[],
+	config_applier_box_cfg_lua[],
+	config_applier_runtime_priv_lua[],
+	config_applier_compat_lua[],
+	config_applier_console_lua[],
+	config_applier_credentials_lua[],
+	config_applier_fiber_lua[],
+	config_applier_lua_lua[],
+	config_applier_mkdir_lua[],
+	config_applier_roles_lua[],
+	config_applier_sharding_lua[],
+	config_applier_box_status_lua[],
+	config_cluster_config_lua[],
+	config_descriptions_lua[],
+	config_validators_lua[],
+	config_configdata_lua[],
+	config_init_lua[],
+	config_instance_config_lua[],
+	config_source_env_lua[],
+	config_source_file_lua[],
+	config_utils_aboard_lua[],
+	config_utils_expression_lua[],
+	config_utils_file_lua[],
+	config_utils_log_lua[],
+	config_utils_odict_lua[],
+	config_utils_schema_lua[],
+	config_utils_snapshot_lua[],
+	config_utils_tabulate_lua[],
+	config_utils_textutils_lua[],
+	config_utils_funcutils_lua[],
+	config_utils_network_lua[],
+	/* }}} config */
+
+	connpool_lua[];
 
 /**
  * List of box's built-in modules written using Lua.
@@ -156,6 +207,7 @@ extern char session_lua[],
 static const char *lua_sources[] = {
 	"box/session", NULL, session_lua,
 	"box/tuple", NULL, tuple_lua,
+	"box/tuple_format", NULL, tuple_format_lua,
 	"box/schema", NULL, schema_lua,
 #if ENABLE_FEEDBACK_DAEMON
 	/*
@@ -174,13 +226,17 @@ static const char *lua_sources[] = {
 	FLIGHT_RECORDER_BOX_LUA_MODULES
 	READ_VIEW_BOX_LUA_MODULES
 	SECURITY_BOX_LUA_MODULES
+	INTEGRITY_BOX_LUA_MODULES
 	"box/xlog", "xlog", xlog_lua,
+	"box/version", NULL, internal_version_lua,
 	"box/upgrade", NULL, upgrade_lua,
 	"box/net_box", "net.box", net_box_lua,
+	"box/net_replicaset", "internal.net.replicaset", net_replicaset_lua,
 	"box/console", "console", console_lua,
 	"box/load_cfg", NULL, load_cfg_lua,
 	"box/key_def", "key_def", key_def_lua,
 	"box/merger", "merger", merger_lua,
+	"box/iproto", "iproto", iproto_lua,
 	/*
 	 * To support tarantool-only types with checks, the module
 	 * must be loaded after decimal and datetime lua modules
@@ -230,6 +286,8 @@ static const char *lua_sources[] = {
 	"metrics.psutils.cpu", metrics_psutils_cpu_lua,
 	"third_party/metrics/metrics/tarantool/clock",
 	"metrics.tarantool.clock", metrics_tarantool_clock_lua,
+	"third_party/metrics/metrics/tarantool/config",
+	"metrics.tarantool.config", metrics_tarantool_config_lua,
 	"third_party/metrics/metrics/tarantool/cpu",
 	"metrics.tarantool.cpu", metrics_tarantool_cpu_lua,
 	"third_party/metrics/metrics/tarantool/event_loop",
@@ -272,13 +330,209 @@ static const char *lua_sources[] = {
 	"metrics.plugins.prometheus", metrics_plugins_prometheus_lua,
 	"third_party/metrics/metrics/plugins/json",
 	"metrics.plugins.json", metrics_plugins_json_lua,
+
+	/* {{{ config */
+
+	/*
+	 * The order is important: we should load base modules
+	 * first and then load ones that use them. Otherwise the
+	 * require() call fails.
+	 *
+	 * General speaking the order here is the following:
+	 *
+	 * - utility functions
+	 * - parts of the general logic
+	 * - configuration sources
+	 * - configuration appliers
+	 * - the entrypoint
+	 * - config.storage role
+	 */
+
+	"config/utils/expression",
+	"internal.config.utils.expression",
+	config_utils_expression_lua,
+
+	"config/utils/file",
+	"internal.config.utils.file",
+	config_utils_file_lua,
+
+	"config/utils/log",
+	"internal.config.utils.log",
+	config_utils_log_lua,
+
+	"config/utils/odict",
+	"internal.config.utils.odict",
+	config_utils_odict_lua,
+
+	"config/utils/aboard",
+	"internal.config.utils.aboard",
+	config_utils_aboard_lua,
+
+	"config/utils/funcutils",
+	"internal.config.utils.funcutils",
+	config_utils_funcutils_lua,
+
+	"config/utils/schema",
+	"experimental.config.utils.schema",
+	config_utils_schema_lua,
+
+	"config/utils/tabulate",
+	"internal.config.utils.tabulate",
+	config_utils_tabulate_lua,
+
+	"config/utils/textutils",
+	"internal.config.utils.textutils",
+	config_utils_textutils_lua,
+
+	"config/utils/network",
+	"internal.config.utils.network",
+	config_utils_network_lua,
+
+	"config/descriptions",
+	"internal.config.descriptions",
+	config_descriptions_lua,
+
+	"config/validators",
+	"internal.config.validators",
+	config_validators_lua,
+
+	"config/instance_config",
+	"internal.config.instance_config",
+	config_instance_config_lua,
+
+	"config/utils/snapshot",
+	"internal.config.utils.snapshot",
+	config_utils_snapshot_lua,
+
+	"config/cluster_config",
+	"internal.config.cluster_config",
+	config_cluster_config_lua,
+
+	"config/configdata",
+	"internal.config.configdata",
+	config_configdata_lua,
+
+	"config/source/env",
+	"internal.config.source.env",
+	config_source_env_lua,
+
+	"config/source/file",
+	"internal.config.source.file",
+	config_source_file_lua,
+
+	"config/applier/app",
+	"internal.config.applier.app",
+	config_applier_app_lua,
+
+	"config/applier/autoexpel",
+	"internal.config.applier.autoexpel",
+	config_applier_autoexpel_lua,
+
+	"config/applier/box_cfg",
+	"internal.config.applier.box_cfg",
+	config_applier_box_cfg_lua,
+
+	"config/applier/compat",
+	"internal.config.applier.compat",
+	config_applier_compat_lua,
+
+	"config/applier/console",
+	"internal.config.applier.console",
+	config_applier_console_lua,
+
+	"config/applier/runtime_priv",
+	"internal.config.applier.runtime_priv",
+	config_applier_runtime_priv_lua,
+
+	"config/applier/credentials",
+	"internal.config.applier.credentials",
+	config_applier_credentials_lua,
+
+	"config/applier/fiber",
+	"internal.config.applier.fiber",
+	config_applier_fiber_lua,
+
+	"config/applier/lua",
+	"internal.config.applier.lua",
+	config_applier_lua_lua,
+
+	"config/applier/mkdir",
+	"internal.config.applier.mkdir",
+	config_applier_mkdir_lua,
+
+	"config/applier/sharding",
+	"internal.config.applier.sharding",
+	config_applier_sharding_lua,
+
+	"config/applier/roles",
+	"internal.config.applier.roles",
+	config_applier_roles_lua,
+
+	"config/applier/box_status",
+	"internal.config.applier.box_status",
+	config_applier_box_status_lua,
+
+	"config/init",
+	"config",
+	config_init_lua,
+
+	CONFIG_EXTRAS_LUA_MODULES
+
+	/* }}} config */
+
+	"connpool",
+	"experimental.connpool",
+	connpool_lua,
+
+	FAILOVER_LUA_MODULES
+
 	NULL
 };
 
 static int
 lbox_commit(lua_State *L)
 {
-	if (box_txn_commit() != 0)
+	int top = lua_gettop(L);
+	enum txn_commit_wait_mode wait_mode = TXN_COMMIT_WAIT_MODE_COMPLETE;
+	if (top == 0)
+		goto box_commit;
+	if (lua_isnil(L, 1))
+		goto box_commit;
+	if (lua_type(L, 1) != LUA_TTABLE) {
+		diag_set(IllegalParams, "options should be a table");
+		return luaT_error(L);
+	}
+	lua_getfield(L, 1, "is_sync");
+	if (!lua_isnil(L, -1)) {
+		if (!lua_isboolean(L, -1)) {
+			diag_set(IllegalParams, "is_sync must be a boolean");
+			return luaT_error(L);
+		}
+		bool is_sync = lua_toboolean(L, lua_gettop(L));
+		if (!is_sync) {
+			diag_set(IllegalParams, "is_sync can only be true");
+			return luaT_error(L);
+		}
+		box_txn_make_sync();
+	}
+	lua_getfield(L, 1, "wait");
+	if (!lua_isnil(L, -1)) {
+		const char *wait_mode_str = lua_tostring(L, -1);
+		if (wait_mode_str == NULL) {
+			/* Nop. */
+		} else if (strcmp(wait_mode_str, "complete") == 0) {
+			/* Nop. */
+		} else if (strcmp(wait_mode_str, "submit") == 0) {
+			wait_mode = TXN_COMMIT_WAIT_MODE_SUBMIT;
+		} else if (strcmp(wait_mode_str, "none") == 0) {
+			wait_mode = TXN_COMMIT_WAIT_MODE_NONE;
+		} else {
+			diag_set(IllegalParams, "unknown 'wait' mode");
+			return luaT_error(L);
+		}
+	}
+box_commit:
+	if (box_txn_commit_ex(wait_mode) != 0)
 		return luaT_error(L);
 	return 0;
 }
@@ -361,9 +615,11 @@ lbox_rollback_to_savepoint(struct lua_State *L)
 	struct txn_savepoint *svp;
 
 	if (lua_gettop(L) != 1 ||
-	    (svp = luaT_check_txn_savepoint(L, 1, &svp_txn_id)) == NULL)
-		return luaL_error(L,
-			"Usage: box.rollback_to_savepoint(savepoint)");
+	    (svp = luaT_check_txn_savepoint(L, 1, &svp_txn_id)) == NULL) {
+		diag_set(IllegalParams,
+			 "Usage: box.rollback_to_savepoint(savepoint)");
+		return luaT_error(L);
+	}
 
 	/*
 	 * Verify that we're in a transaction and that it is the
@@ -440,9 +696,9 @@ lbox_txn_iterator_next(struct lua_State *L)
 }
 
 /**
- * Open an iterator over the transaction statements. This is a C
- * closure and 1 upvalue should be available - id of the
- * transaction to iterate over.
+ * Open an iterator over the transaction statements. This is a C closure and
+ * 2 upvalues should be available: first is an id of the transaction to iterate
+ * over, second is the first statement of the iteration.
  * It returns 3 values which can be used in Lua 'for': iterator
  * generator function, unused nil and the zero key.
  */
@@ -451,13 +707,14 @@ lbox_txn_pairs(struct lua_State *L)
 {
 	int64_t txn_id = luaL_toint64(L, lua_upvalueindex(1));
 	struct txn *txn = in_txn();
+	struct txn_stmt *stmt;
+	stmt = (struct txn_stmt *)lua_topointer(L, lua_upvalueindex(2));
 	if (txn == NULL || txn->id != txn_id) {
 		diag_set(ClientError, ER_CURSOR_NO_TRANSACTION);
 		return luaT_error(L);
 	}
 	luaL_pushint64(L, txn_id);
-	lua_pushlightuserdata(L, stailq_first_entry(&txn->stmts,
-						    struct txn_stmt, next));
+	lua_pushlightuserdata(L, stmt);
 	lua_pushcclosure(L, lbox_txn_iterator_next, 2);
 	lua_pushnil(L);
 	lua_pushinteger(L, 0);
@@ -465,15 +722,17 @@ lbox_txn_pairs(struct lua_State *L)
 }
 
 /**
- * Push an argument for on_commit Lua trigger. The argument is
+ * Push an argument for on_commit and on_rollback Lua triggers. The argument is
  * a function to open an iterator over the transaction statements.
  */
 static int
 lbox_push_txn(struct lua_State *L, void *event)
 {
-	struct txn *txn = (struct txn *) event;
+	struct txn *txn = in_txn();
+	struct txn_stmt *stmt = (struct txn_stmt *)event;
 	luaL_pushint64(L, txn->id);
-	lua_pushcclosure(L, lbox_txn_pairs, 1);
+	lua_pushlightuserdata(L, stmt);
+	lua_pushcclosure(L, lbox_txn_pairs, 2);
 	return 1;
 }
 
@@ -486,13 +745,14 @@ static int                                                                     \
 lbox_on_##name(struct lua_State *L) {                                          \
 	struct txn *txn = in_txn();                                            \
 	int top = lua_gettop(L);                                               \
-	if (top > 2 || txn == NULL) {                                          \
-		return luaL_error(L, "Usage inside a transaction: "            \
-				  "box.on_" #name "([function | nil, "         \
-				  "[function | nil]])");                       \
+	if (top > 3 || txn == NULL) {                                          \
+		diag_set(IllegalParams, "Usage inside a transaction: "         \
+			 "box.on_" #name "([new_function | nil, "              \
+			 "[old_function | nil], [name | nil]])");              \
+		return luaT_error(L);                                          \
 	}                                                                      \
 	txn_init_triggers(txn);                                                \
-	return lbox_trigger_reset(L, 2, &txn->on_##name, lbox_push_txn, NULL); \
+	return lbox_trigger_reset(L, 1, &txn->on_##name, lbox_push_txn, NULL); \
 }
 
 LBOX_TXN_TRIGGER(commit)
@@ -532,9 +792,11 @@ lbox_backup_start(struct lua_State *L)
 {
 	int checkpoint_idx = 0;
 	if (lua_gettop(L) > 0) {
-		checkpoint_idx = luaL_checkint(L, 1);
-		if (checkpoint_idx < 0)
-			return luaL_error(L, "invalid checkpoint index");
+		checkpoint_idx = luaT_checkint(L, 1);
+		if (checkpoint_idx < 0) {
+			diag_set(IllegalParams, "invalid checkpoint index");
+			return luaT_error(L);
+		}
 	}
 	lua_newtable(L);
 	struct lbox_backup_arg arg = {
@@ -570,48 +832,81 @@ static const struct luaL_Reg boxlib_backup[] = {
 };
 
 /**
- * A MsgPack extensions handler, for types defined in box.
+ * A MsgPack extensions handler, for types defined in box. The return value
+ * indicates encoding success.
  */
-static enum mp_type
+static bool
 luamp_encode_extension_box(struct lua_State *L, int idx,
-			   struct mpstream *stream)
+			   struct mpstream *stream, struct mp_ctx *base,
+			   enum mp_type *type)
 {
 	struct tuple *tuple = luaT_istuple(L, idx);
 	if (tuple != NULL) {
-		tuple_to_mpstream(tuple, stream);
-		return MP_ARRAY;
+		if (base != NULL) {
+			struct mp_box_ctx *ctx = mp_box_ctx_check(base);
+			tuple_to_mpstream_as_ext(tuple, stream);
+			tuple_format_map_add_format(&ctx->tuple_format_map,
+						    tuple->format_id);
+			*type = MP_EXT;
+		} else {
+			tuple_to_mpstream(tuple, stream);
+			*type = MP_ARRAY;
+		}
+		return true;
 	}
 	struct error *err = luaL_iserror(L, idx);
-	if (err != NULL)
+	if (err != NULL) {
 		error_to_mpstream(err, stream);
-
-	return MP_EXT;
+		*type = MP_EXT;
+		return true;
+	}
+	return false;
 }
 
 /**
- * A MsgPack extensions handler that supports errors decode.
+ * A MsgPack extensions handler that supports box extensions decode.
  */
 static void
-luamp_decode_extension_box(struct lua_State *L, const char **data)
+luamp_decode_extension_box(struct lua_State *L, const char **data,
+			   struct mp_ctx *ctx)
 {
 	assert(mp_typeof(**data) == MP_EXT);
 	int8_t ext_type;
 	uint32_t len = mp_decode_extl(data, &ext_type);
-
-	if (ext_type != MP_ERROR) {
-		luaL_error(L, "Unsupported MsgPack extension type: %d",
-			   ext_type);
-		return;
+	switch (ext_type) {
+	case MP_ERROR: {
+		struct error *err = error_unpack(data, len);
+		if (err == NULL) {
+			diag_set(IllegalParams,
+				 "Can not parse an error from MsgPack");
+			luaT_error(L);
+		}
+		luaT_pusherror(L, err);
+		break;
 	}
-
-	struct error *err = error_unpack(data, len);
-	if (err == NULL) {
-		luaL_error(L, "Can not parse an error from MsgPack");
-		return;
+	case MP_TUPLE: {
+		struct tuple *tuple;
+		if (ctx == NULL) {
+			tuple = tuple_unpack_without_format(data);
+		} else {
+			struct tuple_format_map *tuple_format_map =
+				&mp_box_ctx_check(ctx)->tuple_format_map;
+			tuple = tuple_unpack(data, tuple_format_map);
+		}
+		if (tuple == NULL)
+			goto tuple_err;
+		luaT_pushtuple(L, tuple);
+		break;
+tuple_err:
+		diag_set(IllegalParams, "Can not parse a tuple from MsgPack");
+		luaT_error(L);
+		break;
 	}
-
-	luaT_pusherror(L, err);
-	return;
+	default:
+		diag_set(IllegalParams,
+			 "Unsupported MsgPack extension type: %d", ext_type);
+		luaT_error(L);
+	}
 }
 
 #include "say.h"
@@ -636,6 +931,7 @@ box_lua_init(struct lua_State *L)
 	lua_pop(L, 1);
 
 	box_lua_error_init(L);
+	box_lua_tuple_format_init(L);
 	box_lua_tuple_init(L);
 	box_lua_call_init(L);
 	box_lua_cfg_init(L);
@@ -655,10 +951,14 @@ box_lua_init(struct lua_State *L)
 	box_lua_iproto_init(L);
 	box_lua_space_upgrade_init(L);
 	box_lua_audit_init(L);
+	box_lua_wal_retention_period_init(L);
 	box_lua_wal_ext_init(L);
 	box_lua_read_view_init(L);
 	box_lua_security_init(L);
 	box_lua_flightrec_init(L);
+	box_lua_trigger_init(L);
+	box_lua_integrity_init(L);
+	box_lua_expression_lexer_init(L);
 	luaopen_net_box(L);
 	lua_pop(L, 1);
 	tarantool_lua_console_init(L);
@@ -717,4 +1017,5 @@ void
 box_lua_free(void)
 {
 	box_lua_iproto_free();
+	box_lua_space_free();
 }

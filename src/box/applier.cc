@@ -157,7 +157,7 @@ applier_check_sync(struct applier *applier)
 	if (applier->state == APPLIER_SYNC &&
 	    applier->lag <= replication_sync_lag &&
 	    vclock_compare_ignore0(&applier->remote_vclock_at_subscribe,
-				   &replicaset.vclock) <= 0) {
+				   instance_vclock) <= 0) {
 		/* Applier is synced, switch to "follow". */
 		applier_set_state(applier, APPLIER_FOLLOW);
 	}
@@ -180,6 +180,10 @@ applier_fiber_new(struct applier *applier, const char *name, fiber_func func,
 	fiber_set_joinable(f, is_joinable);
 	return f;
 }
+
+/** Apply all rows in the rows queue as a single transaction. */
+static int
+applier_apply_tx(struct applier *applier, struct stailq *rows);
 
 /*
  * Fiber function to write vclock to replication master.
@@ -592,29 +596,28 @@ applier_on_bootstrap_leader_uuid_set_f(struct trigger *trigger, void *event)
 	struct applier *applier = (struct applier *)event;
 	struct applier_ballot_data *data =
 		(struct applier_ballot_data *)trigger->data;
+	fiber_wakeup(data->fiber);
 	if (!diag_is_empty(diag_get()))
 		diag_move(diag_get(), &data->diag);
 	else if (tt_uuid_is_nil(&applier->ballot.bootstrap_leader_uuid))
 		return 0;
 	data->done = true;
-	fiber_wakeup(data->fiber);
 	return 0;
 }
 
 void
 applier_wait_bootstrap_leader_uuid_is_set(struct applier *applier)
 {
-	/* The ballot watcher is dead and we aren't going to revive it. */
-	if (applier->ballot_watcher == NULL)
-		goto err;
 	struct trigger trigger;
 	struct applier_ballot_data data;
 	applier_ballot_data_create(&data);
 	trigger_create(&trigger, applier_on_bootstrap_leader_uuid_set_f,
 		       &data, NULL);
 	trigger_add(&applier->on_state, &trigger);
-	while (!data.done && !fiber_is_cancelled())
+	while (!data.done && !fiber_is_cancelled() &&
+	       applier->ballot_watcher != NULL) {
 		fiber_yield();
+	}
 	trigger_clear(&trigger);
 	if (fiber_is_cancelled()) {
 		diag_set(FiberIsCancelled);
@@ -622,6 +625,11 @@ applier_wait_bootstrap_leader_uuid_is_set(struct applier *applier)
 	}
 	if (!diag_is_empty(&data.diag)) {
 		diag_move(&data.diag, diag_get());
+		goto err;
+	}
+	/* The ballot watcher is dead and we aren't going to revive it. */
+	if (!data.done) {
+		diag_set(ClientError, ER_UNKNOWN);
 		goto err;
 	}
 	return;
@@ -656,14 +664,13 @@ applier_connect(struct applier *applier)
 				&greeting);
 
 	applier->last_row_time = ev_monotonic_now(loop());
+	applier->txn_last_tm = 0;
 
 	if (applier->version_id != greeting.version_id) {
-		say_info("remote master %s at %s running Tarantool %u.%u.%u",
+		say_info("remote master %s at %s running Tarantool %s",
 			 tt_uuid_str(&greeting.uuid),
 			 sio_strfaddr(&applier->addr, applier->addr_len),
-			 version_id_major(greeting.version_id),
-			 version_id_minor(greeting.version_id),
-			 version_id_patch(greeting.version_id));
+			 version_id_to_string(greeting.version_id));
 	}
 
 	/* Save the remote instance version and UUID on connect. */
@@ -671,7 +678,7 @@ applier_connect(struct applier *applier)
 	applier->version_id = greeting.version_id;
 
 	/* Don't display previous error messages in box.info.replication */
-	diag_clear(&fiber()->diag);
+	diag_clear(&applier->diag);
 
 	/*
 	 * Send an IPROTO_ID request if it's supported by the master.
@@ -779,7 +786,9 @@ applier_wait_snapshot(struct applier *applier)
 		 * Used to initialize the replica's initial
 		 * vclock in bootstrap_from_master()
 		 */
-		xrow_decode_vclock_xc(&row, &replicaset.vclock);
+		struct vclock vclock;
+		xrow_decode_vclock_ignore0_xc(&row, &vclock);
+		box_init_instance_vclock(&vclock);
 	}
 
 	coio_read_xrow(io, ibuf, &row);
@@ -791,8 +800,11 @@ applier_wait_snapshot(struct applier *applier)
 				xrow_decode_error_xc(&row);
 			} else if (iproto_type_is_promote_request(row.type)) {
 				struct synchro_request req;
-				if (xrow_decode_synchro(&row, &req) != 0)
+				struct vclock limbo_vclock;
+				if (xrow_decode_synchro(&row, &req,
+							&limbo_vclock) != 0) {
 					diag_raise();
+				}
 				if (txn_limbo_process(&txn_limbo, &req) != 0)
 					diag_raise();
 			} else if (iproto_type_is_raft_request(row.type)) {
@@ -832,7 +844,9 @@ applier_wait_snapshot(struct applier *applier)
 				 * vclock yet, do it now. In 1.7+
 				 * this vclock is not used.
 				 */
-				xrow_decode_vclock_xc(&row, &replicaset.vclock);
+				struct vclock vclock;
+				xrow_decode_vclock_ignore0_xc(&row, &vclock);
+				box_init_instance_vclock(&vclock);
 			}
 			break; /* end of stream */
 		} else if (iproto_type_is_error(row.type)) {
@@ -854,8 +868,18 @@ applier_fetch_snapshot(struct applier *applier)
 	struct iostream *io = &applier->io;
 	struct xrow_header row;
 
-	memset(&row, 0, sizeof(row));
-	row.type = IPROTO_FETCH_SNAPSHOT;
+	struct vclock vclock;
+	vclock_create(&vclock);
+	struct fetch_snapshot_request req = {
+		.version_id = tarantool_version_id(),
+		/* Applier doesn't support checkpoint join. */
+		.is_checkpoint_join = false,
+		.checkpoint_vclock = vclock,
+		.checkpoint_lsn = 0,
+		.instance_uuid = INSTANCE_UUID,
+	};
+	RegionGuard region_guard(&fiber()->gc);
+	xrow_encode_fetch_snapshot(&row, &req);
 	coio_write_xrow(io, &row);
 
 	applier_set_state(applier, APPLIER_WAIT_SNAPSHOT);
@@ -873,9 +897,6 @@ struct applier_read_ctx {
 static uint64_t
 applier_read_tx(struct applier *applier, struct stailq *rows,
 		const struct applier_read_ctx *ctx, double timeout);
-
-static int
-apply_final_join_tx(uint32_t replica_id, struct stailq *rows);
 
 /**
  * A helper struct to link xrow objects in a list.
@@ -992,7 +1013,7 @@ applier_wait_register(struct applier *applier, uint64_t row_count)
 						  next)->row);
 			break;
 		}
-		if (apply_final_join_tx(applier->instance_id, &rows) != 0)
+		if (applier_apply_tx(applier, &rows) != 0)
 			diag_raise();
 	}
 
@@ -1100,7 +1121,7 @@ applier_parse_tx_row(struct applier_tx_row *tx_row)
 			diag_raise();
 		}
 	} else if (iproto_type_is_synchro_request(type)) {
-		if (xrow_decode_synchro(row, &tx_row->req.synchro) != 0) {
+		if (xrow_decode_synchro(row, &tx_row->req.synchro, NULL) != 0) {
 			diag_raise();
 		}
 	} else if (iproto_type_is_raft_request(type)) {
@@ -1209,14 +1230,15 @@ applier_rollback_by_wal_io(int64_t signature)
 	trigger_run(&replicaset.applier.on_rollback, NULL);
 
 	/* Rollback applier vclock to the committed one. */
-	vclock_copy(&replicaset.applier.vclock, &replicaset.vclock);
+	vclock_copy(&replicaset.applier.vclock, instance_vclock);
 }
 
 static int
 applier_txn_rollback_cb(struct trigger *trigger, void *event)
 {
-	(void) trigger;
-	struct txn *txn = (struct txn *) event;
+	(void)trigger;
+	(void)event;
+	struct txn *txn = in_txn();
 	/*
 	 * Synchronous transaction rollback due to receiving a
 	 * ROLLBACK entry is a normal event and requires no
@@ -1243,8 +1265,8 @@ static void
 replica_txn_wal_write_cb(struct replica_cb_data *rcb)
 {
 	struct replica *r = replica_by_id(rcb->replica_id);
-	if (likely(r != NULL))
-		r->applier_txn_last_tm = rcb->txn_last_tm;
+	if (likely(r != NULL && r->applier != NULL))
+		r->applier->txn_last_tm = rcb->txn_last_tm;
 }
 
 static int
@@ -1372,8 +1394,7 @@ applier_handle_raft_request(struct applier *applier, struct raft_request *req)
 }
 
 static int
-apply_plain_tx(uint32_t replica_id, struct stailq *rows,
-	       bool skip_conflict, bool use_triggers)
+apply_plain_tx(uint32_t replica_id, struct stailq *rows)
 {
 	/*
 	 * Explicitly begin the transaction so that we can
@@ -1390,7 +1411,7 @@ apply_plain_tx(uint32_t replica_id, struct stailq *rows,
 	stailq_foreach_entry(item, rows, next) {
 		struct xrow_header *row = &item->row;
 		int res = apply_request(&item->req.dml);
-		if (res != 0 && skip_conflict) {
+		if (res != 0 && replication_skip_conflict) {
 			struct error *e = diag_last_error(diag_get());
 			/*
 			 * In case of ER_TUPLE_FOUND error and enabled
@@ -1428,70 +1449,51 @@ apply_plain_tx(uint32_t replica_id, struct stailq *rows,
 		goto fail;
 	}
 
-	if (use_triggers) {
-		/* We are ready to submit txn to wal. */
-		struct trigger *on_rollback, *on_wal_write;
-		size_t size;
-		on_rollback = region_alloc_object(&txn->region, typeof(*on_rollback),
-						  &size);
-		on_wal_write = region_alloc_object(&txn->region, typeof(*on_wal_write),
-						   &size);
-		if (on_rollback == NULL || on_wal_write == NULL) {
-			diag_set(OutOfMemory, size, "region_alloc_object",
-				 "on_rollback/on_wal_write");
-			goto fail;
-		}
+	item = stailq_last_entry(rows, struct applier_tx_row, next);
 
-		struct replica_cb_data *rcb;
-		rcb = region_alloc_object(&txn->region, typeof(*rcb), &size);
-		if (rcb == NULL) {
-			diag_set(OutOfMemory, size, "region_alloc_object", "rcb");
-			goto fail;
-		}
-
-		trigger_create(on_rollback, applier_txn_rollback_cb, NULL, NULL);
-		txn_on_rollback(txn, on_rollback);
-
-		/*
-		 * We use *last* entry timestamp because ack comes up to
-		 * last entry in transaction. Same time this shows more
-		 * precise result because we're interested in how long
-		 * transaction traversed network + remote WAL bundle before
-		 * ack get received.
-		 */
-		item = stailq_last_entry(rows, struct applier_tx_row, next);
-		rcb->replica_id = replica_id;
-		rcb->txn_last_tm = item->row.tm;
-
-		trigger_create(on_wal_write, applier_txn_wal_write_cb, rcb, NULL);
-		txn_on_wal_write(txn, on_wal_write);
+	/*
+	 * Look at the flags item->row->flags. If the transaction
+	 * is synchronous, then set is_sync = true (txn.c). This
+	 * should only be done on replicas. The master sets these
+	 * flags and independently decides whether the transaction
+	 * is synchronous or not. All txn meta flags are set only
+	 * for the last txn row.
+	 */
+	if ((item->row.flags & IPROTO_FLAG_WAIT_ACK) != 0)
+		box_txn_make_sync();
+	size_t size;
+	struct trigger *on_rollback, *on_wal_write;
+	on_rollback = region_alloc_object(&txn->region, typeof(*on_rollback),
+					  &size);
+	on_wal_write = region_alloc_object(&txn->region, typeof(*on_wal_write),
+					   &size);
+	if (on_rollback == NULL || on_wal_write == NULL) {
+		diag_set(OutOfMemory, size, "region_alloc_object",
+			 "on_rollback/on_wal_write");
+		goto fail;
 	}
-
-	return txn_commit_try_async(txn);
+	struct replica_cb_data *rcb;
+	rcb = region_alloc_object(&txn->region, typeof(*rcb), &size);
+	if (rcb == NULL) {
+		diag_set(OutOfMemory, size, "region_alloc_object", "rcb");
+		goto fail;
+	}
+	trigger_create(on_rollback, applier_txn_rollback_cb, NULL, NULL);
+	txn_on_rollback(txn, on_rollback);
+	/*
+	 * We use *last* entry timestamp because ack comes up to last entry in
+	 * transaction. Same time this shows more precise result because we're
+	 * interested in how long transaction traversed network + remote WAL
+	 * bundle before ack get received.
+	 */
+	rcb->replica_id = replica_id;
+	rcb->txn_last_tm = item->row.tm;
+	trigger_create(on_wal_write, applier_txn_wal_write_cb, rcb, NULL);
+	txn_on_wal_write(txn, on_wal_write);
+	return txn_commit_submit(txn);
 fail:
 	txn_abort(txn);
 	return -1;
-}
-
-/** A simpler version of applier_apply_tx() for final join stage. */
-static int
-apply_final_join_tx(uint32_t replica_id, struct stailq *rows)
-{
-	struct applier_tx_row *txr =
-		stailq_first_entry(rows, struct applier_tx_row, next);
-
-	struct xrow_header *last_row =
-		&stailq_last_entry(rows, struct applier_tx_row, next)->row;
-	int rc = 0;
-	/* WAL isn't enabled yet, so follow vclock manually. */
-	vclock_follow_xrow(&replicaset.vclock, last_row);
-	if (unlikely(iproto_type_is_synchro_request(txr->row.type))) {
-		rc = apply_synchro_req(replica_id, &txr->row,
-				       &txr->req.synchro);
-	} else {
-		rc = apply_plain_tx(replica_id, rows, false, false);
-	}
-	return rc;
 }
 
 /**
@@ -1500,7 +1502,7 @@ apply_final_join_tx(uint32_t replica_id, struct stailq *rows)
  * rows for txs following unconfirmed synchronous transactions.
  * The rows are replaced with NOPs to preserve the vclock consistency.
  */
-static void
+static int
 applier_synchro_filter_tx(struct stailq *rows)
 {
 	latch_lock(&txn_limbo.promote_latch);
@@ -1509,17 +1511,17 @@ applier_synchro_filter_tx(struct stailq *rows)
 	});
 	struct xrow_header *row;
 	/*
-	 * It  may happen that we receive the instance's rows via some third
+	 * It may happen that we receive the instance's rows via some third
 	 * node, so cannot check for applier->instance_id here.
 	 */
-	row = &stailq_first_entry(rows, struct applier_tx_row, next)->row;
+	row = &stailq_last_entry(rows, struct applier_tx_row, next)->row;
 	uint64_t term = txn_limbo_replica_term(&txn_limbo, row->replica_id);
 	assert(term <= txn_limbo.promote_greatest_term);
 	if (term == txn_limbo.promote_greatest_term)
-		return;
+		return 0;
 
 	/*
-	 * We do not nopify promotion/demotion and confirm/rollback.
+	 * We do not nopify promotion/demotion and most of confirm/rollback.
 	 * Such syncrhonous requests should be filtered by txn_limbo to detect
 	 * possible split brain situations.
 	 *
@@ -1530,17 +1532,52 @@ applier_synchro_filter_tx(struct stailq *rows)
 	 * claimed by someone is a marker of split-brain by itself: consider it
 	 * a synchronous transaction, which is committed with quorum 1.
 	 */
-	struct xrow_header *last_row =
-		&stailq_last_entry(rows, struct applier_tx_row, next)->row;
-	if (!last_row->wait_sync) {
-		if (iproto_type_is_dml(last_row->type) &&
-		    txn_limbo.owner_id != REPLICA_ID_NIL) {
-			tnt_raise(ClientError, ER_SPLIT_BRAIN,
-				  "got an async transaction from an old term");
-		}
-		return;
-	}
 	struct applier_tx_row *item;
+	if (iproto_type_is_dml(row->type) && !row->wait_sync) {
+		if (txn_limbo.owner_id == REPLICA_ID_NIL)
+			return 0;
+		stailq_foreach_entry(item, rows, next) {
+			row = &item->row;
+			if (row->type == IPROTO_NOP)
+				continue;
+			diag_set(ClientError, ER_SPLIT_BRAIN,
+				 "got an async transaction from an old term");
+			return -1;
+		}
+		return 0;
+	} else if (iproto_type_is_synchro_request(row->type)) {
+		item = stailq_last_entry(rows, typeof(*item), next);
+		struct synchro_request req = item->req.synchro;
+		/* Note! Might be different from row->replica_id. */
+		uint32_t owner_id = req.replica_id;
+		int64_t confirmed_lsn =
+			txn_limbo_replica_confirmed_lsn(&txn_limbo, owner_id);
+		/*
+		 * A CONFIRM with lsn <= known confirm lsn for this replica may
+		 * be nopified without a second thought. The transactions it's
+		 * going to confirm were already confirmed by one of the
+		 * PROMOTE/DEMOTE requests in a new term.
+		 *
+		 * Same about a ROLLBACK with lsn > known confirm lsn.
+		 * These requests, although being out of date, do not contradict
+		 * anything, so we may silently skip them.
+		 */
+		switch (row->type) {
+		case IPROTO_RAFT_PROMOTE:
+		case IPROTO_RAFT_DEMOTE:
+			return 0;
+		case IPROTO_RAFT_CONFIRM:
+			if (req.lsn > confirmed_lsn)
+				return 0;
+			break;
+		case IPROTO_RAFT_ROLLBACK:
+			if (req.lsn <= confirmed_lsn)
+				return 0;
+			break;
+		default:
+			unreachable();
+		}
+	}
 	stailq_foreach_entry(item, rows, next) {
 		row = &item->row;
 		row->type = IPROTO_NOP;
@@ -1549,6 +1586,7 @@ applier_synchro_filter_tx(struct stailq *rows)
 		item->req.dml.header = row;
 		item->req.dml.type = IPROTO_NOP;
 	}
+	return 0;
 }
 
 /**
@@ -1577,11 +1615,6 @@ applier_process_heartbeat(struct applier *applier, struct applier_tx_row *txr)
 	return 0;
 }
 
-/**
- * Apply all rows in the rows queue as a single transaction.
- *
- * Return 0 for success or -1 in case of an error.
- */
 static int
 applier_apply_tx(struct applier *applier, struct stailq *rows)
 {
@@ -1618,6 +1651,11 @@ applier_apply_tx(struct applier *applier, struct stailq *rows)
 	struct latch *latch = (replica ? &replica->order_latch :
 			       &replicaset.applier.order_latch);
 	latch_lock(latch);
+	if (fiber_is_cancelled()) {
+		diag_set(FiberIsCancelled);
+		rc = -1;
+		goto finish;
+	}
 	if (vclock_get(&replicaset.applier.vclock,
 		       last_row->replica_id) >= last_row->lsn) {
 		goto finish;
@@ -1641,7 +1679,10 @@ applier_apply_tx(struct applier *applier, struct stailq *rows)
 			}
 		}
 	}
-	applier_synchro_filter_tx(rows);
+	rc = applier_synchro_filter_tx(rows);
+	if (rc != 0)
+		goto finish;
+
 	if (unlikely(iproto_type_is_synchro_request(first_row->type))) {
 		/*
 		 * Synchro messages are not transactions, in terms
@@ -1652,8 +1693,7 @@ applier_apply_tx(struct applier *applier, struct stailq *rows)
 		rc = apply_synchro_req(applier->instance_id, &txr->row,
 				       &txr->req.synchro);
 	} else {
-		rc = apply_plain_tx(applier->instance_id, rows,
-				    replication_skip_conflict, true);
+		rc = apply_plain_tx(applier->instance_id, rows);
 	}
 	if (rc != 0)
 		goto finish;
@@ -1678,12 +1718,15 @@ applier_signal_ack(struct applier *applier)
 		 * timestamp in tm field. If user delete the node from _cluster
 		 * space, we obtain a nil pointer here.
 		 */
-		struct replica *r = replica_by_id(applier->instance_id);
-		applier->ack_msg.txn_last_tm = (r == NULL ? 0 :
-						r->applier_txn_last_tm);
+		applier->ack_msg.txn_last_tm = applier->txn_last_tm;
+		/*
+		 * Send each timestamp only once. New timestamp is treated by
+		 * relay like something new was acked from that specific relay.
+		 */
+		applier->txn_last_tm = 0;
 		applier->ack_msg.vclock_sync = applier->last_vclock_sync;
 		applier->ack_msg.term = box_raft()->term;
-		vclock_copy(&applier->ack_msg.vclock, &replicaset.vclock);
+		vclock_copy(&applier->ack_msg.vclock, instance_vclock);
 		cmsg_init(&applier->ack_msg.base, applier->ack_route);
 		cpipe_push(&applier->applier_thread->thread_pipe,
 			   &applier->ack_msg.base);
@@ -1749,12 +1792,8 @@ applier_on_rollback(struct trigger *trigger, void *event)
 	(void) event;
 	struct applier *applier = (struct applier *)trigger->data;
 	/* Setup a shared error. */
-	if (!diag_is_empty(&replicaset.applier.diag)) {
-		diag_set_error(&applier->diag,
-			       diag_last_error(&replicaset.applier.diag));
-	}
-	/* Stop the applier fiber. */
-	fiber_cancel(applier->fiber);
+	applier_kill(applier, diag_is_empty(&replicaset.applier.diag) ? NULL :
+			      diag_last_error(&replicaset.applier.diag));
 	return 0;
 }
 
@@ -2019,7 +2058,7 @@ applier_thread_reader_f(va_list ap)
 				 TIMEOUT_INFINITY :
 				 replication_disconnect_timeout();
 		struct applier_tx *tx;
-		tx = lsregion_alloc_object(lsr, applier->thread.lsr_id++,
+		tx = lsregion_alloc_object(lsr, ++applier->thread.lsr_id,
 					   struct applier_tx);
 		if (tx == NULL) {
 			diag_set(OutOfMemory, sizeof(*tx),
@@ -2067,7 +2106,9 @@ applier_thread_f(va_list ap)
 
 	cbus_loop(&thread->endpoint);
 
-	unreachable();
+	cbus_endpoint_destroy(&thread->endpoint, cbus_process);
+	cpipe_destroy(&thread->tx_pipe);
+	return 0;
 }
 
 /** Initialize and start the applier thread. */
@@ -2103,7 +2144,7 @@ applier_init(void)
 						  sizeof(struct applier_thread *));
 	for (int i = 0; i < replication_threads; i++) {
 		struct applier_thread *thread =
-			(struct applier_thread *)xmalloc(sizeof(*thread));
+			xalloc_object(struct applier_thread);
 		applier_thread_create(thread);
 		applier_threads[i] = thread;
 	}
@@ -2114,7 +2155,10 @@ applier_free(void)
 {
 	for (int i = 0; i < replication_threads; i++) {
 		struct applier_thread *thread = applier_threads[i];
-		cord_cancel_and_join(&thread->cord);
+		cbus_stop_loop(&thread->thread_pipe);
+		cpipe_destroy(&thread->thread_pipe);
+		if (cord_join(&thread->cord) != 0)
+			panic_syserror("applier cord join failed");
 		free(thread);
 	}
 	free(applier_threads);
@@ -2223,6 +2267,9 @@ applier_thread_detach_applier(struct cbus_call_msg *base)
 	applier->thread.reader = NULL;
 	lsregion_destroy(&applier->thread.lsr);
 	fiber_cond_destroy(&applier->thread.writer_cond);
+	ibuf_destroy(&applier->thread.ibuf);
+	diag_clear(&applier->thread.exit_msg.diag);
+
 	return 0;
 }
 
@@ -2310,7 +2357,7 @@ applier_subscribe(struct applier *applier)
 
 	struct subscribe_request req;
 	memset(&req, 0, sizeof(req));
-	vclock_copy(&req.vclock, &replicaset.vclock);
+	vclock_copy(&req.vclock, instance_vclock);
 	ERROR_INJECT(ERRINJ_REPLICASET_VCLOCK, {
 		vclock_create(&req.vclock);
 	});
@@ -2451,6 +2498,7 @@ applier_subscribe(struct applier *applier)
 	 * Process a stream of rows from the binary log.
 	 */
 	while (true) {
+		ERROR_INJECT_YIELD(ERRINJ_APPLIER_SUBSCRIBE_DELAY);
 		if (applier->pending_msg_cnt == 0) {
 			fiber_cond_wait(&applier->msg_cond);
 		}
@@ -2472,6 +2520,12 @@ applier_disconnect(struct applier *applier, enum applier_state state)
 	ibuf_reinit(&applier->ibuf);
 }
 
+static void
+applier_set_last_error(struct applier *applier, struct error *e)
+{
+	diag_set_error(&applier->diag, e);
+}
+
 static int
 applier_f(va_list ap)
 {
@@ -2491,9 +2545,14 @@ applier_f(va_list ap)
 	bool was_anon = true;
 
 	/* Re-connect loop */
-	while (!fiber_is_cancelled()) {
+	while (true) {
 		FiberGCChecker gc_check;
 		try {
+			/*
+			 * Test cancel after reconnection sleep at the end
+			 * of the loop here to use catch for FiberIsCancelled.
+			 */
+			fiber_testcancel();
 			applier_connect(applier);
 			if (tt_uuid_is_nil(&REPLICASET_UUID)) {
 				/*
@@ -2537,9 +2596,10 @@ applier_f(va_list ap)
 			    tt_uuid_is_equal(&applier->uuid, &INSTANCE_UUID)) {
 				/* Connection to itself, stop applier */
 				applier_disconnect(applier, APPLIER_OFF);
-				return 0;
+				break;
 			} else if (e->errcode() == ER_LOADING) {
 				/* Autobootstrap */
+				applier_set_last_error(applier, e);
 				applier_log_error(applier, e);
 				applier_disconnect(applier, APPLIER_LOADING);
 				goto reconnect;
@@ -2552,6 +2612,7 @@ applier_f(va_list ap)
 				 * until they receive _cluster record of this
 				 * instance. From some third node, for example.
 				 */
+				applier_set_last_error(applier, e);
 				applier_log_error(applier, e);
 				applier_disconnect(applier, APPLIER_LOADING);
 				goto reconnect;
@@ -2561,6 +2622,7 @@ applier_f(va_list ap)
 				 * Join failure due to synchronous
 				 * transaction rollback.
 				 */
+				applier_set_last_error(applier, e);
 				applier_log_error(applier, e);
 				applier_disconnect(applier, APPLIER_LOADING);
 				goto reconnect;
@@ -2569,12 +2631,14 @@ applier_f(va_list ap)
 				   e->errcode() == ER_NO_SUCH_USER ||
 				   e->errcode() == ER_CREDS_MISMATCH) {
 				/* Invalid configuration */
+				applier_set_last_error(applier, e);
 				applier_log_error(applier, e);
 				applier_disconnect(applier, APPLIER_LOADING);
 				goto reconnect;
 			} else if (e->errcode() == ER_SYSTEM ||
 				   e->errcode() == ER_SSL) {
 				/* System error from master instance. */
+				applier_set_last_error(applier, e);
 				applier_log_error(applier, e);
 				applier_disconnect(applier, APPLIER_DISCONNECTED);
 				goto reconnect;
@@ -2586,15 +2650,17 @@ applier_f(va_list ap)
 				 * will be replaced by a normal tarantool node
 				 * sooner or later.
 				 */
+				applier_set_last_error(applier, e);
 				applier_log_error(applier, e);
 				applier_disconnect(applier,
 						   APPLIER_DISCONNECTED);
 				goto reconnect;
 			} else {
 				/* Unrecoverable errors */
+				applier_set_last_error(applier, e);
 				applier_log_error(applier, e);
 				applier_disconnect(applier, APPLIER_STOPPED);
-				return -1;
+				break;
 			}
 		} catch (XlogGapError *e) {
 			/*
@@ -2619,33 +2685,38 @@ applier_f(va_list ap)
 			 * and in the meantime try to get newer changes from
 			 * node1.
 			 */
+			applier_set_last_error(applier, e);
 			applier_log_error(applier, e);
 			applier_disconnect(applier, APPLIER_LOADING);
 			goto reconnect;
 		} catch (FiberIsCancelled *e) {
 			if (!diag_is_empty(&applier->diag)) {
-				diag_move(&applier->diag, &fiber()->diag);
 				applier_disconnect(applier, APPLIER_STOPPED);
-				break;
+			} else {
+				applier_set_last_error(applier, e);
+				applier_disconnect(applier, APPLIER_OFF);
 			}
-			applier_disconnect(applier, APPLIER_OFF);
 			break;
 		} catch (SocketError *e) {
+			applier_set_last_error(applier, e);
 			applier_log_error(applier, e);
 			applier_disconnect(applier, APPLIER_DISCONNECTED);
 			goto reconnect;
 		} catch (SystemError *e) {
+			applier_set_last_error(applier, e);
 			applier_log_error(applier, e);
 			applier_disconnect(applier, APPLIER_DISCONNECTED);
 			goto reconnect;
 		} catch (SSLError *e) {
+			applier_set_last_error(applier, e);
 			applier_log_error(applier, e);
 			applier_disconnect(applier, APPLIER_DISCONNECTED);
 			goto reconnect;
 		} catch (Exception *e) {
+			applier_set_last_error(applier, e);
 			applier_log_error(applier, e);
 			applier_disconnect(applier, APPLIER_STOPPED);
-			return -1;
+			break;
 		}
 		/* Put fiber_sleep() out of catch block.
 		 *
@@ -2686,11 +2757,20 @@ applier_stop(struct applier *applier)
 	applier->fiber = NULL;
 }
 
+void
+applier_kill(struct applier *applier, struct error *e)
+{
+	assert(applier->fiber != NULL);
+	if (e != NULL)
+		applier_set_last_error(applier, e);
+	fiber_cancel(applier->fiber);
+}
+
 struct applier *
 applier_new(const struct uri *uri)
 {
-	struct applier *applier = (struct applier *)
-		xcalloc(1, sizeof(struct applier));
+	struct applier *applier = xalloc_object(struct applier);
+	memset(applier, 0, sizeof(*applier));
 	if (iostream_ctx_create(&applier->io_ctx, IOSTREAM_CLIENT, uri) != 0) {
 		free(applier);
 		diag_raise();
@@ -2817,8 +2897,9 @@ applier_wait_for_state(struct applier_on_state *trigger, double timeout)
 		assert(applier->state == APPLIER_OFF ||
 		       applier->state == APPLIER_STOPPED);
 		/* Re-throw the original error */
-		assert(!diag_is_empty(&applier->fiber->diag));
-		diag_move(&applier->fiber->diag, &fiber()->diag);
+		assert(!diag_is_empty(&applier->diag));
+		diag_set_error(&fiber()->diag,
+			       diag_last_error(&applier->diag));
 		return -1;
 	}
 	return 0;

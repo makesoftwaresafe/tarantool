@@ -10,6 +10,7 @@ set(lua_sources)
 lua_source(lua_sources lua/load_cfg.lua load_cfg_lua)
 lua_source(lua_sources lua/schema.lua schema_lua)
 lua_source(lua_sources lua/tuple.lua tuple_lua)
+lua_source(lua_sources lua/tuple_format.lua tuple_format_lua)
 lua_source(lua_sources lua/session.lua session_lua)
 if (ENABLE_FEEDBACK_DAEMON)
     lua_source(lua_sources lua/feedback_daemon.lua feedback_daemon_lua)
@@ -29,12 +30,64 @@ endif()
 if(ENABLE_SECURITY)
     lua_source(lua_sources ${SECURITY_LUA_SOURCE} security_lua)
 endif()
+if(ENABLE_INTEGRITY)
+    lua_source(lua_sources ${INTEGRITY_LUA_SOURCE} integrity_lua)
+endif()
 lua_source(lua_sources lua/net_box.lua net_box_lua)
+lua_source(lua_sources lua/net_replicaset.lua net_replicaset_lua)
 lua_source(lua_sources lua/upgrade.lua upgrade_lua)
 lua_source(lua_sources lua/console.lua console_lua)
 lua_source(lua_sources lua/xlog.lua xlog_lua)
 lua_source(lua_sources lua/key_def.lua key_def_lua)
 lua_source(lua_sources lua/merger.lua merger_lua)
+lua_source(lua_sources lua/iproto.lua iproto_lua)
+lua_source(lua_sources lua/version.lua internal_version_lua)
+
+# {{{ config
+lua_source(lua_sources lua/config/applier/app.lua          config_applier_app_lua)
+lua_source(lua_sources lua/config/applier/autoexpel.lua    config_applier_autoexpel_lua)
+lua_source(lua_sources lua/config/applier/box_cfg.lua      config_applier_box_cfg_lua)
+lua_source(lua_sources lua/config/applier/runtime_priv.lua config_applier_runtime_priv_lua)
+lua_source(lua_sources lua/config/applier/compat.lua       config_applier_compat_lua)
+lua_source(lua_sources lua/config/applier/console.lua      config_applier_console_lua)
+lua_source(lua_sources lua/config/applier/credentials.lua  config_applier_credentials_lua)
+lua_source(lua_sources lua/config/applier/fiber.lua        config_applier_fiber_lua)
+lua_source(lua_sources lua/config/applier/lua.lua          config_applier_lua_lua)
+lua_source(lua_sources lua/config/applier/mkdir.lua        config_applier_mkdir_lua)
+lua_source(lua_sources lua/config/applier/roles.lua        config_applier_roles_lua)
+lua_source(lua_sources lua/config/applier/sharding.lua     config_applier_sharding_lua)
+lua_source(lua_sources lua/config/applier/box_status.lua   config_applier_box_status_lua)
+lua_source(lua_sources lua/config/cluster_config.lua       config_cluster_config_lua)
+lua_source(lua_sources lua/config/configdata.lua           config_configdata_lua)
+lua_source(lua_sources lua/config/descriptions.lua         config_descriptions_lua)
+lua_source(lua_sources lua/config/init.lua                 config_init_lua)
+lua_source(lua_sources lua/config/instance_config.lua      config_instance_config_lua)
+lua_source(lua_sources lua/config/source/env.lua           config_source_env_lua)
+lua_source(lua_sources lua/config/source/file.lua          config_source_file_lua)
+lua_source(lua_sources lua/config/validators.lua           config_validators_lua)
+lua_source(lua_sources lua/config/utils/aboard.lua         config_utils_aboard_lua)
+lua_source(lua_sources lua/config/utils/expression.lua     config_utils_expression_lua)
+lua_source(lua_sources lua/config/utils/file.lua           config_utils_file_lua)
+lua_source(lua_sources lua/config/utils/log.lua            config_utils_log_lua)
+lua_source(lua_sources lua/config/utils/odict.lua          config_utils_odict_lua)
+lua_source(lua_sources lua/config/utils/schema.lua         config_utils_schema_lua)
+lua_source(lua_sources lua/config/utils/snapshot.lua       config_utils_snapshot_lua)
+lua_source(lua_sources lua/config/utils/tabulate.lua       config_utils_tabulate_lua)
+lua_source(lua_sources lua/config/utils/textutils.lua      config_utils_textutils_lua)
+lua_source(lua_sources lua/config/utils/funcutils.lua      config_utils_funcutils_lua)
+lua_source(lua_sources lua/config/utils/network.lua        config_utils_network_lua)
+
+if (ENABLE_CONFIG_EXTRAS)
+    lua_multi_source(lua_sources ${CONFIG_EXTRAS_LUA_SOURCES})
+endif()
+# }}} config
+
+lua_source(lua_sources lua/connpool.lua connpool_lua)
+
+if (ENABLE_FAILOVER)
+    lua_multi_source(lua_sources ${FAILOVER_LUA_SOURCES})
+endif()
+
 set(bin_sources)
 bin_source(bin_sources bootstrap.snap bootstrap.h bootstrap_bin)
 
@@ -44,7 +97,6 @@ set(sql_sources
     sql/alter.c
     sql/cursor.c
     sql/build.c
-    sql/callback.c
     sql/delete.c
     sql/expr.c
     sql/func.c
@@ -90,10 +142,11 @@ include_directories(${ZSTD_INCLUDE_DIRS})
 include_directories(${PROJECT_BINARY_DIR}/src/box/sql)
 include_directories(${PROJECT_BINARY_DIR}/src/box)
 include_directories(${EXTRA_CORE_INCLUDE_DIRS})
+include_directories(${EXTRA_SALAD_INCLUDE_DIRS})
 include_directories(${EXTRA_BOX_INCLUDE_DIRS})
 
 add_library(box_error STATIC error.cc errcode.c mp_error.cc)
-target_link_libraries(box_error core stat mpstream vclock)
+target_link_libraries(box_error core mpstream vclock)
 
 add_library(node_name STATIC node_name.c)
 
@@ -105,8 +158,10 @@ set(tuple_sources
     tuple.c
     field_map.c
     tuple_format.c
+    tuple_format_map.c
     tuple_constraint_def.c
     tuple_constraint.c
+    tuple_builder.c
     xrow_update.c
     xrow_update_field.c
     xrow_update_array.c
@@ -125,6 +180,7 @@ set(tuple_sources
     field_def.c
     opt_def.c
     identifier.c
+    mp_tuple.c
 )
 
 if(ENABLE_TUPLE_COMPRESSION)
@@ -134,7 +190,12 @@ endif()
 add_library(tuple STATIC ${tuple_sources})
 target_link_libraries(tuple json box_error core ${MSGPUCK_LIBRARIES} misc bit coll)
 
-add_library(xlog STATIC xlog.c)
+set(xlog_sources xlog.c)
+if(ENABLE_RETENTION_PERIOD)
+    list(APPEND xlog_sources ${RETENTION_PERIOD_SOURCES})
+endif()
+
+add_library(xlog STATIC ${xlog_sources})
 target_link_libraries(xlog core box_error crc32 ${ZSTD_LIBRARIES})
 
 set(box_sources
@@ -146,6 +207,7 @@ set(box_sources
     tuple_convert.c
     index.cc
     index_def.c
+    index_weak_ref.c
     iterator_type.c
     memtx_hash.cc
     memtx_tree.cc
@@ -184,10 +246,10 @@ set(box_sources
     space_cache.c
     space_def.c
     sequence.c
-    constraint_id.c
     func.c
     func_cache.c
     func_def.c
+    field_default_func.c
     tuple_constraint_func.c
     tuple_constraint_fkey.c
     key_list.c
@@ -198,6 +260,7 @@ set(box_sources
     port.c
     txn.c
     txn_limbo.c
+    txn_event_trigger.c
     raft.c
     box.cc
     gc.c
@@ -223,6 +286,7 @@ set(box_sources
     watcher.c
     decimal.c
     read_view.c
+    mp_box_ctx.c
     ${sql_sources}
     ${lua_sources}
     lua/init.c
@@ -249,6 +313,10 @@ set(box_sources
     lua/merger.c
     lua/watcher.c
     lua/iproto.c
+    lua/func_adapter.c
+    lua/tuple_format.c
+    lua/trigger.c
+    lua/config/utils/expression_lexer.c
     ${bin_sources})
 
 if(ENABLE_AUDIT_LOG)
@@ -277,7 +345,18 @@ if(ENABLE_SECURITY)
     list(APPEND box_sources ${SECURITY_SOURCES})
 endif()
 
+if(ENABLE_INTEGRITY)
+    list(APPEND box_sources ${INTEGRITY_SOURCE})
+endif()
+
+if(ENABLE_MEMCS_ENGINE)
+    list(APPEND box_sources ${MEMCS_ENGINE_SOURCES})
+endif()
+
 add_library(box STATIC ${box_sources})
+if(OSS_FUZZ)
+  target_link_options(box PUBLIC "-stdlib=libstdc++")
+endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_definitions(-DSQL_DEBUG=1)
@@ -325,7 +404,7 @@ add_custom_command(OUTPUT ${SQL_BIN_DIR}/opcodes.c
     DEPENDS ${SQL_SRC_DIR}/vdbe.c ${EXT_SRC_DIR}/mkopcodec.sh ${SQL_BIN_DIR}/parse.h
         ${SQL_BIN_DIR}/opcodes.h)
 
-target_link_libraries(box box_error tuple stat xrow xlog vclock crc32 raft
+target_link_libraries(box box_error tuple xrow xlog vclock crc32 raft
                       node_name ${common_libraries})
 
 add_dependencies(box build_bundled_libs generate_sql_files)

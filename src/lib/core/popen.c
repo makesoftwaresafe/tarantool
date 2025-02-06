@@ -12,7 +12,9 @@
 
 #include "popen.h"
 #include "trivia/util.h"
+#include "small/region.h"
 #include "fiber.h"
+#include "fiber_cond.h"
 #include "assoc.h"
 #include "coio.h"
 #include "iostream.h"
@@ -199,12 +201,7 @@ handle_new(struct popen_opts *opts)
 		size += strlen(opts->argv[i]) + 3;
 	}
 
-	handle = malloc(sizeof(*handle) + size);
-	if (!handle) {
-		diag_set(OutOfMemory, sizeof(*handle) + size,
-			 "malloc", "popen_handle");
-		return NULL;
-	}
+	handle = xmalloc(sizeof(*handle) + size);
 
 	pos = handle->command = (void *)handle + sizeof(*handle);
 	pos_max = pos + size;
@@ -232,6 +229,8 @@ handle_new(struct popen_opts *opts)
 	for (i = 0; i < lengthof(handle->ios); i++)
 		iostream_clear(&handle->ios[i]);
 
+	fiber_cond_create(&handle->completion_cond);
+
 	say_debug("popen: alloc handle %p command '%s' flags %#x",
 		  handle, handle->command, opts->flags);
 	return handle;
@@ -239,11 +238,22 @@ handle_new(struct popen_opts *opts)
 
 /**
  * Free memory allocated for a handle. To pair with handle_new().
+ *
+ * Preconditions:
+ *
+ * - No fibers waiting for handle->completion_cond. It may be
+ *   achieved by calling fiber_cond_broadcast(). The waiting
+ *   fibers must be ready to observe a freed handle.
+ * - The handle is removed from the global hashmap of handles
+ *   (using popen_unregister()). popen_wait_timeout() leans on
+ *   this to don't access the freed memory.
  */
 static inline void
 handle_free(struct popen_handle *handle)
 {
 	say_debug("popen: handle free %p", handle);
+	fiber_cond_destroy(&handle->completion_cond);
+	TRASH(handle);
 	free(handle);
 }
 
@@ -618,6 +628,7 @@ popen_sigchld_handler(EV_P_ ev_child *w, int revents)
 			 */
 			popen_unregister(handle);
 			handle->pid = -1;
+			fiber_cond_broadcast(&handle->completion_cond);
 		}
 	}
 }
@@ -670,6 +681,44 @@ popen_state_str(unsigned int state)
 	};
 
 	return state < POPEN_STATE_MAX ? state_str[state] : "unknown";
+}
+
+int
+popen_wait_timeout(struct popen_handle *handle, ev_tstamp timeout)
+{
+	ev_tstamp deadline = ev_monotonic_now(loop()) + timeout;
+
+	/*
+	 * popen_delete() may be called in another fiber, so the
+	 * handle's memory will be freed. Use pid as the primary
+	 * identifier and access the handle's memory only if there
+	 * is a handle registered with this pid.
+	 *
+	 * This way we don't differentiate a completed process
+	 * with a valid handle from a process with a deleted
+	 * handle. We don't need it though.
+	 */
+	pid_t pid = handle->pid;
+	if (pid == -1)
+		return 0;
+
+	/*
+	 * Handle spurious wakeups as suggested by
+	 * fiber_cond_wait_timeout() description.
+	 *
+	 * fiber_wakeup() unblocks fiber_cond_wait_deadline() with
+	 * zero return value despite that fiber_cond_signal() or
+	 * fiber_cond_broadcast() is not called.
+	 */
+	int rc = 0;
+	while (rc == 0) {
+		handle = popen_find(pid);
+		if (handle == NULL || handle->pid == -1)
+			break;
+		rc = fiber_cond_wait_deadline(&handle->completion_cond,
+					      deadline);
+	}
+	return rc;
 }
 
 /**
@@ -842,6 +891,9 @@ popen_delete(struct popen_handle *handle)
 		ev_child_stop(EV_DEFAULT_ &handle->ev_sigchld);
 		popen_unregister(handle);
 	}
+
+	/* Unblock fibers waiting in popen_wait_timeout(). */
+	fiber_cond_broadcast(&handle->completion_cond);
 
 	rlist_del(&handle->list);
 	handle_free(handle);
@@ -1134,7 +1186,6 @@ popen_wait_group_leadership(pid_t pid)
  *   getpgid() fails in the parent process.
  * - SystemError: (temporary restriction) one of std{in,out,err}
  *   is closed in the parent process.
- * - OutOfMemory: unable to allocate handle.
  */
 struct popen_handle *
 popen_new(struct popen_opts *opts)
@@ -1153,13 +1204,6 @@ popen_new(struct popen_opts *opts)
 	char **envp = get_envp(opts);
 	int saved_errno;
 	size_t i;
-
-	/*
-	 * At max we could be skipping each pipe end
-	 * plus dev/null variants and logfd
-	 */
-	int skip_fds[POPEN_FLAG_FD_STDEND_BIT * 2 + 2 + 1];
-	size_t nr_skip_fds = 0;
 
 	/*
 	 * We must decouple log file descriptor from stderr in order to
@@ -1215,11 +1259,27 @@ popen_new(struct popen_opts *opts)
 		return NULL;
 	}
 
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+	/*
+	 * Beside the fds configured to be inherited by the caller,
+	 * at max we could be skipping each pipe end plus dev/null
+	 * variants and logfd.
+	 */
+	const size_t nr_skip_fds_max = opts->nr_inherit_fds +
+				       POPEN_FLAG_FD_STDEND_BIT * 2 + 2 + 1;
+	int *skip_fds = xregion_alloc_array(region, typeof(skip_fds[0]),
+					    nr_skip_fds_max);
+	size_t nr_skip_fds = opts->nr_inherit_fds;
+	if (nr_skip_fds > 0)
+		memcpy(skip_fds, opts->inherit_fds,
+		       nr_skip_fds * sizeof(*skip_fds));
+
 	if (log_fd >= 0)
 		skip_fds[nr_skip_fds++] = log_fd;
 	skip_fds[nr_skip_fds++] = dev_null_fd_ro;
 	skip_fds[nr_skip_fds++] = dev_null_fd_wr;
-	assert(nr_skip_fds <= lengthof(skip_fds));
+	assert(nr_skip_fds <= nr_skip_fds_max);
 
 	for (i = 0; i < lengthof(pfd_map); i++) {
 		if (opts->flags & pfd_map[i].mask) {
@@ -1243,7 +1303,7 @@ popen_new(struct popen_opts *opts)
 
 			skip_fds[nr_skip_fds++] = pfd[i][0];
 			skip_fds[nr_skip_fds++] = pfd[i][1];
-			assert(nr_skip_fds <= lengthof(skip_fds));
+			assert(nr_skip_fds <= nr_skip_fds_max);
 
 			say_debug("popen: created pipe [%s:%d:%d]",
 				  stdX_str(i), pfd[i][0], pfd[i][1]);
@@ -1476,6 +1536,7 @@ exit_child:
 		log_fd = -1;
 		goto out_err;
 	}
+	region_truncate(region, region_svp);
 
 	/*
 	 * Link it into global list for force
@@ -1520,6 +1581,7 @@ out_err:
 	}
 	if (log_fd >= 0)
 		close(log_fd);
+	region_truncate(region, region_svp);
 
 	/* Restore the diagnostics area entry. */
 	diag_set_error(diag, e);

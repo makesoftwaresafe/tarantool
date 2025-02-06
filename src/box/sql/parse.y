@@ -33,11 +33,12 @@
   UNUSED_PARAMETER(yymajor);  /* Silence some compiler warnings */
   assert( TOKEN.z[0] );  /* The tokenizer always gives us a token */
   if (yypParser->is_fallback_failed && TOKEN.isReserved) {
+    const char *token = tt_cstr(TOKEN.z, TOKEN.n);
     diag_set(ClientError, ER_SQL_KEYWORD_IS_RESERVED, pParse->line_count,
-             pParse->line_pos, TOKEN.n, TOKEN.z, TOKEN.n, TOKEN.z);
+             pParse->line_pos, token, token);
   } else {
-    diag_set(ClientError, ER_SQL_SYNTAX_NEAR_TOKEN, pParse->line_count, TOKEN.n,
-             TOKEN.z);
+    diag_set(ClientError, ER_SQL_SYNTAX_NEAR_TOKEN, pParse->line_count,
+             tt_cstr(TOKEN.z, TOKEN.n));
   }
   pParse->is_aborted = true;
 }
@@ -272,8 +273,9 @@ columnlist ::= tcons.
 %type nm {Token}
 nm(A) ::= id(A). {
   if(A.isReserved) {
+    const char *token = tt_cstr(A.z, A.n);
     diag_set(ClientError, ER_SQL_KEYWORD_IS_RESERVED, pParse->line_count,
-             pParse->line_pos, A.n, A.z, A.n, A.z);
+             pParse->line_pos, token, token);
     pParse->is_aborted = true;
   }
 }
@@ -288,15 +290,20 @@ carglist ::= .
 %type cconsname { struct Token }
 cconsname(N) ::= CONSTRAINT nm(X). { N = X; }
 cconsname(N) ::= . { N = Token_nil; }
-ccons ::= DEFAULT term(X).            {sqlAddDefaultValue(pParse,&X);}
-ccons ::= DEFAULT LP expr(X) RP.      {sqlAddDefaultValue(pParse,&X);}
-ccons ::= DEFAULT PLUS term(X).       {sqlAddDefaultValue(pParse,&X);}
-ccons ::= DEFAULT MINUS(A) term(X).      {
+ccons ::= DEFAULT term(X).            {sql_add_term_default(pParse, &X);}
+ccons ::= DEFAULT LP expr(X) RP.      {
+  if (sql_expr_is_term(X.pExpr))
+    sql_add_term_default(pParse, &X);
+  else
+    sql_add_func_default(pParse, &X);
+}
+ccons ::= DEFAULT PLUS number(X).     {sql_add_term_default(pParse, &X);}
+ccons ::= DEFAULT MINUS(A) number(X). {
   ExprSpan v;
   v.pExpr = sqlPExpr(pParse, TK_UMINUS, X.pExpr, 0);
   v.zStart = A.z;
   v.zEnd = X.zEnd;
-  sqlAddDefaultValue(pParse,&v);
+  sql_add_term_default(pParse, &v);
 }
 
 // In addition to the type name, we also care about the primary key and
@@ -888,6 +895,8 @@ idlist(A) ::= nm(Y). {
 %destructor expr {sql_expr_delete($$.pExpr);}
 %type term {ExprSpan}
 %destructor term {sql_expr_delete($$.pExpr);}
+%type number {ExprSpan}
+%destructor number {sql_expr_delete($$.pExpr);}
 
 %include {
   /* This is a utility routine used to set the ExprSpan.zStart and
@@ -937,13 +946,11 @@ idlist(A) ::= nm(Y). {
     p->flags = EP_Leaf;
     p->iAgg = -1;
     p->u.zToken = (char*)&p[1];
-    int rc = sql_normalize_name(p->u.zToken, name_sz, t.z, t.n);
-    if (rc > name_sz) {
-      name_sz = rc;
-      p = sql_xrealloc(p, sizeof(*p) + name_sz);
-      p->u.zToken = (char *)&p[1];
-      sql_normalize_name(p->u.zToken, name_sz, t.z, t.n);
-    }
+    memcpy(p->u.zToken, t.z, t.n);
+    p->u.zToken[t.n] = '\0';
+    sqlDequote(p->u.zToken);
+    if (op == TK_ID || op == TK_COLLATE || op == TK_FUNCTION)
+      p->flags |= t.z[0] != '"' ? EP_Lookup2 : 0;
 #if SQL_MAX_EXPR_DEPTH>0
     p->nHeight = 1;
 #endif  
@@ -966,14 +973,15 @@ expr(A) ::= nm(X) DOT nm(Y). {
   spanSet(&A,&X,&Y); /*A-overwrites-X*/
   A.pExpr = sqlPExpr(pParse, TK_DOT, temp1, temp2);
 }
-term(A) ::= FLOAT|BLOB(X). {spanExpr(&A, @X, X);/*A-overwrites-X*/}
+term(A) ::= BLOB(X). {spanExpr(&A, @X, X);/*A-overwrites-X*/}
 term(A) ::= STRING(X).     {spanExpr(&A, @X, X);/*A-overwrites-X*/}
 term(A) ::= FALSE(X) . {spanExpr(&A, @X, X);/*A-overwrites-X*/}
 term(A) ::= TRUE(X) . {spanExpr(&A, @X, X);/*A-overwrites-X*/}
 term(A) ::= UNKNOWN(X) . {spanExpr(&A, @X, X);/*A-overwrites-X*/}
-term(A) ::= DECIMAL(X) . {spanExpr(&A, @X, X);/*A-overwrites-X*/}
-
-term(A) ::= INTEGER(X). {
+term(A) ::= number(A).
+number(A) ::= FLOAT(X). {spanExpr(&A, @X, X);/*A-overwrites-X*/}
+number(A) ::= DECIMAL(X) . {spanExpr(&A, @X, X);/*A-overwrites-X*/}
+number(A) ::= INTEGER(X). {
   A.pExpr = sql_expr_new_dequoted(TK_INTEGER, &X);
   A.pExpr->type = FIELD_TYPE_INTEGER;
   A.zStart = X.z;
@@ -1212,7 +1220,6 @@ expr(A) ::= expr(A) likeop(OP) expr(Y).  [LIKE_KW]  {
   A.pExpr = sqlExprFunction(pParse, pList, &OP);
   exprNot(pParse, bNot, &A);
   A.zEnd = Y.zEnd;
-  if( A.pExpr ) A.pExpr->flags |= EP_InfixFunc;
 }
 expr(A) ::= expr(A) likeop(OP) expr(Y) ESCAPE expr(E).  [LIKE_KW]  {
   ExprList *pList;
@@ -1224,7 +1231,6 @@ expr(A) ::= expr(A) likeop(OP) expr(Y) ESCAPE expr(E).  [LIKE_KW]  {
   A.pExpr = sqlExprFunction(pParse, pList, &OP);
   exprNot(pParse, bNot, &A);
   A.zEnd = E.zEnd;
-  if( A.pExpr ) A.pExpr->flags |= EP_InfixFunc;
 }
 
 %include {
@@ -1488,18 +1494,18 @@ cmd ::= PRAGMA nm(X).                        {
 cmd ::= PRAGMA nm(X) LP nm(Y) RP.         {
     sqlPragma(pParse,&X,&Y,0);
 }
-cmd ::= PRAGMA nm(X) LP nm(Z) DOT nm(Y) RP.  {
+cmd ::= PRAGMA nm(X) LP nm(Y) DOT nm(Z) RP.  {
     sqlPragma(pParse,&X,&Y,&Z);
 }
 cmd ::= FUNCTION_KW(T) expr(E). {
   if (!pParse->is_expr) {
-    diag_set(ClientError, ER_SQL_SYNTAX_NEAR_TOKEN, pParse->line_count, T.n,
-             T.z);
+    diag_set(ClientError, ER_SQL_SYNTAX_NEAR_TOKEN, pParse->line_count,
+             tt_cstr(T.z, T.n));
     pParse->is_aborted = true;
     return;
   }
   pParse->parsed_ast_type = AST_TYPE_EXPR;
-  pParse->parsed_ast.expr = sqlExprDup(E.pExpr, 0);
+  pParse->parsed_ast.expr = E.pExpr;
 }
 
 //////////////////////////// The SHOW CREATE TABLE command /////////////////////
@@ -1722,10 +1728,44 @@ cmd ::= alter_table_start(A) RENAME TO nm(N). {
     sql_alter_table_rename(pParse);
 }
 
-cmd ::= ALTER TABLE fullname(X) DROP CONSTRAINT nm(Z). {
-  drop_constraint_def_init(&pParse->drop_constraint_def, X, &Z, false);
+cmd ::= ALTER TABLE nm(X) DROP CONSTRAINT nm(Z). {
   pParse->initiateTTrans = true;
-  sql_drop_constraint(pParse);
+  sql_drop_table_constraint(pParse, &X, &Z);
+}
+
+cmd ::= ALTER TABLE nm(X) DROP CONSTRAINT nm(Z) FOREIGN KEY. {
+  pParse->initiateTTrans = true;
+  sql_drop_tuple_foreign_key(pParse, &X, &Z);
+}
+
+cmd ::= ALTER TABLE nm(X) DROP CONSTRAINT nm(Z) PRIMARY KEY. {
+  pParse->initiateTTrans = true;
+  sql_drop_primary_key(pParse, &X, &Z);
+}
+
+cmd ::= ALTER TABLE nm(X) DROP CONSTRAINT nm(Z) UNIQUE. {
+  pParse->initiateTTrans = true;
+  sql_drop_unique(pParse, &X, &Z);
+}
+
+cmd ::= ALTER TABLE nm(X) DROP CONSTRAINT nm(Z) CHECK. {
+  pParse->initiateTTrans = true;
+  sql_drop_tuple_check(pParse, &X, &Z);
+}
+
+cmd ::= ALTER TABLE nm(X) DROP CONSTRAINT nm(F) DOT nm(Z). {
+  pParse->initiateTTrans = true;
+  sql_drop_field_constraint(pParse, &X, &F, &Z);
+}
+
+cmd ::= ALTER TABLE nm(X) DROP CONSTRAINT nm(F) DOT nm(Z) FOREIGN KEY. {
+  pParse->initiateTTrans = true;
+  sql_drop_field_foreign_key(pParse, &X, &F, &Z);
+}
+
+cmd ::= ALTER TABLE nm(X) DROP CONSTRAINT nm(F) DOT nm(Z) CHECK. {
+  pParse->initiateTTrans = true;
+  sql_drop_field_check(pParse, &X, &F, &Z);
 }
 
 //////////////////////// COMMON TABLE EXPRESSIONS ////////////////////////////

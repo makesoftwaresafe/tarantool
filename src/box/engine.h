@@ -40,6 +40,20 @@
 extern "C" {
 #endif /* defined(__cplusplus) */
 
+enum {
+	/**
+	 * For simplicity, assume that the total engine count can't exceed
+	 * the value of this constant.
+	 */
+	MAX_ENGINE_COUNT = 10,
+	/**
+	 * Max number of engines involved in a multi-statement transaction.
+	 * This value must be greater than any `engine::id' of an engine
+	 * without `ENGINE_BYPASS_TX' flag.
+	 */
+	MAX_TX_ENGINE_COUNT = 3,
+};
+
 struct engine;
 struct engine_read_view;
 struct txn;
@@ -49,6 +63,7 @@ struct space;
 struct space_def;
 struct vclock;
 struct xstream;
+struct engine_join_ctx;
 
 extern struct rlist engines;
 
@@ -93,6 +108,11 @@ engine_backup_cb(const char *path, void *arg);
 
 struct engine_vtab {
 	/** Destroy an engine instance. */
+	void (*free)(struct engine *);
+	/**
+	 * Shutdown an engine instance. Shutdown stops all internal
+	 * fibers/threads. It may yield.
+	 */
 	void (*shutdown)(struct engine *);
 	/** Allocate a new space instance. */
 	struct space *(*create_space)(struct engine *engine,
@@ -116,17 +136,19 @@ struct engine_vtab {
 	 * Setup and return a context that will be used
 	 * on further steps.
 	 */
-	int (*prepare_join)(struct engine *engine, void **ctx);
+	int (*prepare_join)(struct engine *engine, struct engine_join_ctx *ctx);
 	/**
 	 * Feed the read view frozen on the previous step to
 	 * the given stream.
 	 */
-	int (*join)(struct engine *engine, void *ctx, struct xstream *stream);
+	int (*join)(struct engine *engine, struct engine_join_ctx *ctx,
+		    struct xstream *stream);
 	/**
 	 * Release the read view and free the context prepared
 	 * on the first step.
 	 */
-	void (*complete_join)(struct engine *engine, void *ctx);
+	void (*complete_join)(struct engine *engine,
+			      struct engine_join_ctx *ctx);
 	/**
 	 * Begin a new single or multi-statement transaction.
 	 * Called on first statement in a transaction, not when
@@ -245,8 +267,8 @@ struct engine_vtab {
 	void (*reset_stat)(struct engine *);
 	/**
 	 * Check definition of a new space for engine-specific
-	 * limitations. E.g. not all engines support temporary
-	 * tables.
+	 * limitations. E.g. not all engines support data-temporary
+	 * spaces.
 	 */
 	int (*check_space_def)(struct space_def *);
 };
@@ -263,6 +285,20 @@ enum {
 	 * Set if the engine supports creation of a read view.
 	 */
 	ENGINE_SUPPORTS_READ_VIEW = 1 << 1,
+	/**
+	 * Set if checkpointing is implemented by the memtx engine.
+	 * Engine setting this flag must support read views.
+	 */
+	ENGINE_CHECKPOINT_BY_MEMTX = 1 << 2,
+	/**
+	 * Set if replica join is implemented by the memtx engine.
+	 * Engine setting this flag must support read views.
+	 */
+	ENGINE_JOIN_BY_MEMTX = 1 << 3,
+	/**
+	 * Set if the engine supports cross-engine transactions.
+	 */
+	ENGINE_SUPPORTS_CROSS_ENGINE_TX = 1 << 4,
 };
 
 struct engine {
@@ -297,12 +333,30 @@ struct engine_read_view {
 	struct rlist link;
 };
 
-struct engine_join_ctx {
-	/** Array of engine join contexts, one per each engine. */
-	void **array;
+/**
+ * Cursor used during checkpoint initial join. Shared between engines.
+ */
+struct checkpoint_cursor {
+	/** Signature of the checkpoint to take data from. */
+	struct vclock *vclock;
+	/** Checkpoint lsn to start from. */
+	int64_t start_lsn;
+	/** Counter, shared between engines */
+	int64_t lsn_counter;
 };
 
-/** Register engine engine instance. */
+struct engine_join_ctx {
+	/** Vclock to respond with. */
+	struct vclock *vclock;
+	/** Whether sending JOIN_META stage is required. */
+	bool send_meta;
+	/** Checkpoint join cursor. */
+	struct checkpoint_cursor *cursor;
+	/** Array of engine join contexts, one per each engine. */
+	void **data;
+};
+
+/** Register engine instance. */
 void engine_register(struct engine *engine);
 
 /** Call a visitor function on every registered engine. */
@@ -386,10 +440,17 @@ engine_read_view_delete(struct engine_read_view *rv)
 }
 
 /**
- * Shutdown all engine factories.
+ * Shutdown all engines. Shutdown stops all internal fibers/threads.
+ * It may yield.
  */
 void
 engine_shutdown(void);
+
+/**
+ * Free all engines.
+ */
+void
+engine_free(void);
 
 /**
  * Called before switching the instance to read-only mode.
@@ -467,9 +528,10 @@ engine_reset_stat(void);
 struct engine_read_view *
 generic_engine_create_read_view(struct engine *engine,
 				const struct read_view_opts *opts);
-int generic_engine_prepare_join(struct engine *, void **);
-int generic_engine_join(struct engine *, void *, struct xstream *);
-void generic_engine_complete_join(struct engine *, void *);
+int generic_engine_prepare_join(struct engine *, struct engine_join_ctx *);
+int generic_engine_join(struct engine *, struct engine_join_ctx *,
+			struct xstream *);
+void generic_engine_complete_join(struct engine *, struct engine_join_ctx *);
 int generic_engine_begin(struct engine *, struct txn *);
 int generic_engine_begin_statement(struct engine *, struct txn *);
 int generic_engine_prepare(struct engine *, struct txn *);
@@ -494,6 +556,7 @@ int generic_engine_backup(struct engine *, const struct vclock *,
 void generic_engine_memory_stat(struct engine *, struct engine_memory_stat *);
 void generic_engine_reset_stat(struct engine *);
 int generic_engine_check_space_def(struct space_def *);
+void generic_engine_shutdown(struct engine *engine);
 
 #if defined(__cplusplus)
 } /* extern "C" */

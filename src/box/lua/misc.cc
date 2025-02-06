@@ -44,19 +44,17 @@
 #include "box/read_view.h"
 #include "box/space_cache.h"
 #include "box/tuple.h"
-#include "box/tuple_format.h"
 #include "box/txn.h"
 #include "box/xrow.h"
 #include "core/diag.h"
 #include "core/fiber.h"
+#include "core/mp_ctx.h"
 #include "core/tt_static.h"
 #include "lua/utils.h"
 #include "lua/msgpack.h"
 #include "mpstream/mpstream.h"
 #include "small/region.h"
 #include "small/rlist.h"
-
-static uint32_t CTID_STRUCT_TUPLE_FORMAT_PTR;
 
 /** {{{ Miscellaneous utils **/
 
@@ -199,50 +197,177 @@ lua_wrap_formatted_array(struct lua_State *L, struct tuple_format *format)
 	lua_setmetatable(L, -2);
 }
 
+/**
+ * Advances the iterator - invokes iterator_next() with a saved state.
+ * For details, see description of port_c_push_iterator_lua().
+ */
+static int
+port_c_iterator_next_lua(lua_State *L)
+{
+	struct port_c_iterator *iter =
+		(struct port_c_iterator *)lua_touserdata(L, 1);
+	bool is_eof = false;
+	struct port port;
+	int rc = iter->next(iter, &port, &is_eof);
+	if (rc != 0)
+		luaT_error(L);
+	if (is_eof)
+		return 0;
+	int top_svp = lua_gettop(L);
+	port_dump_lua(&port, L, PORT_DUMP_LUA_MODE_FLAT);
+	port_destroy(&port);
+	return lua_gettop(L) - top_svp;
+}
+
+/**
+ * Typename for Lua representation of port_c_iterator.
+ */
+static const char *port_c_iterator_lua_name = "port_c_iterator";
+
+/**
+ * Metatable for Lua representation of port_c_iterator.
+ */
+static const struct luaL_Reg port_c_iterator_lua_meta[] = {
+	{"__call", port_c_iterator_next_lua},
+	{NULL, NULL}
+};
+
+/**
+ * The function should be called as a closure with one upvalue:
+ * port_c_iterator stored as userdata.
+ * For details, see description of port_c_push_iterator_lua().
+ */
+static int
+port_c_iterator_start_lua(lua_State *L)
+{
+	lua_pushvalue(L, lua_upvalueindex(1));
+	return 1;
+}
+
+/**
+ * Pushes an iterator created by passed iterable object to Lua stack.
+ *
+ * Iterators in Lua are implemented as usual functions (or closures), which
+ * return the next element. So this function pushes a closure, that returns an
+ * actual iterator - a callable userdata, which is a wrapper over iterator_next.
+ * That's how it looks from Lua:
+ * function(iter)
+ *     for v1, v2 in iter() do
+ *         process(v1, v2)
+ *     end
+ * end
+ */
+static void
+port_c_iterator_push_lua(struct lua_State *L, port_c_iterable *iterable)
+{
+	struct port_c_iterator *iter =
+		(struct port_c_iterator *)lua_newuserdata(L, sizeof(*iter));
+	luaL_getmetatable(L, port_c_iterator_lua_name);
+	lua_setmetatable(L, -2);
+	/* Wrap iterator into closure. */
+	lua_pushcclosure(L, port_c_iterator_start_lua, 1);
+	/* Actually initialize the iterator. */
+	iterable->iterator_create(iterable->data, iter);
+}
+
 extern "C" void
-port_c_dump_lua(struct port *base, struct lua_State *L, bool is_flat)
+port_c_dump_lua(struct port *base, struct lua_State *L,
+		enum port_dump_lua_mode mode)
 {
 	struct port_c *port = (struct port_c *)base;
-	if (!is_flat)
+	if (mode == PORT_DUMP_LUA_MODE_MP_OBJECT) {
+		port_dump_lua_mp_object_mode_slow(base, L, &fiber()->gc,
+						  port_c_get_msgpack);
+		return;
+	}
+	if (mode == PORT_DUMP_LUA_MODE_TABLE)
 		lua_createtable(L, port->size, 0);
 	struct port_c_entry *pe = port->first;
 	const char *mp;
 	for (int i = 0; pe != NULL; pe = pe->next) {
-		if (pe->mp_size == 0) {
+		switch (pe->type) {
+		case PORT_C_ENTRY_NULL:
+			lua_pushnil(L);
+			break;
+		case PORT_C_ENTRY_NUMBER:
+			lua_pushnumber(L, pe->number);
+			break;
+		case PORT_C_ENTRY_BOOL:
+			lua_pushboolean(L, pe->boolean);
+			break;
+		case PORT_C_ENTRY_STR:
+			lua_pushlstring(L, pe->str.data,
+					pe->str.size);
+			break;
+		case PORT_C_ENTRY_TUPLE:
 			luaT_pushtuple(L, pe->tuple);
-		} else {
-			mp = pe->mp;
-			luamp_decode(L, luaL_msgpack_default, &mp);
-
-			if (pe->mp_format != NULL) {
-				assert(mp_typeof(*pe->mp) == MP_ARRAY);
-				lua_wrap_formatted_array(L, pe->mp_format);
+			break;
+		case PORT_C_ENTRY_MP_OBJECT:
+			if (pe->mp.ctx != NULL) {
+				struct mp_ctx ctx;
+				mp_ctx_copy(&ctx, pe->mp.ctx);
+				size_t size = pe->mp.size;
+				luamp_push_with_ctx(L, pe->mp.data,
+						    pe->mp.data + size,
+						    &ctx);
+			} else {
+				size_t size = pe->mp.size;
+				luamp_push(L, pe->mp.data,
+					   pe->mp.data + size);
 			}
+			break;
+		case PORT_C_ENTRY_MP:
+			mp = pe->mp.data;
+			luamp_decode(L, luaL_msgpack_default, &mp);
+			if (pe->mp.format != NULL) {
+				const char *mp_start = pe->mp.data;
+				assert(mp_typeof(*mp_start) == MP_ARRAY);
+				(void)mp_start;
+				lua_wrap_formatted_array(
+					L, pe->mp.format);
+			}
+			break;
+		case PORT_C_ENTRY_ITERABLE: {
+			port_c_iterator_push_lua(L, &pe->iterable);
+			break;
 		}
-		if (!is_flat)
+		default:
+			unreachable();
+		};
+		if (mode == PORT_DUMP_LUA_MODE_TABLE)
 			lua_rawseti(L, -2, ++i);
 	}
 }
 
 extern "C" void
-port_msgpack_dump_lua(struct port *base, struct lua_State *L, bool is_flat)
+port_msgpack_dump_lua(struct port *base, struct lua_State *L,
+		      enum port_dump_lua_mode mode)
 {
-	(void) is_flat;
-	assert(is_flat == true);
+	assert(mode == PORT_DUMP_LUA_MODE_FLAT ||
+	       mode == PORT_DUMP_LUA_MODE_MP_OBJECT);
 	struct port_msgpack *port = (struct port_msgpack *) base;
 
-	const char *args = port->data;
-	uint32_t arg_count = mp_decode_array(&args);
-	for (uint32_t i = 0; i < arg_count; i++)
-		luamp_decode(L, luaL_msgpack_default, &args);
+	if (mode == PORT_DUMP_LUA_MODE_FLAT) {
+		const char *args = port->data;
+		uint32_t arg_count = mp_decode_array(&args);
+		for (uint32_t i = 0; i < arg_count; i++)
+			luamp_decode_with_ctx(L, luaL_msgpack_default, &args,
+					      port->ctx);
+	} else {
+		luamp_push_with_ctx(L, port->data, port->data + port->data_sz,
+				    port->ctx);
+	}
 }
 
 /** Generate unique id for non-system space. */
 static int
 lbox_generate_space_id(lua_State *L)
 {
+	assert(lua_gettop(L) >= 1);
+	assert(lua_isboolean(L, 1) == 1);
+	bool is_temporary = lua_toboolean(L, 1) != 0;
 	uint32_t ret = 0;
-	if (box_generate_space_id(&ret) != 0)
+	if (box_generate_space_id(&ret, is_temporary) != 0)
 		return luaT_error(L);
 	lua_pushnumber(L, ret);
 	return 1;
@@ -330,7 +455,7 @@ lbox_select(lua_State *L)
 	 * table always crashed the first (can't be fixed with pcall).
 	 * https://github.com/tarantool/tarantool/issues/1182
 	 */
-	port_dump_lua(&port, L, false);
+	port_dump_lua(&port, L, PORT_DUMP_LUA_MODE_TABLE);
 	port_destroy(&port);
 	if (fetch_pos && packed_pos != NULL) {
 		lua_pushlstring(L, packed_pos, packed_pos_end - packed_pos);
@@ -359,90 +484,6 @@ lbox_txn_set_isolation(struct lua_State *L)
 	lua_pushnumber(L, rc);
 	return 1;
 }
-
-/** {{{ Utils to work with tuple_format. **/
-
-struct tuple_format *
-lbox_check_tuple_format(struct lua_State *L, int narg)
-{
-	uint32_t ctypeid;
-	struct tuple_format *format =
-		*(struct tuple_format **)luaL_checkcdata(L, narg, &ctypeid);
-	if (ctypeid != CTID_STRUCT_TUPLE_FORMAT_PTR) {
-		luaL_error(L, "Invalid argument: 'struct tuple_format *' "
-			   "expected, got %s)",
-			   lua_typename(L, lua_type(L, narg)));
-	}
-	return format;
-}
-
-static int
-lbox_tuple_format_gc(struct lua_State *L)
-{
-	struct tuple_format *format =  lbox_check_tuple_format(L, 1);
-	tuple_format_unref(format);
-	return 0;
-}
-
-static int
-lbox_push_tuple_format(struct lua_State *L, struct tuple_format *format)
-{
-	struct tuple_format **ptr = (struct tuple_format **)
-		luaL_pushcdata(L, CTID_STRUCT_TUPLE_FORMAT_PTR);
-	*ptr = format;
-	tuple_format_ref(format);
-	lua_pushcfunction(L, lbox_tuple_format_gc);
-	luaL_setcdatagc(L, -2);
-	return 1;
-}
-
-static int
-lbox_tuple_format_new(struct lua_State *L)
-{
-	assert(CTID_STRUCT_TUPLE_FORMAT_PTR != 0);
-	int top = lua_gettop(L);
-	if (top == 0)
-		return lbox_push_tuple_format(L, tuple_format_runtime);
-	assert(top == 1 && lua_istable(L, 1));
-	uint32_t count = lua_objlen(L, 1);
-	if (count == 0)
-		return lbox_push_tuple_format(L, tuple_format_runtime);
-	struct region *region = &fiber()->gc;
-	size_t region_svp = region_used(region);
-	struct field_def *fields = xregion_alloc_array(region,
-						       struct field_def, count);
-	for (uint32_t i = 0; i < count; ++i) {
-		size_t len;
-		fields[i] = field_def_default;
-		lua_pushinteger(L, i + 1);
-		lua_gettable(L, 1);
-		lua_pushstring(L, "name");
-		lua_gettable(L, -2);
-		assert(! lua_isnil(L, -1));
-		const char *name = lua_tolstring(L, -1, &len);
-		fields[i].name = (char *)xregion_alloc(region, len + 1);
-		memcpy(fields[i].name, name, len);
-		fields[i].name[len] = '\0';
-		lua_pop(L, 1);
-		lua_pop(L, 1);
-	}
-	struct tuple_dictionary *dict = tuple_dictionary_new(fields, count);
-	region_truncate(region, region_svp);
-	if (dict == NULL)
-		return luaT_error(L);
-	struct tuple_format *format = runtime_tuple_format_new(dict);
-	/*
-	 * Since dictionary reference counter is 1 from the
-	 * beginning and after creation of the tuple_format
-	 * increases by one, we must decrease it once.
-	 */
-	tuple_dictionary_unref(dict);
-	if (format == NULL)
-		return luaT_error(L);
-	return lbox_push_tuple_format(L, format);
-}
-
-/* }}} */
 
 /** {{{ Read view utils. **/
 
@@ -512,7 +553,6 @@ box_lua_misc_init(struct lua_State *L)
 	static const struct luaL_Reg boxlib_internal[] = {
 		{"prepare_auth", lbox_prepare_auth},
 		{"select", lbox_select},
-		{"new_tuple_format", lbox_tuple_format_new},
 		{"txn_set_isolation", lbox_txn_set_isolation},
 		{"read_view_list", lbox_read_view_list},
 		{"read_view_status", lbox_read_view_status},
@@ -524,9 +564,6 @@ box_lua_misc_init(struct lua_State *L)
 	luaL_setfuncs(L, boxlib_internal, 0);
 	lua_pop(L, 1);
 
-	int rc = luaL_cdef(L, "struct tuple_format;");
-	assert(rc == 0);
-	(void) rc;
-	CTID_STRUCT_TUPLE_FORMAT_PTR = luaL_ctypeid(L, "struct tuple_format *");
-	assert(CTID_STRUCT_TUPLE_FORMAT_PTR != 0);
+	luaL_register_type(L, port_c_iterator_lua_name,
+			   port_c_iterator_lua_meta);
 }

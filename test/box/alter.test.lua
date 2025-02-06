@@ -45,7 +45,7 @@ _space:update({_space.id}, {{'-', 1, 2}})
 --
 -- Create a space
 --
-t = _space:insert{box.internal.generate_space_id(), ADMIN, 'hello', 'memtx', 0, EMPTY_MAP, {}}
+t = _space:insert{box.internal.generate_space_id(false), ADMIN, 'hello', 'memtx', 0, EMPTY_MAP, {}}
 -- Check that a space exists
 space = box.space[t[1]]
 space.id
@@ -522,6 +522,11 @@ s:delete{1}
 -- Invalid values.
 s:alter({field_count = box.NULL})
 s:alter({field_count = 'string'})
+-- exact_field_count is less than index_field_count.
+s:alter({field_count = 1})
+sk = s:create_index('sk', {parts = {2, 'unsigned'}})
+s:replace{1}
+sk:drop()
 
 -- Alter owner.
 owner1 = box.space._space:get{s.id}.owner
@@ -560,7 +565,7 @@ s:alter({format = true})
 s:alter({format = {{{1, 2, 3, 4}}}})
 
 --
--- Alter temporary.
+-- Alter data-temporary.
 --
 s:alter({temporary = true})
 assert(s.temporary)

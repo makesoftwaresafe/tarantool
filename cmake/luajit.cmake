@@ -39,8 +39,17 @@ set(LUAJIT_SMART_STRINGS ON CACHE BOOL
     "Harder string hashing function" FORCE)
 set(LUAJIT_TEST_BINARY $<TARGET_FILE:tarantool> CACHE STRING
     "Lua implementation to be used for tests (tarantool)" FORCE)
-set(LUAJIT_USE_TEST OFF CACHE BOOL
-    "Generate <test> target" FORCE)
+
+if(ENABLE_ASAN)
+  # FIXME: Disabled due to
+  # https://github.com/tarantool/tarantool/issues/10733.
+  set(LUAJIT_USE_TEST OFF CACHE BOOL "Generate <test> target" FORCE)
+else()
+  set(LUAJIT_USE_TEST ON CACHE BOOL "Generate <test> target" FORCE)
+endif()
+
+set(LUAJIT_TEST_DEPS "tarantool" CACHE STRING
+    "A list of target dependencies to be used for tests. (tarantool)" FORCE)
 
 # XXX: There is <strict> module enabled by default in Tarantool
 # built in Debug, so we need to tweak LuaJIT testing environment.
@@ -66,13 +75,28 @@ if(ENABLE_VALGRIND)
         "Valgrind support" FORCE)
 endif()
 
-# FIXME: ASAN support is badly implemented in LuaJIT and there is
-# not a specific build options for this. At the same time there
-# are several places wrapped with LUAJIT_USE_ASAN define.
-# Just enable it here if needed and patiently wait until ASAN
-# support is implemented properly in LuaJIT.
+# Enable LuaJIT ASan support.
 if(ENABLE_ASAN)
-    add_definitions(-DLUAJIT_USE_ASAN=1)
+    if(LUAJIT_ENABLE_GC64)
+        set(LUAJIT_USE_SYSMALLOC ON CACHE BOOL
+            "System provided memory allocator (realloc/malloc)" FORCE)
+    else()
+        message(WARNING
+            "The internal LuaJIT memory allocator is not instrumented yet,"
+            " so to find any memory faults, it's worth building LuaJIT with"
+            " the system provided memory allocator. This requires enabling"
+            " the LUAJIT_ENABLE_GC64 option, as sysmalloc can only be used"
+            " in GC64 mode. Without it, sysmalloc cannot be used due to"
+            " allocator and pointer bitness incompatibility."
+        )
+    endif()
+    set(LUAJIT_USE_ASAN ON CACHE BOOL
+        "Build LuaJIT with AddressSanitizer" FORCE)
+endif()
+
+if(ENABLE_UB_SANITIZER)
+    set(LUAJIT_USE_UBSAN ON CACHE BOOL
+        "Build LuaJIT with UndefinedBehaviourSanitizer" FORCE)
 endif()
 
 if(TARGET_OS_DARWIN AND NOT LUAJIT_ENABLE_GC64)

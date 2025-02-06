@@ -72,6 +72,13 @@ runs:
         # 2. Build package on tag 2.4.8. It will produce package with
         #    name 2.4.8.x.
         git fetch --tags -f
+        # Found that actions/checkout fetches the repository with the
+        # '--unshallow' option, but it doesn't do the same for submodules.
+        # So this may lead to the following error while using 'git describe'
+        # for submodules:
+        #   fatal: No tags can describe '<sha>'.
+        #   Try --always, or create some tags.
+        git submodule foreach 'git fetch --unshallow || true'
         # Github Actions may runs twice the same job on branch push and
         # on new tag if it was created on this push. To avoid of fails
         # on saving the commonly named packages, lets drop a tag that
@@ -86,10 +93,13 @@ runs:
         git clean -xffd
         git submodule foreach --recursive 'git clean -xffd'
 
-        # A temporary workaround that should be removed after the corresponding
-        # issue is fixed. See for details:
-        #   https://github.com/tarantool/tarantool/issues/7472.
-        if ${{ runner.os == 'Linux' && github.workflow == 'coverage' }}; then
+        # See for details: https://github.com/tarantool/tarantool/issues/7472.
+        # However, this workaround doesn't work on our aarch64 runners due to
+        # the following error:
+        #     mount: /tmp/luajit-test-vardir: mount failed: Operation not permitted
+        # Looks like it happens because our aarch64 runners are LXD containers.
+        if ${{ runner.os == 'Linux' && runner.arch != 'ARM64' &&
+               !contains(runner.name, 'GitHub Actions') }}; then
             LUAJIT_TEST_VARDIR=/tmp/luajit-test-vardir
             LUAJIT_TEST_VARDIR_DISK=/tmp/luajit-test-vardir-disk/disk.ext4
 

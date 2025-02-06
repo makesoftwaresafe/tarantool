@@ -10,7 +10,7 @@ include_directories(${LUAJIT_INCLUDE_DIRS})
 include_directories(${READLINE_INCLUDE_DIRS})
 include_directories(${LIBYAML_INCLUDE_DIRS})
 include_directories(${MSGPUCK_INCLUDE_DIRS})
-include_directories(${CURL_INCLUDE_DIRS})
+include_directories(BEFORE ${CURL_INCLUDE_DIRS})
 include_directories(${ICU_INCLUDE_DIRS})
 include_directories(${ICONV_INCLUDE_DIRS})
 include_directories(${DECNUMBER_INCLUDE_DIR})
@@ -57,10 +57,10 @@ lua_source(lua_sources lua/csv.lua csv_lua)
 lua_source(lua_sources lua/strict.lua strict_lua)
 lua_source(lua_sources lua/clock.lua clock_lua)
 lua_source(lua_sources lua/title.lua title_lua)
+lua_source(lua_sources lua/utils.lua utils_lua)
 lua_source(lua_sources lua/argparse.lua argparse_lua)
 lua_source(lua_sources lua/env.lua env_lua)
 lua_source(lua_sources lua/pwd.lua pwd_lua)
-lua_source(lua_sources lua/trigger.lua trigger_lua)
 lua_source(lua_sources lua/table.lua table_lua)
 lua_source(lua_sources lua/httpc.lua httpc_lua)
 lua_source(lua_sources lua/iconv.lua iconv_lua)
@@ -70,6 +70,10 @@ lua_source(lua_sources lua/timezones.lua timezones_lua)
 lua_source(lua_sources lua/print.lua print_lua)
 lua_source(lua_sources lua/pairs.lua pairs_lua)
 lua_source(lua_sources lua/compat.lua compat_lua)
+lua_source(lua_sources lua/varbinary.lua varbinary_lua)
+lua_source(lua_sources lua/protobuf_wireformat.lua protobuf_wireformat_lua)
+lua_source(lua_sources lua/protobuf.lua protobuf_lua)
+lua_source(lua_sources lua/version.lua version_lua)
 if (ENABLE_COMPRESS_MODULE)
     lua_source(lua_sources ${COMPRESS_MODULE_LUA_SOURCE} compress_lua)
 endif()
@@ -103,6 +107,7 @@ lua_source(lua_sources ../third_party/metrics/metrics/quantile.lua metrics_quant
 lua_source(lua_sources ../third_party/metrics/metrics/registry.lua metrics_registry_lua)
 lua_source(lua_sources ../third_party/metrics/metrics/stash.lua metrics_stash_lua)
 lua_source(lua_sources ../third_party/metrics/metrics/tarantool/clock.lua metrics_tarantool_clock_lua)
+lua_source(lua_sources ../third_party/metrics/metrics/tarantool/config.lua metrics_tarantool_config_lua)
 lua_source(lua_sources ../third_party/metrics/metrics/tarantool/cpu.lua metrics_tarantool_cpu_lua)
 lua_source(lua_sources ../third_party/metrics/metrics/tarantool/event_loop.lua metrics_tarantool_event_loop_lua)
 lua_source(lua_sources ../third_party/metrics/metrics/tarantool/fibers.lua metrics_tarantool_fibers_lua)
@@ -139,15 +144,11 @@ lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/memprof/humanize.lua memprof_
 lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/memprof/parse.lua memprof_parse_lua)
 lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/memprof/process.lua memprof_process_lua)
 lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/sysprof.lua sysprof_lua)
-lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/sysprof/collapse.lua sysprof_collapse_lua)
 lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/sysprof/parse.lua sysprof_parse_lua)
 lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/utils/avl.lua utils_avl_lua)
 lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/utils/bufread.lua utils_bufread_lua)
+lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/utils/evread.lua utils_evread_lua)
 lua_source(lua_sources ${LUAJIT_SOURCE_ROOT}/tools/utils/symtab.lua utils_symtab_lua)
-
-if(EMBED_LUAROCKS)
-    include("luarocks_lua_sources.cmake")
-endif()
 
 add_custom_target(generate_lua_sources
     WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/src/box
@@ -164,9 +165,6 @@ if(NOT TARGET_OS_OPENBSD)
         set(generic_libraries ${generic_libraries} dl)
     endif()
 endif()
-
-add_library(stat STATIC rmean.c latency.c histogram.c)
-target_link_libraries(stat core)
 
 add_library(cpu_feature STATIC cpu_feature.c)
 
@@ -190,6 +188,7 @@ set (server_sources
      ssl_cert_paths_discover.c
      systemd.c
      version.c
+     lua/alloc.c
      lua/digest.c
      lua/init.c
      lua/fiber.c
@@ -223,7 +222,6 @@ set (server_sources
      lua/xml.c
      ${lua_sources}
      ${PROJECT_SOURCE_DIR}/third_party/lua-yaml/lyaml.cc
-     ${PROJECT_SOURCE_DIR}/third_party/lua-yaml/b64.c
      ${PROJECT_SOURCE_DIR}/third_party/lua-cjson/lua_cjson.c
      ${PROJECT_SOURCE_DIR}/third_party/lua-cjson/strbuf.c
      ${COMPRESS_MODULE_SOURCES}
@@ -256,6 +254,7 @@ set(api_headers
     ${PROJECT_SOURCE_DIR}/src/lib/core/fiber_cond.h
     ${PROJECT_SOURCE_DIR}/src/lib/core/coio.h
     ${PROJECT_SOURCE_DIR}/src/lib/core/coio_task.h
+    ${PROJECT_SOURCE_DIR}/src/lib/core/tnt_thread.h
     ${PROJECT_SOURCE_DIR}/src/box/ibuf.h
     ${PROJECT_SOURCE_DIR}/src/lua/utils.h
     ${PROJECT_SOURCE_DIR}/src/lua/error.h
@@ -307,7 +306,7 @@ endif()
 set (reexport_libraries server core misc bitset csv swim swim_udp swim_ev
      shutdown tzcode ${LUAJIT_LIBRARIES} ${MSGPUCK_LIBRARIES} ${ICU_LIBRARIES}
      ${CURL_LIBRARIES} ${XXHASH_LIBRARIES} ${LIBCDT_LIBRARIES}
-     ${EXTRA_REEXPORT_LIBRARIES})
+     ${NANOARROW_LIBRARIES} ${EXTRA_REEXPORT_LIBRARIES})
 
 set (common_libraries
     ${reexport_libraries}
@@ -338,44 +337,24 @@ add_subdirectory(box)
 include_directories(${EXTRA_BOX_INCLUDE_DIRS})
 
 # Save CMAKE_XXX_FLAGS from this directory for config.h (used in --version)
-set(TARANTOOL_C_FLAGS ${CMAKE_C_FLAGS} PARENT_SCOPE)
-set(TARANTOOL_CXX_FLAGS ${CMAKE_CXX_FLAGS} PARENT_SCOPE)
+string(REPLACE ";" " " TARANTOOL_CFLAGS_LTO "${CFLAGS_LTO}")
 
-set(EXPORT_LIST)
-if(BUILD_STATIC)
-    # for each static library we should find a corresponding shared library to
-    # parse and reexport library api functions
-    foreach(libstatic
-            ${READLINE_LIBRARIES}
-            ${CURL_LIBRARIES}
-            ${OPENSSL_LIBRARIES}
-            ${ICU_LIBRARIES})
-        if (${libstatic} MATCHES "lib[^/]+.a")
-            string(REGEX MATCH "lib[^/]+.a" libname ${libstatic})
-            string(REGEX REPLACE "\\.a$" "" libname ${libname})
-            string(REGEX REPLACE "^lib" "" libname ${libname})
-            find_library(SYMBOLS_LIB NAMES ${libname})
-            # add found library to export list
-            list(APPEND EXPORT_LIST ${SYMBOLS_LIB})
-            # set variable to allow rescan (CMake depended)
-            set(SYMBOLS_LIB "SYMBOLS_LIB-NOTFOUND")
-        elseif (${libstatic} STREQUAL bundled-libcurl OR
-                ${libstatic} STREQUAL bundled-ares OR
-                ${libstatic} STREQUAL bundled-nghttp2)
-            message("We don't need to export symbols from statically linked ${libstatic}, skipped")
-        else()
-            message(WARNING "${libstatic} should be a static")
-        endif()
-    endforeach(libstatic)
-    string(REPLACE ";" " " EXPORT_LIST "${EXPORT_LIST}")
+set(TARANTOOL_BUILD_TYPES Debug Release RelWithDebInfo MinSizeRel)
+list(FIND TARANTOOL_BUILD_TYPES "${CMAKE_BUILD_TYPE}" TARANTOOL_BUILD_TYPE)
 
-    if (HAVE_OPENMP)
-        # Link libgomp explicitly to make it static. Avoid linking
-        # against DSO version of libgomp, which implied by -fopenmp
-        set (common_libraries ${common_libraries} "libgomp.a")
-        set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS} -fno-openmp")
-    endif()
+if(${TARANTOOL_BUILD_TYPE} EQUAL -1)
+    message(FATAL_ERROR "Unknown config passed: ${CMAKE_BUILD_TYPE}")
 endif()
+
+string(TOUPPER "${CMAKE_BUILD_TYPE}" TARANTOOL_BUILD_TYPE)
+set(TARANTOOL_C_FLAGS_CONFIG "${CMAKE_C_FLAGS_${TARANTOOL_BUILD_TYPE}}")
+set(TARANTOOL_CXX_FLAGS_CONFIG "${CMAKE_CXX_FLAGS_${TARANTOOL_BUILD_TYPE}}")
+
+set(TARANTOOL_C_FLAGS "${CMAKE_C_FLAGS} ${TARANTOOL_C_FLAGS_CONFIG} ${TARANTOOL_CFLAGS_LTO}")
+set(TARANTOOL_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TARANTOOL_CXX_FLAGS_CONFIG} ${TARANTOOL_CFLAGS_LTO}")
+
+set(TARANTOOL_C_FLAGS ${TARANTOOL_C_FLAGS} PARENT_SCOPE)
+set(TARANTOOL_CXX_FLAGS ${TARANTOOL_CXX_FLAGS} PARENT_SCOPE)
 
 set(exports_file_sources
     ${PROJECT_SOURCE_DIR}/extra/exports
@@ -396,7 +375,6 @@ add_custom_command(
     COMMAND ${PROJECT_SOURCE_DIR}/extra/mkexports
             ${exports_file_sources_str}
             ${exports_file} ${CMAKE_SYSTEM_NAME}
-            ${EXPORT_LIST}
 )
 
 add_executable(
@@ -446,6 +424,17 @@ else ()
     # So, while we are using CMake versions below 3.4, we need
     # to get rid of the "rdynamic" flag.
     set(CMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS "")
+endif()
+
+if(BUILD_STATIC AND OPENSSL_USE_STATIC_LIBS)
+    add_custom_command(
+        TARGET tarantool POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DFILE=${PROJECT_BINARY_DIR}/src/tarantool
+            -DCMAKE_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}
+            -DENABLE_ASAN=${ENABLE_ASAN}
+            -P ${PROJECT_SOURCE_DIR}/cmake/CheckDependencies.cmake
+    )
 endif()
 
 install (TARGETS tarantool DESTINATION bin)

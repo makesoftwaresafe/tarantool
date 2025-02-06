@@ -236,7 +236,7 @@ local function test_boolean(test, s)
 end
 
 local function test_string(test, s)
-    test:plan(8)
+    test:plan(11)
     rt(test, s, "")
     rt(test, s, "abcde")
     rt(test, s, "Кудыкины горы") -- utf-8
@@ -245,6 +245,9 @@ local function test_string(test, s)
     rt(test, s, '$a\t $')
     rt(test, s, [[$a\t $]])
     rt(test, s, [[$a\\t $]])
+    rt(test, s, '9e123456789')
+    rt(test, s, 'infinity')
+    rt(test, s, 'NaN')
 end
 
 local function test_nil(test, s)
@@ -515,7 +518,7 @@ end
 
 local function test_error(test, s)
     test:plan(4)
-    local err = box.error.new(box.error.ILLEGAL_PARAMS, 'test')
+    local err = box.error.new(box.error.UNSUPPORTED, 'foo', 'bar')
     err:set_prev(box.error.new(box.error.UNKNOWN))
     local encode_error_as_ext = msgpack.cfg.encode_error_as_ext
     local encode_load_metatables = msgpack.cfg.encode_load_metatables
@@ -533,7 +536,7 @@ local function test_error(test, s)
     }
     local err2 = s.decode(s.encode(err))
     test:is(type(err2), 'string', 'encode/decode error as str - type')
-    test:is(err2, 'Illegal parameters, test',
+    test:is(err2, 'foo does not support bar',
             'encode/decode error as str - value')
     msgpack.cfg{
         encode_error_as_ext = encode_error_as_ext,

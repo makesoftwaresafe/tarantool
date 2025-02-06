@@ -52,6 +52,20 @@ enum {
 	VY_CACHE_CLEANUP_MAX_STEPS = 10,
 };
 
+static void *
+vy_cache_tree_page_alloc(struct matras_allocator *allocator)
+{
+	(void)allocator;
+	return xmalloc(VY_CACHE_TREE_EXTENT_SIZE);
+}
+
+static void
+vy_cache_tree_page_free(struct matras_allocator *allocator, void *ptr)
+{
+	(void)allocator;
+	free(ptr);
+}
+
 void
 vy_cache_env_create(struct vy_cache_env *e, struct slab_cache *slab_cache)
 {
@@ -60,11 +74,25 @@ vy_cache_env_create(struct vy_cache_env *e, struct slab_cache *slab_cache)
 	e->mem_quota = 0;
 	mempool_create(&e->cache_node_mempool, slab_cache,
 		       sizeof(struct vy_cache_node));
+	matras_allocator_create(&e->allocator,
+				VY_CACHE_TREE_EXTENT_SIZE,
+				vy_cache_tree_page_alloc,
+				vy_cache_tree_page_free);
 }
+
+/** Delete a node from the cache. */
+static void
+vy_cache_gc_step(struct vy_cache_env *env);
 
 void
 vy_cache_env_destroy(struct vy_cache_env *e)
 {
+#if ENABLE_ASAN
+	/* Purge cache to suppress leak detector. */
+	while (e->mem_used > 0)
+		vy_cache_gc_step(e);
+#endif
+	matras_allocator_destroy(&e->allocator);
 	mempool_destroy(&e->cache_node_mempool);
 }
 
@@ -114,26 +142,6 @@ vy_cache_node_delete(struct vy_cache_env *env, struct vy_cache_node *node)
 	mempool_free(&env->cache_node_mempool, node);
 }
 
-static void *
-vy_cache_tree_page_alloc(void *ctx)
-{
-	struct vy_env *env = (struct vy_env *)ctx;
-	(void)env;
-	void *ret = malloc(VY_CACHE_TREE_EXTENT_SIZE);
-	if (ret == NULL)
-		diag_set(OutOfMemory, VY_CACHE_TREE_EXTENT_SIZE, "malloc",
-			 "ret");
-	return ret;
-}
-
-static void
-vy_cache_tree_page_free(void *ctx, void *p)
-{
-	struct vy_env *env = (struct vy_env *)ctx;
-	(void)env;
-	free(p);
-}
-
 void
 vy_cache_create(struct vy_cache *cache, struct vy_cache_env *env,
 		struct key_def *cmp_def, bool is_primary)
@@ -143,8 +151,7 @@ vy_cache_create(struct vy_cache *cache, struct vy_cache_env *env,
 	cache->is_primary = is_primary;
 	cache->version = 1;
 	vy_cache_tree_create(&cache->cache_tree, cmp_def,
-			     vy_cache_tree_page_alloc,
-			     vy_cache_tree_page_free, env, NULL);
+			     &env->allocator, NULL);
 }
 
 void
@@ -196,7 +203,7 @@ vy_cache_gc_step(struct vy_cache_env *env)
 	}
 	cache->version++;
 	vy_stmt_counter_acct_tuple(&cache->stat.evict, node->entry.stmt);
-	vy_cache_tree_delete(&cache->cache_tree, node);
+	vy_cache_tree_delete(&cache->cache_tree, node, NULL);
 	vy_cache_node_delete(cache->env, node);
 }
 
@@ -425,9 +432,12 @@ vy_cache_get(struct vy_cache *cache, struct vy_entry key)
 	return (*node)->entry;
 }
 
-void
-vy_cache_on_write(struct vy_cache *cache, struct vy_entry entry,
-		  struct vy_entry *deleted)
+/**
+ * Invalidate the cache when a statement is committed or rolled back.
+ */
+static void
+vy_cache_invalidate(struct vy_cache *cache, struct vy_entry entry,
+		    bool rollback, struct vy_entry *deleted)
 {
 	vy_cache_gc(cache->env);
 	bool exact = false;
@@ -448,7 +458,7 @@ vy_cache_on_write(struct vy_cache *cache, struct vy_entry entry,
 	 *   ('exact' == false, 'node' == NULL)
 	 */
 
-	if (vy_stmt_type(entry.stmt) == IPROTO_DELETE && !exact) {
+	if (!rollback && vy_stmt_type(entry.stmt) == IPROTO_DELETE && !exact) {
 		/* there was nothing and there is nothing now */
 		return;
 	}
@@ -497,9 +507,22 @@ vy_cache_on_write(struct vy_cache *cache, struct vy_entry entry,
 		}
 		vy_stmt_counter_acct_tuple(&cache->stat.invalidate,
 					   to_delete->entry.stmt);
-		vy_cache_tree_delete(&cache->cache_tree, to_delete);
+		vy_cache_tree_delete(&cache->cache_tree, to_delete, NULL);
 		vy_cache_node_delete(cache->env, to_delete);
 	}
+}
+
+void
+vy_cache_on_write(struct vy_cache *cache, struct vy_entry entry,
+		  struct vy_entry *deleted)
+{
+	vy_cache_invalidate(cache, entry, /*rollback=*/false, deleted);
+}
+
+void
+vy_cache_on_rollback(struct vy_cache *cache, struct vy_entry entry)
+{
+	vy_cache_invalidate(cache, entry, /*rollback=*/true, NULL);
 }
 
 /**
@@ -817,10 +840,13 @@ vy_cache_iterator_restore(struct vy_cache_iterator *itr, struct vy_entry last,
 			struct vy_cache_node *node =
 				*vy_cache_tree_iterator_get_elem(tree, &pos);
 			int cmp = dir * vy_entry_compare(node->entry, key, def);
+			bool is_visible = vy_cache_iterator_stmt_is_visible(
+							itr, node->entry.stmt);
+			if (!is_visible)
+				*stop = false;
 			if (cmp < 0 || (cmp == 0 && !key_belongs))
 				break;
-			if (vy_cache_iterator_stmt_is_visible(
-					itr, node->entry.stmt)) {
+			if (is_visible) {
 				itr->curr_pos = pos;
 				if (itr->curr.stmt != NULL)
 					tuple_unref(itr->curr.stmt);

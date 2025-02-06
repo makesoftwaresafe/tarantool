@@ -113,6 +113,7 @@ static const struct space_vtab blackhole_space_vtab = {
 	/* .execute_delete = */ blackhole_space_execute_delete,
 	/* .execute_update = */ blackhole_space_execute_update,
 	/* .execute_upsert = */ blackhole_space_execute_upsert,
+	/* .execute_insert_arrow = */ generic_space_execute_insert_arrow,
 	/* .ephemeral_replace = */ generic_space_ephemeral_replace,
 	/* .ephemeral_delete = */ generic_space_ephemeral_delete,
 	/* .ephemeral_rowid_next = */ generic_space_ephemeral_rowid_next,
@@ -126,12 +127,13 @@ static const struct space_vtab blackhole_space_vtab = {
 	/* .build_index = */ generic_space_build_index,
 	/* .swap_index = */ generic_space_swap_index,
 	/* .prepare_alter = */ generic_space_prepare_alter,
+	/* .finish_alter = */ generic_space_finish_alter,
 	/* .prepare_upgrade = */ generic_space_prepare_upgrade,
 	/* .invalidate = */ generic_space_invalidate,
 };
 
 static void
-blackhole_engine_shutdown(struct engine *engine)
+blackhole_engine_free(struct engine *engine)
 {
 	free(engine);
 }
@@ -172,7 +174,8 @@ blackhole_engine_create_space(struct engine *engine, struct space_def *def,
 }
 
 static const struct engine_vtab blackhole_engine_vtab = {
-	/* .shutdown = */ blackhole_engine_shutdown,
+	/* .free = */ blackhole_engine_free,
+	/* .shutdown = */ generic_engine_shutdown,
 	/* .create_space = */ blackhole_engine_create_space,
 	/* .create_read_view = */ generic_engine_create_read_view,
 	/* .prepare_join = */ generic_engine_prepare_join,

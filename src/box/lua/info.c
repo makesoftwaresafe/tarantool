@@ -133,7 +133,7 @@ lbox_pushapplier(lua_State *L, struct applier *applier)
 		lua_pushlstring(L, name, total);
 		lua_settable(L, -3);
 
-		struct error *e = diag_last_error(&applier->fiber->diag);
+		struct error *e = diag_last_error(&applier->diag);
 		if (e != NULL)
 			lbox_push_replication_error_message(L, e, -1);
 	}
@@ -198,7 +198,7 @@ lbox_pushreplica(lua_State *L, struct replica *replica)
 	lua_setfield(L, -2, "name");
 
 	lua_pushstring(L, "lsn");
-	luaL_pushuint64(L, vclock_get(&replicaset.vclock, replica->id));
+	luaL_pushuint64(L, vclock_get(instance_vclock, replica->id));
 	lua_settable(L, -3);
 
 	if (applier != NULL && applier->state != APPLIER_OFF) {
@@ -327,14 +327,7 @@ lbox_info_name(struct lua_State *L)
 static int
 lbox_info_lsn(struct lua_State *L)
 {
-	/* See comments in lbox_info_id */
-	struct replica *self = replica_by_uuid(&INSTANCE_UUID);
-	if (self != NULL &&
-	    (self->id != REPLICA_ID_NIL || cfg_replication_anon)) {
-		luaL_pushint64(L, vclock_get(box_vclock, self->id));
-	} else {
-		luaL_pushint64(L, -1);
-	}
+	luaL_pushint64(L, box_info_lsn());
 	return 1;
 }
 
@@ -444,6 +437,9 @@ lbox_info_cluster(struct lua_State *L)
 static int
 lbox_info_memory_call(struct lua_State *L)
 {
+	if (box_check_configured() != 0)
+		return luaT_error(L);
+
 	struct engine_memory_stat stat;
 	engine_memory_stat(&stat);
 
@@ -472,7 +468,7 @@ lbox_info_memory_call(struct lua_State *L)
 	lua_settable(L, -3);
 
 	lua_pushstring(L, "lua");
-	lua_pushinteger(L, G(L)->gc.total);
+	lua_pushinteger(L, luaL_getgctotal(L));
 	lua_settable(L, -3);
 
 	return 1;
@@ -496,6 +492,9 @@ lbox_info_memory(struct lua_State *L)
 static int
 lbox_info_gc_call(struct lua_State *L)
 {
+	if (box_check_configured() != 0)
+		return luaT_error(L);
+
 	int count;
 
 	lua_newtable(L);
@@ -514,6 +513,15 @@ lbox_info_gc_call(struct lua_State *L)
 
 	lua_pushstring(L, "is_paused");
 	lua_pushboolean(L, gc.is_paused);
+	lua_settable(L, -3);
+
+	lua_pushstring(L, "wal_retention_vclock");
+	struct vclock retention_vclock;
+	wal_get_retention_vclock(&retention_vclock);
+	if (vclock_is_set(&retention_vclock))
+		luaT_pushvclock(L, &retention_vclock);
+	else
+		luaL_pushnull(L);
 	lua_settable(L, -3);
 
 	lua_pushstring(L, "checkpoints");
@@ -558,7 +566,7 @@ lbox_info_gc_call(struct lua_State *L)
 		lua_createtable(L, 0, 3);
 
 		lua_pushstring(L, "name");
-		lua_pushstring(L, consumer->name);
+		lua_pushstring(L, gc_consumer_name(consumer));
 		lua_settable(L, -3);
 
 		lua_pushstring(L, "vclock");
@@ -594,6 +602,9 @@ lbox_info_gc(struct lua_State *L)
 static int
 lbox_info_vinyl_call(struct lua_State *L)
 {
+	if (box_check_configured() != 0)
+		return luaT_error(L);
+
 	struct info_handler h;
 	luaT_info_handler_create(&h, L);
 	struct engine *vinyl = engine_by_name("vinyl");
@@ -621,6 +632,9 @@ lbox_info_vinyl(struct lua_State *L)
 static int
 lbox_info_sql_call(struct lua_State *L)
 {
+	if (box_check_configured() != 0)
+		return luaT_error(L);
+
 	struct info_handler h;
 	luaT_info_handler_create(&h, L);
 	sql_stmt_cache_stat(&h);
@@ -676,6 +690,14 @@ lbox_info_election(struct lua_State *L)
 	lua_pushinteger(L, raft->leader);
 	lua_setfield(L, -2, "leader");
 	if (raft_is_enabled(raft)) {
+		if (raft->leader != 0) {
+			char *leader_name = replica_by_id(raft->leader)->name;
+			if (*leader_name == 0)
+				luaL_pushnull(L);
+			else
+				lua_pushstring(L, leader_name);
+			lua_setfield(L, -2, "leader_name");
+		}
 		lua_pushnumber(L, raft_leader_idle(raft));
 		lua_setfield(L, -2, "leader_idle");
 	}
@@ -693,15 +715,28 @@ lbox_info_synchro(struct lua_State *L)
 
 	/* Queue information. */
 	struct txn_limbo *queue = &txn_limbo;
-	lua_createtable(L, 0, 3);
+	lua_createtable(L, 0, 7);
 	lua_pushnumber(L, queue->len);
 	lua_setfield(L, -2, "len");
+	lua_pushnumber(L, queue->size);
+	lua_setfield(L, -2, "size");
 	lua_pushnumber(L, queue->owner_id);
 	lua_setfield(L, -2, "owner");
 	lua_pushboolean(L, latch_is_locked(&queue->promote_latch));
 	lua_setfield(L, -2, "busy");
 	luaL_pushuint64(L, queue->promote_greatest_term);
 	lua_setfield(L, -2, "term");
+	if (queue->len == 0) {
+		lua_pushnumber(L, 0);
+	} else {
+		struct txn_limbo_entry *oldest_entry =
+			txn_limbo_first_entry(queue);
+		double now = fiber_clock();
+		lua_pushnumber(L, now - oldest_entry->insertion_time);
+	}
+	lua_setfield(L, -2, "age");
+	lua_pushnumber(L, queue->confirm_lag);
+	lua_setfield(L, -2, "confirm_lag");
 	lua_setfield(L, -2, "queue");
 
 	return 1;
@@ -730,6 +765,42 @@ lbox_info_hostname(struct lua_State *L)
 	return 1;
 }
 
+static int
+lbox_info_config(struct lua_State *L)
+{
+	/* require('config'):info('v2') */
+	lua_getglobal(L, "require");
+	lua_pushliteral(L, "config");
+	if (lua_pcall(L, 1, 1, 0) != 0)
+		goto error;
+	/* Stack: config. */
+	lua_getfield(L, -1, "info");
+	/* Stack: config, config.info. */
+	lua_insert(L, -2);
+	/* Stack: config.info, config. */
+	lua_pushliteral(L, "v2");
+	/* Stack: config.info, config, 'v2'. */
+	if (lua_pcall(L, 2, 1, 0) != 0)
+		goto error;
+	return 1;
+
+error:
+	/*
+	 * An error shouldn't occur by construction.
+	 *
+	 * However, box.info() is an important call and we
+	 * shouldn't fail it in any circumstances, including a
+	 * problem in the config:info() implementation.
+	 *
+	 * So, we don't raise an error here and place it to the
+	 * result instead.
+	 */
+	lua_newtable(L);
+	lua_insert(L, -2);
+	lua_setfield(L, -2, "error");
+	return 1;
+}
+
 static const struct luaL_Reg lbox_info_dynamic_meta[] = {
 	{"id", lbox_info_id},
 	{"uuid", lbox_info_uuid},
@@ -755,6 +826,7 @@ static const struct luaL_Reg lbox_info_dynamic_meta[] = {
 	{"synchro", lbox_info_synchro},
 	{"schema_version", lbox_schema_version},
 	{"hostname", lbox_info_hostname},
+	{"config", lbox_info_config},
 	{NULL, NULL}
 };
 

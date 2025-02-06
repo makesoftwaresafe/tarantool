@@ -2,17 +2,26 @@ local fio = require('fio')
 local replica_set = require('luatest.replica_set')
 local server = require('luatest.server')
 local t = require('luatest')
-local g = t.group()
+
+local g = t.group('with-names', t.helpers.matrix({
+    on_2_11_1 = {true, false},
+}))
+
+local wait_timeout = 60
 
 local function wait_for_death(instance)
-    t.helpers.retrying({}, function()
+    -- NB: The address sanitizer may take some time to generate
+    -- its report and all this time the process is alive. It takes
+    -- more than the default retrying() timeout (5 seconds) in
+    -- some circumstances.
+    t.helpers.retrying({timeout = 60}, function()
         assert(not instance.process:is_alive())
     end)
     -- Nullify already dead process or server:drop() fails.
     instance.process = nil
 end
 
-g.before_all = function(lg)
+g.before_all(function(lg)
     lg.replica_set = replica_set:new({})
     local box_cfg = {
         replication = {
@@ -21,23 +30,59 @@ g.before_all = function(lg)
         },
         replication_timeout = 0.1,
         instance_name = 'master-name',
+        replication_sync_timeout = 300,
     }
+    if lg.params.on_2_11_1 then
+        -- It's prohibited to start instance with name, when
+        -- there's no name in the snap.
+        box_cfg.instance_name = nil
+    end
     lg.master = lg.replica_set:build_and_add_server({
         alias = 'master',
         box_cfg = box_cfg,
+        datadir = lg.params.on_2_11_1 and
+            'test/replication-luatest/upgrade/2.11.1/master' or nil,
     })
     box_cfg.read_only = true
-    box_cfg.instance_name = 'replica-name'
+    if not lg.params.on_2_11_1 then
+        box_cfg.instance_name = 'replica-name'
+    end
     lg.replica = lg.replica_set:build_and_add_server({
         alias = 'replica',
         box_cfg = box_cfg,
+        datadir = lg.params.on_2_11_1 and
+            'test/replication-luatest/upgrade/2.11.1/replica' or nil,
     })
     lg.replica_set:start()
-end
+    if lg.params.on_2_11_1 then
+        lg.master:exec(function()
+            -- Pretend to be the 2.11.5 version, since it's the first
+            -- 2.11 release, which will properly work with names.
+            box.space._schema:replace{'version', 2, 11, 5}
+            box.cfg{instance_name = 'master-name'}
+            t.assert_equals(box.info.name, 'master-name')
+        end)
+        lg.replica:wait_for_vclock_of(lg.master)
+        lg.replica:exec(function()
+            box.cfg{instance_name = 'replica-name'}
+            t.assert_equals(box.info.name, 'replica-name')
+        end)
+    end
+end)
 
-g.after_all = function(lg)
+g.after_all(function(lg)
+    if lg.params.on_2_11_1 then
+        lg.master:exec(function()
+            box.schema.upgrade()
+            t.assert_not(box.internal.schema_needs_upgrade())
+        end)
+        lg.replica:wait_for_vclock_of(lg.master)
+        lg.replica:exec(function()
+            t.assert_not(box.internal.schema_needs_upgrade())
+        end)
+    end
     lg.replica_set:drop()
-end
+end)
 
 g.test_local_errors = function(lg)
     lg.master:exec(function()
@@ -52,9 +97,9 @@ g.test_local_errors = function(lg)
         msg = 'type does not match'
         local _cluster = box.space._cluster
         t.assert_error_msg_contains(msg, _cluster.update, _cluster, {1},
-                                    {{'=', 'name', 'bad name'}})
+                                    {{'=', 3, 'bad name'}})
         t.assert_error_msg_contains(msg, _cluster.update, _cluster, {1},
-                                    {{'=', 'name', 100}})
+                                    {{'=', 3, 100}})
     end)
     lg.replica:exec(function()
         local msg = "Couldn't find an instance to register this replica on"
@@ -69,7 +114,7 @@ g.test_instance_name_basic = function(lg)
     local check_name_f = function()
         local info = box.info
         local _cluster = box.space._cluster
-        t.assert_equals(info.name, _cluster:get{info.id}.name)
+        t.assert_equals(info.name, _cluster:get{info.id}[3])
         t.assert_equals(info.name, box.cfg.instance_name)
         t.assert_equals(info.replication[1].name, 'master-name')
         t.assert_equals(info.replication[2].name, 'replica-name')
@@ -91,7 +136,7 @@ g.test_instance_rename = function(lg)
             force_recovery = true,
             instance_name = box.NULL,
         }
-        box.space._cluster:update({1}, {{'=', 'name', box.NULL}})
+        box.space._cluster:update({1}, {{'=', 3, box.NULL}})
         local info = box.info
         t.assert_equals(info.name, nil)
         t.assert_equals(info.replication[1].name, nil)
@@ -110,7 +155,7 @@ g.test_instance_rename = function(lg)
         t.assert_equals(info.replication[2].name, 'replica-name')
     end)
     lg.master:exec(function()
-        box.space._cluster:update({2}, {{'=', 'name', box.NULL}})
+        box.space._cluster:update({2}, {{'=', 3, box.NULL}})
         local info = box.info
         t.assert_equals(info.name, nil)
         t.assert_equals(info.replication[1].name, nil)
@@ -202,7 +247,7 @@ g.test_instance_name_transactional = function(lg)
         t.assert_equals(box.info.name, 'master-name')
         box.cfg{force_recovery = true}
         box.begin()
-        box.space._cluster:update({1}, {{'=', 'name', 'new-name'}})
+        box.space._cluster:update({1}, {{'=', 3, 'new-name'}})
         t.assert_equals(box.info.name, 'new-name')
         box.rollback()
         t.assert_equals(box.info.name, 'master-name')
@@ -240,7 +285,7 @@ g.test_instance_name_bootstrap_mismatch = function(lg)
     local function cluster_delete_by_name(name)
         local _cluster = box.space._cluster
         for _, t in _cluster:pairs() do
-            if t.name == name then
+            if t[3] == name then
                 _cluster:delete{t.id}
                 return
             end
@@ -258,7 +303,8 @@ g.test_instance_name_bootstrap_mismatch = function(lg)
                                  new_replica.alias .. '.log')
     wait_for_death(new_replica)
     t.assert(new_replica:grep_log(
-        'Instance name mismatch: expected new%-replica%-name, got other%-name',
+        'Instance name mismatch: name \'new%-replica%-name\' provided in ' ..
+        'config confilcts with the instance one \'other%-name\'',
         1024, {filename = logfile}))
     new_replica:drop()
     --
@@ -284,7 +330,8 @@ g.test_instance_name_bootstrap_mismatch = function(lg)
     logfile = fio.pathjoin(new_replica.workdir, new_replica.alias .. '.log')
     wait_for_death(new_replica)
     t.assert(new_replica:grep_log(
-        'Instance name mismatch: expected new%-replica%-name, got <no%-name>',
+        'Instance name mismatch: name \'new%-replica%-name\' provided in ' ..
+        'config confilcts with the instance one \'<no%-name>\'',
         1024, {filename = logfile}))
     new_replica:drop()
     --
@@ -319,7 +366,8 @@ g.test_instance_name_recovery_mismatch = function(lg)
                                  lg.replica.alias .. '.log')
     wait_for_death(lg.replica)
     t.assert(lg.replica:grep_log(
-        'Instance name mismatch: expected new%-name, got replica%-name', 1024,
+        'Instance name mismatch: name \'new%-name\' provided in config ' ..
+        'confilcts with the instance one \'replica%-name\'', 1024,
         {filename = logfile}))
     --
     -- Has name in WAL, no name in cfg. Then the replica uses the saved name, no
@@ -342,7 +390,7 @@ g.test_instance_name_recovery_mismatch = function(lg)
         box.cfg{force_recovery = true}
     end)
     lg.master:exec(function()
-        box.space._cluster:update({2}, {{'=', 'name', box.NULL}})
+        box.space._cluster:update({2}, {{'=', 3, box.NULL}})
     end)
     lg.replica:wait_for_vclock_of(lg.master)
     lg.replica:exec(function()
@@ -357,7 +405,8 @@ g.test_instance_name_recovery_mismatch = function(lg)
     logfile = fio.pathjoin(lg.replica.workdir, lg.replica.alias .. '.log')
     wait_for_death(lg.replica)
     t.assert(lg.replica:grep_log(
-        'Instance name mismatch: expected new%-name, got <no%-name>', 1024,
+        'Instance name mismatch: name \'new%-name\' provided in config ' ..
+        'confilcts with the instance one \'<no%-name>\'', 1024,
         {filename = logfile}))
     box_cfg.instance_name = nil
     box_cfg.force_recovery = nil
@@ -379,7 +428,8 @@ g.test_instance_name_recovery_mismatch = function(lg)
     logfile = fio.pathjoin(lg.master.workdir, lg.master.alias .. '.log')
     wait_for_death(lg.master)
     t.assert(lg.master:grep_log(
-        'Instance name mismatch: expected new%-name, got master%-name', 1024,
+        'Instance name mismatch: name \'new%-name\' provided in config ' ..
+        'confilcts with the instance one \'master%-name\'', 1024,
         {filename = logfile}))
     --
     -- No name in WAL, has name in cfg.
@@ -392,7 +442,7 @@ g.test_instance_name_recovery_mismatch = function(lg)
     })
     lg.master:exec(function()
         box.cfg{force_recovery = true}
-        box.space._cluster:update({1}, {{'=', 'name', box.NULL}})
+        box.space._cluster:update({1}, {{'=', 3, box.NULL}})
         t.assert_equals(box.info.name, nil)
     end)
     box_cfg.instance_name = 'new-name'
@@ -404,7 +454,8 @@ g.test_instance_name_recovery_mismatch = function(lg)
     logfile = fio.pathjoin(lg.master.workdir, lg.master.alias .. '.log')
     wait_for_death(lg.master)
     t.assert(lg.master:grep_log(
-        'Instance name mismatch: expected new%-name, got <no%-name>', 1024,
+        'Instance name mismatch: name \'new%-name\' provided in config ' ..
+        'confilcts with the instance one \'<no%-name>\'', 1024,
         {filename = logfile}))
     box_cfg.instance_name = nil
     box_cfg.force_recovery = nil
@@ -420,8 +471,8 @@ g.test_instance_name_recovery_mismatch = function(lg)
     lg.master:exec(function()
         box.cfg{force_recovery = true}
         local _cluster = box.space._cluster
-        _cluster:update({1}, {{'=', 'name', 'master-name'}})
-        _cluster:update({2}, {{'=', 'name', 'replica-name'}})
+        _cluster:update({1}, {{'=', 3, 'master-name'}})
+        _cluster:update({2}, {{'=', 3, 'replica-name'}})
         box.cfg{force_recovery = false}
     end)
     lg.replica:wait_for_vclock_of(lg.master)
@@ -443,8 +494,8 @@ g.test_instance_name_change_batch = function(lg)
         t.assert_equals(box.info.replication[2].name, 'replica-name')
         local _cluster = box.space._cluster
         for _ = 1, 3 do
-            _cluster:update({2}, {{'=', 'name', 'replica-name-new'}})
-            _cluster:update({2}, {{'=', 'name', 'replica-name'}})
+            _cluster:update({2}, {{'=', 3, 'replica-name-new'}})
+            _cluster:update({2}, {{'=', 3, 'replica-name'}})
         end
         t.assert_equals(box.info.replication[2].name, 'replica-name')
     end)
@@ -505,7 +556,7 @@ g.test_instance_name_new_uuid = function(lg)
         local new_uuid = uuid.str()
         local old_id
         for _, t in _cluster:pairs() do
-            if t.name == 'replica-name' then
+            if t[3] == 'replica-name' then
                 old_id = t.id
                 break
             end
@@ -514,7 +565,7 @@ g.test_instance_name_new_uuid = function(lg)
         t.assert_error_msg_contains('UUID and name update together',
                                     _cluster.update, _cluster, {old_id},
                                     {{'=', 'uuid', new_uuid},
-                                    {'=', 'name', 'new-name'}})
+                                    {'=', 3, 'new-name'}})
         --
         -- Can't change own UUID.
         --
@@ -544,4 +595,158 @@ g.test_instance_name_new_uuid = function(lg)
     lg.master:exec(function(replication)
         box.cfg{replication = replication}
     end, {lg.master.box_cfg.replication})
+end
+
+local g_no_name = t.group('no-names', t.helpers.matrix({
+    on_2_11_1 = {true, false},
+}))
+
+g_no_name.before_all(function(lg)
+    lg.replica_set = replica_set:new({})
+    local box_cfg = {
+        replication_timeout = 0.1,
+        replication = {
+            server.build_listen_uri('master', lg.replica_set.id),
+            server.build_listen_uri('replica', lg.replica_set.id),
+        },
+    }
+
+    lg.master = lg.replica_set:build_and_add_server({
+        alias = 'master',
+        box_cfg = box_cfg,
+        datadir = lg.params.on_2_11_1 and
+            'test/replication-luatest/upgrade/2.11.1/master' or nil,
+    })
+
+    box_cfg.read_only = true
+    lg.replica = lg.replica_set:build_and_add_server({
+        alias = 'replica',
+        box_cfg = box_cfg,
+        datadir = lg.params.on_2_11_1 and
+            'test/replication-luatest/upgrade/2.11.1/replica' or nil,
+    })
+
+    lg.replica_set:start()
+    lg.replica_set:wait_for_fullmesh()
+    if lg.params.on_2_11_1 then
+        lg.master:exec(function()
+            -- Pretend to be the 2.11.5 version, since it's the first
+            -- 2.11 release, which will properly work with names.
+            box.space._schema:replace{'version', 2, 11, 5}
+        end)
+        lg.replica:wait_for_vclock_of(lg.master)
+    end
+end)
+
+g_no_name.after_all(function(lg)
+    if lg.params.on_2_11_1 then
+        lg.master:exec(function()
+            box.schema.upgrade()
+            t.assert_not(box.internal.schema_needs_upgrade())
+        end)
+        lg.replica:wait_for_vclock_of(lg.master)
+        lg.replica:exec(function()
+            t.assert_not(box.internal.schema_needs_upgrade())
+        end)
+    end
+    lg.replica_set:drop()
+end)
+
+-- Test, that replica doesn't hang on name apply.
+g_no_name.test_replica_hang = function(lg)
+    lg.master:exec(function()
+        box.space._cluster:update(2, {{'=', 3, 'replica'}})
+    end)
+
+    -- Wait for INSTANCE_NAME to be set.
+    lg.replica:wait_for_vclock_of(lg.master)
+    lg.replica:exec(function()
+        -- Test, that no hang happens.
+        box.cfg{instance_name = 'replica'}
+    end)
+
+    -- Cleanup.
+    lg.replica:update_box_cfg{force_recovery = true}
+    lg.master:exec(function()
+        box.space._cluster:update(2, {{'#', 3, 1}})
+    end)
+    lg.replica:wait_for_vclock_of(lg.master)
+    lg.replica:exec(function()
+        box.cfg{instance_name = box.NULL}
+        box.cfg{force_recovery = false}
+    end)
+end
+
+--
+-- gh-9916: txns being applied from the master during the name change process
+-- could crash the replica or cause "double LSN" error in release.
+--
+g_no_name.test_txns_replication_during_name_setting = function(lg)
+    t.tarantool.skip_if_not_debug()
+    lg.master:exec(function()
+        local s = box.schema.create_space('test')
+        s:create_index('pk')
+    end)
+    lg.replica:wait_for_vclock_of(lg.master)
+    lg.replica:exec(function()
+        box.error.injection.set("ERRINJ_WAL_DELAY_COUNTDOWN", 0)
+    end)
+    lg.master:exec(function()
+        box.space.test:replace{1}
+    end)
+    local replica_id = lg.replica:exec(function(timeout)
+        -- One txn from master is being applied by the replica. Not yet
+        -- reflected in its vclock.
+        t.helpers.retrying({timeout = timeout}, function()
+            if box.error.injection.get("ERRINJ_WAL_DELAY") then
+                return
+            end
+            error("No txn from master")
+        end)
+        local fiber = require('fiber')
+        -- Send registration request while having a remote txn being committed
+        -- from the same master.
+        local f = fiber.create(function()
+            box.cfg{instance_name = 'replica'}
+        end)
+        f:set_joinable(true)
+        rawset(_G, 'test_f', f)
+        return box.info.id
+    end, {wait_timeout})
+    lg.master:exec(function(timeout, id)
+        -- Registration request is received.
+        t.helpers.retrying({timeout = timeout}, function()
+            if box.space._cluster:get{id}[3] == 'replica' then
+                return
+            end
+            error("No name request from replica")
+        end)
+        -- Bump the LSN again. To make it easier later to wait when the replica
+        -- gets all previous data from the master.
+        box.space.test:replace{2}
+    end, {wait_timeout, replica_id})
+    lg.replica:exec(function()
+        box.error.injection.set("ERRINJ_WAL_DELAY", false)
+        local ok, err = _G.test_f:join()
+        _G.test_f = nil
+        t.assert_equals(err, nil)
+        t.assert(ok)
+        t.assert(box.info.name, 'replica')
+    end)
+    lg.replica:wait_for_vclock_of(lg.master)
+    lg.replica:exec(function()
+        t.assert(box.space.test:get{2}, {2})
+    end)
+
+    -- Cleanup.
+    lg.replica:update_box_cfg{force_recovery = true}
+    lg.master:exec(function()
+        box.space.test:drop()
+        box.space._cluster:update(2, {{'#', 3, 1}})
+    end)
+    lg.replica:wait_for_vclock_of(lg.master)
+    lg.replica:exec(function()
+        box.cfg{instance_name = box.NULL}
+        box.cfg{force_recovery = false}
+    end)
 end
